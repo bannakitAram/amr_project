@@ -168,7 +168,7 @@ const float STOP_DAC_STEP_R = 200.0f;
 // ============================================================
 // V9.3 LEFT LAUNCH SLEW BOOST (V9.6 re-tune)
 // ============================================================
-const float         LAUNCH_DAC_STEP_L           = 120.0f;
+const float         LAUNCH_DAC_STEP_L           = 35.0f;
 const float         LEFT_LAUNCH_SPEED_THRESHOLD = 0.005f;
 const unsigned long  LEFT_LAUNCH_TIMEOUT_MS      = 700;
 bool left_launch_active     = false;
@@ -240,8 +240,8 @@ const float left_dac_table[CAL_POINTS] =
 
 const float right_dac_table[CAL_POINTS] =
 {
-  383.05f, 708.76f, 1034.48f, 1360.19f, 1685.91f,
-  2011.62f, 2337.33f, 2663.05f, 2988.76f, 3314.47f
+  393.05f, 718.76f, 1044.48f, 1370.19f, 1695.91f,
+  2021.62f, 2347.33f, 2673.05f, 2998.76f, 3324.47f
 };
 
 // ============================================================
