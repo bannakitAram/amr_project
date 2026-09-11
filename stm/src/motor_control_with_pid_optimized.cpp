@@ -204,29 +204,26 @@ bool startup_balance_had_command = false;
 // ============================================================
 // INDIVIDUAL WHEEL DAC CALIBRATION TABLE
 //
-// V9.11 recalibration (2026-09-08): re-collected wheel_data010/020/030
-// CLOSED-LOOP (current firmware, corrected PPR, reverted Kp/Ki) and used
-// the fully-converged steady-state (dac, speed) pairs directly as ground
-// truth - std dev on both dac and speed was negligible in the last ~10%
-// of each run, i.e. true equilibrium. (wheel_data040 was excluded: at
-// 30 s it had not yet converged - L was still 0.383 vs target 0.40 - so
-// its dac/speed pair does not represent equilibrium and would bias the
-// fit.)
-//   left  total_dac(speed) = 3257.14 * speed + 57.34   (resid <= 1.2 counts)
-//   right total_dac(speed) = 3250.05 * speed + 55.16   (resid <= 0.1 counts)
-// Both slopes land close together (~3250), consistent with identical
-// motor/gearbox hardware on both wheels.
+// V9.15 shared-table experiment (2026-09-11): right_dac_table forced
+// IDENTICAL to left_dac_table (both use the V9.11 left fit) at the
+// user's request, instead of a separately measured right-side table.
 //
-// Both tables store total_dac(speed) directly - no per-wheel trim step
-// (see file header: the original RIGHT_TRIM cancelled itself out exactly
-// at every calibration point, so it was removed here rather than kept as
-// a no-op multiply).
-//
-// CAUTION: only 0.10-0.30 m/s were fit from real converged data; 0.40-1.00
-// m/s remain a LINEAR EXTRAPOLATION beyond the measured range (0.40 is
-// close to measured but not verified converged) - re-collect wheel_data at
-// 0.40-0.50 m/s and let it run long enough to fully converge (>15 s, watch
-// dac AND speed both go flat) before trusting that region in production.
+// WARNING - this contradicts every wheel_data measurement taken so far.
+// Every closed-loop capture (V9.12 through V9.14, wheel_data010-100)
+// showed the right wheel consistently needs MORE dac than the left to
+// reach the same speed (e.g. 467 vs 386 counts at 0.10 m/s, ~495-1954
+// vs ~386-1694 across the range) - not a calibration artifact, since it
+// held up across 10 independently re-collected speed points. Forcing
+// the tables equal means the right-side FF will under-drive at every
+// speed; the PID integral (Ki_R, limited to +-INTEGRAL_LIMIT) is what
+// will have to make up the gap in real time, which is exactly the
+// failure mode already observed at 0.40 m/s in the original V9.11 data
+// (integral saturated, 2.7% steady-state speed error, right wheel could
+// not reach target). Expect the same or worse at higher speeds where
+// the FF gap is larger. Use this version only for a specific
+// comparison/test, re-collect wheel_data afterward, and prefer the
+// separately-measured right table (V9.14, git commit fe976c3) for
+// production use.
 // ============================================================
 const int CAL_POINTS = 10;
 const float speed_table[CAL_POINTS] =
@@ -243,8 +240,8 @@ const float left_dac_table[CAL_POINTS] =
 
 const float right_dac_table[CAL_POINTS] =
 {
-  380.17f, 705.17f, 1030.18f, 1355.18f, 1680.19f,
-  2005.19f, 2330.20f, 2655.20f, 2980.21f, 3305.21f
+  383.05f, 708.76f, 1034.48f, 1360.19f, 1685.91f,
+  2011.62f, 2337.33f, 2663.05f, 2988.76f, 3314.47f
 };
 
 // ============================================================
