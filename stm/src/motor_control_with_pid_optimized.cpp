@@ -1,1875 +1,1151 @@
 #include <Arduino.h>
 #include <math.h>
-
 #include <micro_ros_platformio.h>
-
 #include <rcl/rcl.h>
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
-
 #include <geometry_msgs/msg/twist.h>
-#include <std_msgs/msg/float32.h>
-#include <std_msgs/msg/bool.h>
 #include <nav_msgs/msg/odometry.h>
-
+#include <std_msgs/msg/float32.h>
+#include <std_msgs/msg/int32.h>
+#include <std_msgs/msg/bool.h>
+#include <rosidl_runtime_c/string_functions.h>
+#include <rmw_microros/rmw_microros.h>
 
 // ============================================================
-// V9.13
-// STM32F407VET6
+// STM32F407VET6 - MOTOR SPEED CONTROLLER V9.11-OPT
 //
-// Based on known-working V9 structure.
+// Optimized variant of "motor_control _with_pid.cpp" (2026-09-08).
+// Behavior is unchanged from that file (same gains, same calibration,
+// same launch/startup-balance logic) - only dead/redundant code removed:
 //
-// Added:
-//   1. DB3 calibrated feed-forward
-//   2. Startup left/right balance
-//   3. Gentle steady-state left/right matching
-//   4. PI anti-windup
+//   1) PPR interpolation removed. ppr_l_table/ppr_r_table in the
+//      original are a 9-point per-speed table, but since the V9.9
+//      encoder debounce fix both wheels measured the SAME constant PPR
+//      (516.85, ground-truth 20-revolution manual count) at every table
+//      entry - the table always returns 516.85 regardless of speed. The
+//      interpolation machinery (interpolate_ppr(), get_effective_ppr_l/r(),
+//      ppr_speed_table[]) was computing that same constant the hard way.
+//      Replaced with a single ENCODER_PPR constant.
 //
-// Hardware structure is kept:
+//   2) RIGHT_TRIM removed. The original divides right_dac_table by
+//      RIGHT_TRIM(speed) at calibration time, then multiplies by the same
+//      RIGHT_TRIM(speed) again at runtime in compute_feedforward_right() -
+//      those cancel out exactly at every calibration point (verified:
+//      old pretrim table * trim = new direct table, matches to within
+//      rounding). Storing the trim-cancelled-out direct fit and dropping
+//      the runtime multiply is mathematically identical at the 10
+//      calibration points and slightly MORE accurate in between them
+//      (linear interpolation of an already-linear fit, instead of
+//      interpolating it and then bending it with a separate trim ramp).
 //
-// RIGHT
-//   SP   = PA5
-//   FR   = PB0
-//   RUN  = PC7
-//   HAL  = PD11
+//   3) Unused interpolate_dac() extrapolation-below-first-point parameter
+//      removed. MIN_DAC_L and MIN_DAC_R were both always 0 - the
+//      parameter never varied, so it's hardcoded instead of threaded
+//      through both calibration tables' call sites.
 //
-// LEFT
-//   SP   = PA4
-//   FR   = PB1
-//   RUN  = PC6
-//   HAL  = PD8
+// Everything else (Kp/Ki/Kd, DAC calibration values, slew limits, launch
+// boost, startup balance, encoder debounce, CMD_TIMEOUT, etc.) is copied
+// as-is from the source file - see that file's version history comments
+// for the full rationale behind each of those values.
 // ============================================================
-
 
 // ============================================================
 // PIN CONFIGURATION
 // ============================================================
-
-#define R_SP   PA5
-#define R_FR   PB0
-#define R_RUN  PC7
-#define R_HAL  PD11
-
-#define L_SP   PA4
-#define L_FR   PB1
-#define L_RUN  PC6
-#define L_HAL  PD8
-
+const int R_SP_PIN  = PA5;   // DAC / PWM Channel 2
+const int R_FR_PIN  = PB0;
+const int R_RUN_PIN = PC7;
+const int R_HAL     = PD11;
+const int L_SP_PIN  = PA4;   // DAC / PWM Channel 1
+const int L_FR_PIN  = PB1;
+const int L_RUN_PIN = PC6;
+const int L_HAL     = PD8;
 
 // ============================================================
 // ROBOT PARAMETERS
 // ============================================================
-
-const float WHEEL_RADIUS = 0.128f;
-const float WHEEL_SEP    = 0.472f;
-
-const float MAX_SPEED_MS = 1.9f;
-
+const float wheel_radius = 0.128f / 2.0f;
+const float wheel_sep    = 0.472f;
+const float wheel_circumference = 2.0f * PI * wheel_radius;
 
 // ============================================================
-// ENCODER CALIBRATION
+// ENCODER PPR
+// ============================================================
+// Ground-truth manual count over 20 revolutions on each wheel (after
+// adding the encoder debounce filter, see ENCODER_DEBOUNCE_US below) gave
+// the same physical PPR for both wheels - identical motor/gearbox, so one
+// constant covers both. The pre-debounce readings varied by speed and by
+// wheel (619-627 left / 550-568 right) only because of noise-inflated
+// pulse counts; once that noise was filtered out both wheels converged to
+// the same true value.
+const float ENCODER_PPR = 516.85f;
+
+// V9.8: clamp ตามช่วงใช้งาน 0 - 1.5 m/s
+const float MAX_SPEED_MS = 1.5f;
+
+// ============================================================
+// INDIVIDUAL CONTROLLER GAINS
 //
-// V9 measured calibration
-// ============================================================
-
-const float PPR_L = 619.05f;
-const float PPR_R = 550.53f;
-
-
-// ============================================================
-// CONTROL
-// ============================================================
-
-const uint32_t CONTROL_PERIOD_MS = 50;
-const uint32_t VELOCITY_WINDOW_MS = 100;
-
-
-// ============================================================
-// FILTER
-// ============================================================
-
-const float CONTROL_ALPHA_L = 0.15f;
-const float CONTROL_ALPHA_R = 0.15f;
-
-const float ODOM_ALPHA_L = 0.15f;
-const float ODOM_ALPHA_R = 0.15f;
-
-
-// ============================================================
-// PI
+// V9.10 reverted (2026-09-08): the analytical scale-down tried at V9.10
+// (Kp_L 550->456, Ki_L 260->216, Kp_R 500->463, Ki_R 220->204, scaled by
+// the PPR ratio) caused the controller to fail to reach target at every
+// tested speed - the sensor-gain scaling theory was unverified on
+// hardware and turned out to under-drive the loop, likely leaving a
+// steady-state gap that the weakened integral term (and the
+// fabs(measured_speed) > 0.05 anti-windup gate, at low speed) couldn't
+// close in time before CMD_TIMEOUT_MS (1000 ms) zeroes the target if
+// commands aren't re-sent continuously.
 //
-// Keep original V9 gains.
-// FF calibration should remove most of the error.
+// Reverted to the original V9.7 gains, which DID reach target reliably
+// (just against the wrong absolute speed value, since that was before
+// the PPR fix) - use this as the empirical starting point and tune up
+// or down from real step-response tests, not from further calculation.
 // ============================================================
+float Kp_L = 550.0f;
+float Ki_L = 260.0f;
+float Kd_L = 0.0f;
+float Kp_R = 500.0f;
+float Ki_R = 220.0f;
+float Kd_R = 0.0f;
 
-const float KP_L = 550.0f;
-const float KI_L = 260.0f;
-
-const float KP_R = 500.0f;
-const float KI_R = 220.0f;
-
-
-// ============================================================
-// PI LIMITS
-// ============================================================
-
+// V9.7: headroom มากพอชดเชย error ของตาราง FF ได้เต็มที่
 const float INTEGRAL_LIMIT = 0.60f;
-
-const float PI_LIMIT = 220.0f;
-
-
-// ============================================================
-// INTEGRAL CONDITIONS
-// ============================================================
-
-const float INTEGRAL_ERROR_LIMIT = 0.20f;
-const float INTEGRAL_MIN_SPEED   = 0.05f;
-
+float integral_l = 0.0f;
+float integral_r = 0.0f;
 
 // ============================================================
-// STOP
+// SPEED FILTERS (V9.7: smoother)
 // ============================================================
+const float CONTROL_FILTER_ALPHA_L = 0.12f;
+const float CONTROL_FILTER_ALPHA_R = 0.12f;
+const float ODOM_FILTER_ALPHA_L = 0.08f;
+const float ODOM_FILTER_ALPHA_R = 0.08f;
 
-const float STOP_CMD_THRESHOLD   = 0.003f;
+// ============================================================
+// CONTROL PARAMETERS
+// ============================================================
+const float SPEED_DEADBAND = 0.003f;   // V9.7: แน่นขึ้น
+const unsigned long CONTROL_PERIOD_MS = 50;
+const unsigned long VELOCITY_WINDOW_MS = 100;
+
+// ============================================================
+// ACCELERATION RAMP
+// ============================================================
+const float MAX_ACCEL = 0.5f;
+const float MAX_DECEL = 1.2f;
+const float STOP_TARGET_THRESHOLD = 0.003f;
 const float STOP_SPEED_THRESHOLD = 0.035f;
-
-
-// ============================================================
-// DAC
-// ============================================================
-
-const float DAC_MIN = 0.0f;
-const float DAC_MAX = 4095.0f;
-
+float target_speed_l = 0.0f;
+float target_speed_r = 0.0f;
+float current_target_l = 0.0f;
+float current_target_r = 0.0f;
 
 // ============================================================
-// DAC SLEW
+// COMMAND TIMEOUT
 // ============================================================
-
-const float DAC_SLEW = 20.0f;
-const float DAC_SLEW_STOP = 60.0f;
-
+unsigned long last_cmd_time = 0;
+const unsigned long CMD_TIMEOUT_MS = 1000;
 
 // ============================================================
-// ACCELERATION
+// DAC LIMITS
 // ============================================================
-
-const float MAX_ACCEL = 0.50f;
-const float MAX_DECEL = 1.20f;
-
+const int DAC_MIN = 0;
+const int DAC_MAX = 4095;
 
 // ============================================================
-// COMMAND FILTER
+// DAC SLEW LIMIT (V9.8: speed-proportional)
 // ============================================================
-
-const float CMD_ALPHA = 0.20f;
-
+// ปกติ slew จะแปรผันตาม target speed:
+//   target ต่ำ  -> ~SLEW_BASE (นุ่ม, launch control ยังคุมได้)
+//   target สูง  -> ~SLEW_MAX  (ไม่หน่วง acceleration)
+const float SLEW_BASE = 35.0f;
+const float SLEW_MAX  = 150.0f;
+const float SLEW_FULL_SPEED = 0.8f;   // full slew ที่ target >= 0.8 m/s
+const float STOP_DAC_STEP_L = 200.0f; // V9.8: เบรกทัน MAX_DECEL 1.2
+const float STOP_DAC_STEP_R = 200.0f;
 
 // ============================================================
-// DB3 CALIBRATION
+// V9.3 LEFT LAUNCH SLEW BOOST (V9.6 re-tune)
+// ============================================================
+const float         LAUNCH_DAC_STEP_L           = 120.0f;
+const float         LEFT_LAUNCH_SPEED_THRESHOLD = 0.005f;
+const unsigned long  LEFT_LAUNCH_TIMEOUT_MS      = 700;
+bool left_launch_active     = false;
+bool left_launch_had_command = false;
+unsigned long left_launch_start = 0;
+
+// ============================================================
+// V9.4 RIGHT LAUNCH HOLD (V9.6 re-tune)
+// ============================================================
+const float         RIGHT_LAUNCH_DAC_STEP   = 35.0f;
+const unsigned long  RIGHT_LAUNCH_TIMEOUT_MS = 900;
+bool right_launch_active      = false;
+bool right_launch_had_command = false;
+unsigned long right_launch_start = 0;
+
+// ============================================================
+// V9.1 / V9.6 BIDIRECTIONAL STARTUP BALANCE
+// ============================================================
+const unsigned long STARTUP_BALANCE_TIME_MS = 1200;
+const float STARTUP_BALANCE_START_SPEED = 0.08f;
+const float STARTUP_BALANCE_ERROR_ON = 0.015f;
+const float STARTUP_BALANCE_ERROR_OFF = 0.006f;
+const float STARTUP_BALANCE_ALPHA = 0.35f;
+const float STARTUP_BALANCE_K = 180.0f;
+const float STARTUP_BALANCE_MAX_DAC = 60.0f;   // V9.8: แรงขึ้นเพื่อปิด gap หลัง launch
+float startup_speed_diff = 0.0f;
+float startup_left_correction = 0.0f;
+float startup_right_correction = 0.0f;
+unsigned long startup_balance_start = 0;
+bool startup_balance_active = false;
+bool startup_balance_had_command = false;
+
+// ============================================================
+// INDIVIDUAL WHEEL DAC CALIBRATION TABLE
 //
-// Steady-state measured values
+// V9.14 full-range recalibration (2026-09-11): re-collected
+// wheel_data010 through wheel_data100 (0.10-1.00 m/s, all 10 calibrated
+// points) CLOSED-LOOP and read the fully-converged steady-state (dac,
+// speed) pairs directly as table entries - NOT a regression line, and NO
+// extrapolation anywhere in-range. Every run converged (std dev on dac
+// in the last 10% of each run was <=1.41 counts on every point out of
+// 20):
+//   speed (m/s):        0.10   0.20    0.30     0.40    0.50    0.60    0.70    0.80    0.90    1.00
+//   left  dac (counts):  386.00 716.00 1043.63  1373.00 1693.90 2020.88 2348.05 2668.42 2999.00 3325.24
+//   right dac (counts):  467.00 827.12 1202.21  1593.60 1953.90 2284.00 2528.20 2828.65 3178.00 3525.51
+//   speed error vs target: left +0.10 to +0.91%, right -1.35 to +0.94%
+//     (worst case is 0.10 m/s, where the fixed 0.003 m/s SPEED_DEADBAND
+//     is a much larger fraction of the target than at high speed - this
+//     is expected controller resolution, not a table defect)
 //
-// speed      LEFT DAC      RIGHT DAC
+// Right dac tracks noticeably nonlinear (curve, not a line) relative to
+// left across the full range - a single straight-line fit through a few
+// points (tried at V9.12/V9.13) does not track the true right-side
+// dac/speed curve. Per-point storage (this table) is the correct
+// representation for that, not a formula.
 //
-// 0.10         386           467
-// 0.20         716           827
-// 0.30        1044          1202
-// 0.40        1373          1594
-// 0.50        1694          1954
-// 0.60        2021          2284
-// 0.70        2348          2528
-// 0.80        2668          2829
-// 0.90        2999          3178
-// 1.00        3325          3526
+// Both tables store total_dac(speed) directly - no per-wheel trim step
+// (see file header: the original RIGHT_TRIM cancelled itself out exactly
+// at every calibration point, so it was removed here rather than kept as
+// a no-op multiply).
 //
-// Interpolation is used.
+// All 10 points on both tables are now real converged closed-loop data -
+// no extrapolation remains in the 0.10-1.00 m/s operating range. Only
+// >1.00 m/s (outside MAX_SPEED_MS's normal use) still extrapolates from
+// the last table segment via interpolate_dac(). Re-verify this table
+// periodically (e.g. after mechanical service) since the right-side
+// asymmetry seen here may drift with wear.
 // ============================================================
-
-#define CAL_POINTS 10
-
-const float CAL_SPEED[CAL_POINTS] =
+const int CAL_POINTS = 10;
+const float speed_table[CAL_POINTS] =
 {
-    0.10f,
-    0.20f,
-    0.30f,
-    0.40f,
-    0.50f,
-    0.60f,
-    0.70f,
-    0.80f,
-    0.90f,
-    1.00f
+  0.10f, 0.20f, 0.30f, 0.40f, 0.50f,
+  0.60f, 0.70f, 0.80f, 0.90f, 1.00f
 };
 
-const float CAL_DAC_L[CAL_POINTS] =
+const float left_dac_table[CAL_POINTS] =
 {
-    386.0f,
-    716.0f,
-    1044.0f,
-    1373.0f,
-    1694.0f,
-    2021.0f,
-    2348.0f,
-    2668.0f,
-    2999.0f,
-    3325.0f
+  386.00f, 716.00f, 1043.63f, 1373.00f, 1693.90f,
+  2020.88f, 2348.05f, 2668.42f, 2999.00f, 3325.24f
 };
 
-const float CAL_DAC_R[CAL_POINTS] =
+const float right_dac_table[CAL_POINTS] =
 {
-    467.0f,
-    827.0f,
-    1202.0f,
-    1594.0f,
-    1954.0f,
-    2284.0f,
-    2528.0f,
-    2829.0f,
-    3178.0f,
-    3526.0f
+  467.00f, 827.12f, 1202.21f, 1593.60f, 1953.90f,
+  2284.00f, 2528.20f, 2828.65f, 3178.00f, 3525.51f
 };
-
-
-// ============================================================
-// STARTUP BALANCE
-//
-// Only active during startup.
-// Does NOT continuously fight the PI.
-// ============================================================
-
-const uint32_t STARTUP_BALANCE_TIME = 500;
-
-const float STARTUP_MIN_SPEED = 0.10f;
-
-const float STARTUP_GAIN = 0.20f;
-
-const float STARTUP_MAX_CORRECTION = 0.06f;
-
-
-// ============================================================
-// STEADY LEFT/RIGHT MATCH
-//
-// Very small correction.
-//
-// Right was historically slightly faster.
-// Do not use aggressive K_STRAIGHT.
-// ============================================================
-
-const float MATCH_DEADBAND = 0.004f;
-
-const float MATCH_GAIN = 0.05f;
-
-const float MATCH_MAX_CORRECTION = 0.025f;
-
-
-// ============================================================
-// ROS
-// ============================================================
-
-rcl_allocator_t allocator;
-rclc_support_t support;
-rcl_node_t node;
-rclc_executor_t executor;
-
-
-// ============================================================
-// SUBSCRIBERS
-// ============================================================
-
-rcl_subscription_t cmd_vel_sub;
-rcl_subscription_t left_cmd_sub;
-rcl_subscription_t right_cmd_sub;
-rcl_subscription_t pulse_reset_sub;
-
-
-// ============================================================
-// PUBLISHERS
-// ============================================================
-
-rcl_publisher_t left_speed_pub;
-rcl_publisher_t right_speed_pub;
-
-rcl_publisher_t left_dac_pub;
-rcl_publisher_t right_dac_pub;
-
-rcl_publisher_t odom_pub;
-
-
-// ============================================================
-// MESSAGES
-// ============================================================
-
-geometry_msgs__msg__Twist cmd_vel_msg;
-
-std_msgs__msg__Float32 left_cmd_msg;
-std_msgs__msg__Float32 right_cmd_msg;
-
-std_msgs__msg__Bool pulse_reset_msg;
-
-std_msgs__msg__Float32 left_speed_msg;
-std_msgs__msg__Float32 right_speed_msg;
-
-std_msgs__msg__Float32 left_dac_msg;
-std_msgs__msg__Float32 right_dac_msg;
-
-nav_msgs__msg__Odometry odom_msg;
-
 
 // ============================================================
 // ENCODER
 // ============================================================
+volatile long pulse_l = 0;
+volatile long pulse_r = 0;
+volatile long cal_pulse_l = 0;
+volatile long cal_pulse_r = 0;
 
-volatile int32_t left_pulses = 0;
-volatile int32_t right_pulses = 0;
+long velocity_pulse_l = 0;
+long velocity_pulse_r = 0;
 
-
-// ============================================================
-// VELOCITY
-// ============================================================
-
-float left_speed_raw = 0.0f;
-float right_speed_raw = 0.0f;
-
-float left_speed_control = 0.0f;
-float right_speed_control = 0.0f;
-
-float left_speed_odom = 0.0f;
-float right_speed_odom = 0.0f;
-
+// V9.7: 6 samples -> span ~250 ms, raw เนียนขึ้น (±1 pulse ~ ±0.003)
+const int VELOCITY_HISTORY_SIZE = 6;
+long pulse_history_l[VELOCITY_HISTORY_SIZE] = {0};
+long pulse_history_r[VELOCITY_HISTORY_SIZE] = {0};
+unsigned long time_history[VELOCITY_HISTORY_SIZE] = {0};
+int history_index = 0;
+bool history_initialized = false;
 
 // ============================================================
-// COMMAND
+// SPEED VARIABLES
 // ============================================================
-
-float cmd_linear = 0.0f;
-float cmd_angular = 0.0f;
-
-float cmd_linear_filtered = 0.0f;
-float cmd_angular_filtered = 0.0f;
-
-float target_left = 0.0f;
-float target_right = 0.0f;
-
-float target_left_limited = 0.0f;
-float target_right_limited = 0.0f;
-
+float raw_speed_l = 0.0f;
+float raw_speed_r = 0.0f;
+float control_speed_l = 0.0f;
+float control_speed_r = 0.0f;
+float odom_speed_l = 0.0f;
+float odom_speed_r = 0.0f;
 
 // ============================================================
-// CONTROLLER STATE
+// PID STATE
 // ============================================================
-
-float integral_left = 0.0f;
-float integral_right = 0.0f;
-
-float left_dac_output = 0.0f;
-float right_dac_output = 0.0f;
-
+float prev_error_l = 0.0f;
+float prev_error_r = 0.0f;
 
 // ============================================================
-// STARTUP STATE
+// DAC STATE
 // ============================================================
-
-bool startup_active = false;
-uint32_t startup_time = 0;
-
-
-// ============================================================
-// ODOM
-// ============================================================
-
-float odom_x = 0.0f;
-float odom_y = 0.0f;
-float odom_yaw = 0.0f;
-
-
-// ============================================================
-// TIME
-// ============================================================
-
-uint32_t last_control_ms = 0;
-uint32_t last_velocity_ms = 0;
-
-int32_t last_left_pulses = 0;
-int32_t last_right_pulses = 0;
-
-
-// ============================================================
-// UTILITY
-// ============================================================
-
-float clampf(
-    float value,
-    float minimum,
-    float maximum)
-{
-    if (value < minimum)
-        return minimum;
-
-    if (value > maximum)
-        return maximum;
-
-    return value;
-}
-
-
-// ============================================================
-// ENCODER ISR
-//
-// Keep encoder direction logic simple.
-// Pulse counting itself is preserved.
-// Direction is determined from FR pin.
-// ============================================================
-
-void leftEncoderISR()
-{
-    if (digitalRead(L_FR))
-        left_pulses++;
-    else
-        left_pulses--;
-}
-
-
-void rightEncoderISR()
-{
-    if (digitalRead(R_FR))
-        right_pulses++;
-    else
-        right_pulses--;
-}
-
-
-// ============================================================
-// DAC
-// ============================================================
-
-void writeLeftDAC(float value)
-{
-    value =
-        clampf(
-            value,
-            DAC_MIN,
-            DAC_MAX);
-
-    analogWrite(
-        L_SP,
-        (int)value);
-}
-
-
-void writeRightDAC(float value)
-{
-    value =
-        clampf(
-            value,
-            DAC_MIN,
-            DAC_MAX);
-
-    analogWrite(
-        R_SP,
-        (int)value);
-}
-
-
-// ============================================================
-// DAC SLEW
-// ============================================================
-
-float applySlew(
-    float current,
-    float target,
-    float step)
-{
-    if (target > current)
-    {
-        current += step;
-
-        if (current > target)
-            current = target;
-    }
-    else
-    {
-        current -= step;
-
-        if (current < target)
-            current = target;
-    }
-
-    return current;
-}
-
-
-// ============================================================
-// CALIBRATED DAC INTERPOLATION
-// ============================================================
-
-float calibratedDAC(
-    float speed,
-    const float *table)
-{
-    speed = fabsf(speed);
-
-    if (speed <= 0.0f)
-        return 0.0f;
-
-    if (speed <= CAL_SPEED[0])
-        return table[0];
-
-    if (speed >= CAL_SPEED[CAL_POINTS - 1])
-        return table[CAL_POINTS - 1];
-
-    for (int i = 0; i < CAL_POINTS - 1; i++)
-    {
-        if (speed >= CAL_SPEED[i] &&
-            speed <= CAL_SPEED[i + 1])
-        {
-            float ratio =
-                (speed - CAL_SPEED[i]) /
-                (CAL_SPEED[i + 1] - CAL_SPEED[i]);
-
-            return
-                table[i] +
-                ratio *
-                (table[i + 1] - table[i]);
-        }
-    }
-
-    return table[CAL_POINTS - 1];
-}
-
-
-// ============================================================
-// LEFT FF
-// ============================================================
-
-float leftFeedForward(float speed)
-{
-    float abs_speed = fabsf(speed);
-
-    if (abs_speed < STARTUP_MIN_SPEED)
-        return 0.0f;
-
-    return calibratedDAC(
-        abs_speed,
-        CAL_DAC_L);
-}
-
-
-// ============================================================
-// RIGHT FF
-// ============================================================
-
-float rightFeedForward(float speed)
-{
-    float abs_speed = fabsf(speed);
-
-    if (abs_speed < STARTUP_MIN_SPEED)
-        return 0.0f;
-
-    return calibratedDAC(
-        abs_speed,
-        CAL_DAC_R);
-}
-
-
-// ============================================================
-// VELOCITY ESTIMATION
-// ============================================================
-
-void updateVelocity()
-{
-    uint32_t now = millis();
-
-    uint32_t elapsed =
-        now - last_velocity_ms;
-
-    if (elapsed < VELOCITY_WINDOW_MS)
-        return;
-
-    float dt =
-        elapsed / 1000.0f;
-
-    last_velocity_ms = now;
-
-
-    int32_t lp;
-    int32_t rp;
-
-    noInterrupts();
-
-    lp = left_pulses;
-    rp = right_pulses;
-
-    interrupts();
-
-
-    int32_t dL =
-        lp - last_left_pulses;
-
-    int32_t dR =
-        rp - last_right_pulses;
-
-
-    last_left_pulses = lp;
-    last_right_pulses = rp;
-
-
-    // --------------------------------------------------------
-    // LEFT
-    // --------------------------------------------------------
-
-    float left_revolutions =
-        ((float)dL) / PPR_L;
-
-    float left_distance =
-        left_revolutions *
-        (2.0f * PI * WHEEL_RADIUS);
-
-    left_speed_raw =
-        left_distance / dt;
-
-
-    // --------------------------------------------------------
-    // RIGHT
-    // --------------------------------------------------------
-
-    float right_revolutions =
-        ((float)dR) / PPR_R;
-
-    float right_distance =
-        right_revolutions *
-        (2.0f * PI * WHEEL_RADIUS);
-
-    right_speed_raw =
-        right_distance / dt;
-
-
-    // --------------------------------------------------------
-    // CONTROL FILTER
-    // --------------------------------------------------------
-
-    left_speed_control =
-        CONTROL_ALPHA_L *
-        left_speed_raw +
-        (1.0f - CONTROL_ALPHA_L) *
-        left_speed_control;
-
-
-    right_speed_control =
-        CONTROL_ALPHA_R *
-        right_speed_raw +
-        (1.0f - CONTROL_ALPHA_R) *
-        right_speed_control;
-
-
-    // --------------------------------------------------------
-    // ODOM FILTER
-    // --------------------------------------------------------
-
-    left_speed_odom =
-        ODOM_ALPHA_L *
-        left_speed_raw +
-        (1.0f - ODOM_ALPHA_L) *
-        left_speed_odom;
-
-
-    right_speed_odom =
-        ODOM_ALPHA_R *
-        right_speed_raw +
-        (1.0f - ODOM_ALPHA_R) *
-        right_speed_odom;
-}
-
-
-// ============================================================
-// CMD VEL
-// ============================================================
-
-void cmdVelCallback(
-    const void *msgin)
-{
-    const geometry_msgs__msg__Twist *msg =
-        (const geometry_msgs__msg__Twist *)msgin;
-
-    cmd_linear =
-        clampf(
-            msg->linear.x,
-            -MAX_SPEED_MS,
-            MAX_SPEED_MS);
-
-    cmd_angular =
-        msg->angular.z;
-}
-
-
-// ============================================================
-// DIRECT LEFT
-// ============================================================
-
-void leftCmdCallback(
-    const void *msgin)
-{
-    const std_msgs__msg__Float32 *msg =
-        (const std_msgs__msg__Float32 *)msgin;
-
-    target_left =
-        clampf(
-            msg->data,
-            -MAX_SPEED_MS,
-            MAX_SPEED_MS);
-}
-
-
-// ============================================================
-// DIRECT RIGHT
-// ============================================================
-
-void rightCmdCallback(
-    const void *msgin)
-{
-    const std_msgs__msg__Float32 *msg =
-        (const std_msgs__msg__Float32 *)msgin;
-
-    target_right =
-        clampf(
-            msg->data,
-            -MAX_SPEED_MS,
-            MAX_SPEED_MS);
-}
-
-
-// ============================================================
-// RESET
-// ============================================================
-
-void resetSpeedController()
-{
-    integral_left = 0.0f;
-    integral_right = 0.0f;
-
-    left_dac_output = 0.0f;
-    right_dac_output = 0.0f;
-
-    target_left_limited = 0.0f;
-    target_right_limited = 0.0f;
-
-    left_speed_control = 0.0f;
-    right_speed_control = 0.0f;
-
-    noInterrupts();
-
-    left_pulses = 0;
-    right_pulses = 0;
-
-    interrupts();
-
-    last_left_pulses = 0;
-    last_right_pulses = 0;
-}
-
-
-void pulseResetCallback(
-    const void *msgin)
-{
-    const std_msgs__msg__Bool *msg =
-        (const std_msgs__msg__Bool *)msgin;
-
-    if (msg->data)
-        resetSpeedController();
-}
-
-
-// ============================================================
-// WHEEL TARGET
-// ============================================================
-
-void calculateWheelTarget()
-{
-    cmd_linear_filtered =
-        CMD_ALPHA *
-        cmd_linear +
-        (1.0f - CMD_ALPHA) *
-        cmd_linear_filtered;
-
-
-    cmd_angular_filtered =
-        CMD_ALPHA *
-        cmd_angular +
-        (1.0f - CMD_ALPHA) *
-        cmd_angular_filtered;
-
-
-    target_left =
-        cmd_linear_filtered -
-        cmd_angular_filtered *
-        WHEEL_SEP *
-        0.5f;
-
-
-    target_right =
-        cmd_linear_filtered +
-        cmd_angular_filtered *
-        WHEEL_SEP *
-        0.5f;
-
-
-    target_left =
-        clampf(
-            target_left,
-            -MAX_SPEED_MS,
-            MAX_SPEED_MS);
-
-    target_right =
-        clampf(
-            target_right,
-            -MAX_SPEED_MS,
-            MAX_SPEED_MS);
-}
-
-
-// ============================================================
-// TARGET RAMP
-// ============================================================
-
-float rampTarget(
-    float current,
-    float target,
-    float dt)
-{
-    float delta =
-        target - current;
-
-
-    float max_up =
-        MAX_ACCEL * dt;
-
-    float max_down =
-        MAX_DECEL * dt;
-
-
-    if (delta > max_up)
-        delta = max_up;
-
-    if (delta < -max_down)
-        delta = -max_down;
-
-
-    return current + delta;
-}
-
-
-// ============================================================
-// STARTUP BALANCE
-//
-// If right starts faster than left:
-//   increase left slightly
-//   decrease right slightly
-//
-// Only during startup.
-// ============================================================
-
-void startupBalance()
-{
-    float command =
-        fmaxf(
-            fabsf(target_left_limited),
-            fabsf(target_right_limited));
-
-
-    if (command < STARTUP_MIN_SPEED)
-    {
-        startup_active = false;
-        return;
-    }
-
-
-    if (!startup_active)
-    {
-        startup_active = true;
-        startup_time = millis();
-    }
-
-
-    if ((millis() - startup_time) >
-        STARTUP_BALANCE_TIME)
-    {
-        startup_active = false;
-        return;
-    }
-
-
-    float diff =
-        fabsf(right_speed_control) -
-        fabsf(left_speed_control);
-
-
-    if (fabsf(diff) < 0.003f)
-        return;
-
-
-    float correction =
-        diff * STARTUP_GAIN;
-
-
-    correction =
-        clampf(
-            correction,
-            -STARTUP_MAX_CORRECTION,
-            STARTUP_MAX_CORRECTION);
-
-
-    if (target_left_limited >= 0.0f &&
-        target_right_limited >= 0.0f)
-    {
-        target_left_limited += correction;
-        target_right_limited -= correction;
-    }
-    else
-    {
-        target_left_limited -= correction;
-        target_right_limited += correction;
-    }
-
-
-    target_left_limited =
-        clampf(
-            target_left_limited,
-            -MAX_SPEED_MS,
-            MAX_SPEED_MS);
-
-    target_right_limited =
-        clampf(
-            target_right_limited,
-            -MAX_SPEED_MS,
-            MAX_SPEED_MS);
-}
-
-
-// ============================================================
-// STEADY LEFT/RIGHT MATCH
-//
-// Gentle only.
-// ============================================================
-
-void steadyStateMatching()
-{
-    if (fabsf(target_left_limited) <
-            STARTUP_MIN_SPEED ||
-        fabsf(target_right_limited) <
-            STARTUP_MIN_SPEED)
-    {
-        return;
-    }
-
-
-    // Do not interfere while turning.
-    if (fabsf(
-            target_left_limited -
-            target_right_limited) > 0.02f)
-    {
-        return;
-    }
-
-
-    float diff =
-        fabsf(right_speed_control) -
-        fabsf(left_speed_control);
-
-
-    if (fabsf(diff) <
-        MATCH_DEADBAND)
-    {
-        return;
-    }
-
-
-    float correction =
-        diff * MATCH_GAIN;
-
-
-    correction =
-        clampf(
-            correction,
-            -MATCH_MAX_CORRECTION,
-            MATCH_MAX_CORRECTION);
-
-
-    if (target_left_limited >= 0.0f &&
-        target_right_limited >= 0.0f)
-    {
-        target_left_limited += correction;
-        target_right_limited -= correction;
-    }
-    else
-    {
-        target_left_limited -= correction;
-        target_right_limited += correction;
-    }
-}
-
-
-// ============================================================
-// LEFT PI
-// ============================================================
-
-float leftPI(
-    float target,
-    float measured,
-    float dt)
-{
-    float target_abs =
-        fabsf(target);
-
-    float measured_abs =
-        fabsf(measured);
-
-
-    if (target_abs <
-        STOP_CMD_THRESHOLD)
-    {
-        integral_left = 0.0f;
-        return 0.0f;
-    }
-
-
-    float error =
-        target_abs -
-        measured_abs;
-
-
-    // --------------------------------------------------------
-    // Integral
-    // --------------------------------------------------------
-
-    if (fabsf(error) <
-            INTEGRAL_ERROR_LIMIT &&
-        measured_abs >
-            INTEGRAL_MIN_SPEED)
-    {
-        integral_left +=
-            error * dt;
-
-        integral_left =
-            clampf(
-                integral_left,
-                -INTEGRAL_LIMIT,
-                INTEGRAL_LIMIT);
-    }
-    else
-    {
-        // Anti-windup bleed
-        integral_left *= 0.95f;
-    }
-
-
-    float correction =
-        KP_L * error +
-        KI_L * integral_left;
-
-
-    correction =
-        clampf(
-            correction,
-            -PI_LIMIT,
-            PI_LIMIT);
-
-
-    return correction;
-}
-
-
-// ============================================================
-// RIGHT PI
-// ============================================================
-
-float rightPI(
-    float target,
-    float measured,
-    float dt)
-{
-    float target_abs =
-        fabsf(target);
-
-    float measured_abs =
-        fabsf(measured);
-
-
-    if (target_abs <
-        STOP_CMD_THRESHOLD)
-    {
-        integral_right = 0.0f;
-        return 0.0f;
-    }
-
-
-    float error =
-        target_abs -
-        measured_abs;
-
-
-    if (fabsf(error) <
-            INTEGRAL_ERROR_LIMIT &&
-        measured_abs >
-            INTEGRAL_MIN_SPEED)
-    {
-        integral_right +=
-            error * dt;
-
-        integral_right =
-            clampf(
-                integral_right,
-                -INTEGRAL_LIMIT,
-                INTEGRAL_LIMIT);
-    }
-    else
-    {
-        integral_right *= 0.95f;
-    }
-
-
-    float correction =
-        KP_R * error +
-        KI_R * integral_right;
-
-
-    correction =
-        clampf(
-            correction,
-            -PI_LIMIT,
-            PI_LIMIT);
-
-
-    return correction;
-}
-
-
-// ============================================================
-// MOTOR CONTROL
-// ============================================================
-
-void updateMotorControl(float dt)
-{
-    calculateWheelTarget();
-
-
-    // --------------------------------------------------------
-    // Target ramp
-    // --------------------------------------------------------
-
-    target_left_limited =
-        rampTarget(
-            target_left_limited,
-            target_left,
-            dt);
-
-
-    target_right_limited =
-        rampTarget(
-            target_right_limited,
-            target_right,
-            dt);
-
-
-    // --------------------------------------------------------
-    // Startup
-    // --------------------------------------------------------
-
-    startupBalance();
-
-
-    // --------------------------------------------------------
-    // Steady-state matching
-    // --------------------------------------------------------
-
-    steadyStateMatching();
-
-
-    // --------------------------------------------------------
-    // STOP
-    // --------------------------------------------------------
-
-    if (fabsf(target_left_limited) <
-        STOP_CMD_THRESHOLD)
-    {
-        integral_left = 0.0f;
-
-        left_dac_output =
-            applySlew(
-                left_dac_output,
-                0.0f,
-                DAC_SLEW_STOP);
-
-        writeLeftDAC(
-            left_dac_output);
-    }
-
-
-    if (fabsf(target_right_limited) <
-        STOP_CMD_THRESHOLD)
-    {
-        integral_right = 0.0f;
-
-        right_dac_output =
-            applySlew(
-                right_dac_output,
-                0.0f,
-                DAC_SLEW_STOP);
-
-        writeRightDAC(
-            right_dac_output);
-    }
-
-
-    // --------------------------------------------------------
-    // LEFT
-    // --------------------------------------------------------
-
-    if (fabsf(target_left_limited) >=
-        STARTUP_MIN_SPEED)
-    {
-        float ff =
-            leftFeedForward(
-                target_left_limited);
-
-
-        float pi =
-            leftPI(
-                target_left_limited,
-                left_speed_control,
-                dt);
-
-
-        float desired =
-            ff + pi;
-
-
-        desired =
-            clampf(
-                desired,
-                0.0f,
-                DAC_MAX);
-
-
-        if (target_left_limited >= 0.0f)
-            digitalWrite(L_FR, HIGH);
-        else
-            digitalWrite(L_FR, LOW);
-
-
-        left_dac_output =
-            applySlew(
-                left_dac_output,
-                desired,
-                DAC_SLEW);
-
-
-        writeLeftDAC(
-            left_dac_output);
-    }
-
-
-    // --------------------------------------------------------
-    // RIGHT
-    // --------------------------------------------------------
-
-    if (fabsf(target_right_limited) >=
-        STARTUP_MIN_SPEED)
-    {
-        float ff =
-            rightFeedForward(
-                target_right_limited);
-
-
-        float pi =
-            rightPI(
-                target_right_limited,
-                right_speed_control,
-                dt);
-
-
-        float desired =
-            ff + pi;
-
-
-        desired =
-            clampf(
-                desired,
-                0.0f,
-                DAC_MAX);
-
-
-        if (target_right_limited >= 0.0f)
-            digitalWrite(R_FR, HIGH);
-        else
-            digitalWrite(R_FR, LOW);
-
-
-        right_dac_output =
-            applySlew(
-                right_dac_output,
-                desired,
-                DAC_SLEW);
-
-
-        writeRightDAC(
-            right_dac_output);
-    }
-}
-
+float desired_dac_l = 0.0f;
+float desired_dac_r = 0.0f;
+int dac_output_l = 0;
+int dac_output_r = 0;
 
 // ============================================================
 // ODOMETRY
 // ============================================================
+float pose_x = 0.0f;
+float pose_y = 0.0f;
+float pose_theta = 0.0f;
+unsigned long last_control_time = 0;
+unsigned long last_pulse_pub_time = 0;
 
-void updateOdometry(float dt)
+// ============================================================
+// MICRO-ROS
+// ============================================================
+enum States
 {
-    float linear =
-        (left_speed_odom +
-         right_speed_odom) *
-        0.5f;
+  WAITING_AGENT,
+  AGENT_AVAILABLE,
+  AGENT_CONNECTED,
+  AGENT_DISCONNECTED
+};
+States state;
 
+// ============================================================
+// ROS OBJECTS
+// ============================================================
+rcl_subscription_t subscriber;
+rcl_subscription_t sub_left_cmd;
+rcl_subscription_t sub_right_cmd;
+rcl_subscription_t sub_pulse_reset;
+rcl_publisher_t odom_publisher;
+rcl_publisher_t left_speed_publisher;
+rcl_publisher_t right_speed_publisher;
+rcl_publisher_t left_dac_publisher;
+rcl_publisher_t right_dac_publisher;
+rcl_publisher_t left_pulse_publisher;
+rcl_publisher_t right_pulse_publisher;
 
-    float angular =
-        (right_speed_odom -
-         left_speed_odom) /
-        WHEEL_SEP;
+geometry_msgs__msg__Twist msg_twist;
+std_msgs__msg__Float32 msg_left_cmd;
+std_msgs__msg__Float32 msg_right_cmd;
+std_msgs__msg__Bool msg_pulse_reset;
+nav_msgs__msg__Odometry odom_msg;
+std_msgs__msg__Float32 left_speed_msg;
+std_msgs__msg__Float32 right_speed_msg;
+std_msgs__msg__Float32 left_dac_msg;
+std_msgs__msg__Float32 right_dac_msg;
+std_msgs__msg__Int32 left_pulse_msg;
+std_msgs__msg__Int32 right_pulse_msg;
 
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_allocator_t allocator;
+rcl_node_t node;
+unsigned long last_ping_time = 0;
 
-    odom_x +=
-        linear *
-        cosf(odom_yaw) *
-        dt;
+// ============================================================
+// V9.5 TIME SYNC STATE
+// ============================================================
+unsigned long connected_at_ms = 0;
+bool time_resynced = false;
 
+// ============================================================
+// FUNCTION PROTOTYPES
+// ============================================================
+bool create_entities();
+void destroy_entities();
+void reset_speed_controller();
+void check_cmd_timeout();
+void update_ramped_targets(float dt);
+void read_encoder_counts(long &count_l, long &count_r);
+void update_velocity_estimator(long count_l, long count_r, unsigned long now);
+void update_control_filters();
+void update_odom_filters();
+float interpolate_dac(float target_speed, const float * dac_table);
+float compute_feedforward_left(float target_speed);
+float compute_feedforward_right(float target_speed);
+float compute_left_dac(float target_speed, float measured_speed, float dt);
+float compute_right_dac(float target_speed, float measured_speed, float dt);
+int apply_dac_slew(float desired, int current, float max_step);
+void update_left_launch();
+void update_right_launch();
+void update_startup_balance();
+float get_startup_left_correction();
+float get_startup_right_correction();
+void motor_control_process();
+void update_and_publish_odom();
+void publish_pulse_counts();
+void L_HAL_ISR();
+void R_HAL_ISR();
 
-    odom_y +=
-        linear *
-        sinf(odom_yaw) *
-        dt;
+// ============================================================
+// ENCODER ISR
+// ============================================================
+// Software debounce (เทียบเท่า Timer Input Filter สำหรับ EXTI ที่ไม่มี ICxF):
+// ปฏิเสธ edge ที่มาเร็วเกินไปจาก edge ก่อนหน้า - ที่ 1.5 m/s (max speed) กับ
+// PPR ~627 (left) period สั้นสุดของ pulse จริงอยู่ที่ ~427 us จึงตั้ง window
+// ไว้ 50 us ให้กัน contact bounce/noise ได้โดยไม่กิน pulse จริงแม้ที่ท็อปสปีด
+volatile unsigned long last_pulse_us_l = 0;
+volatile unsigned long last_pulse_us_r = 0;
+const unsigned long ENCODER_DEBOUNCE_US = 50;
 
-
-    odom_yaw +=
-        angular * dt;
-
-
-    while (odom_yaw > PI)
-        odom_yaw -=
-            2.0f * PI;
-
-
-    while (odom_yaw < -PI)
-        odom_yaw +=
-            2.0f * PI;
+void L_HAL_ISR()
+{
+  unsigned long now = micros();
+  if (now - last_pulse_us_l < ENCODER_DEBOUNCE_US) return;
+  last_pulse_us_l = now;
+  pulse_l++; cal_pulse_l++;
 }
 
-
-// ============================================================
-// PUBLISH SPEED
-// ============================================================
-
-void publishWheelData()
+void R_HAL_ISR()
 {
-    left_speed_msg.data =
-        left_speed_control;
-
-    right_speed_msg.data =
-        right_speed_control;
-
-
-    left_dac_msg.data =
-        left_dac_output;
-
-    right_dac_msg.data =
-        right_dac_output;
-
-
-    rcl_publish(
-        &left_speed_pub,
-        &left_speed_msg,
-        NULL);
-
-
-    rcl_publish(
-        &right_speed_pub,
-        &right_speed_msg,
-        NULL);
-
-
-    rcl_publish(
-        &left_dac_pub,
-        &left_dac_msg,
-        NULL);
-
-
-    rcl_publish(
-        &right_dac_pub,
-        &right_dac_msg,
-        NULL);
+  unsigned long now = micros();
+  if (now - last_pulse_us_r < ENCODER_DEBOUNCE_US) return;
+  last_pulse_us_r = now;
+  pulse_r++; cal_pulse_r++;
 }
 
-
 // ============================================================
-// PUBLISH ODOM
+// CMD_VEL CALLBACK
 // ============================================================
-
-void publishOdometry()
+void subscription_callback(const void * msvin)
 {
-    int64_t now_ns =
-        rmw_uros_epoch_nanos();
+  const geometry_msgs__msg__Twist * msg =
+    (const geometry_msgs__msg__Twist *)msvin;
+  float v = msg->linear.x;
+  float w = msg->angular.z;
 
+  target_speed_l = v - ((w * wheel_sep) / 2.0f);
+  target_speed_r = v + ((w * wheel_sep) / 2.0f);
 
-    odom_msg.header.stamp.sec =
-        now_ns / 1000000000LL;
-
-    odom_msg.header.stamp.nanosec =
-        now_ns % 1000000000LL;
-
-
-    odom_msg.header.frame_id.data =
-        (char *)"odom";
-
-    odom_msg.header.frame_id.size =
-        4;
-
-    odom_msg.header.frame_id.capacity =
-        5;
-
-
-    odom_msg.child_frame_id.data =
-        (char *)"base_link";
-
-    odom_msg.child_frame_id.size =
-        9;
-
-    odom_msg.child_frame_id.capacity =
-        10;
-
-
-    odom_msg.pose.pose.position.x =
-        odom_x;
-
-    odom_msg.pose.pose.position.y =
-        odom_y;
-
-    odom_msg.pose.pose.position.z =
-        0.0;
-
-
-    float half =
-        odom_yaw * 0.5f;
-
-
-    odom_msg.pose.pose.orientation.x =
-        0.0;
-
-    odom_msg.pose.pose.orientation.y =
-        0.0;
-
-    odom_msg.pose.pose.orientation.z =
-        sinf(half);
-
-    odom_msg.pose.pose.orientation.w =
-        cosf(half);
-
-
-    odom_msg.twist.twist.linear.x =
-        (left_speed_odom +
-         right_speed_odom) *
-        0.5f;
-
-
-    odom_msg.twist.twist.linear.y =
-        0.0;
-
-
-    odom_msg.twist.twist.angular.z =
-        (right_speed_odom -
-         left_speed_odom) /
-        WHEEL_SEP;
-
-
-    rcl_publish(
-        &odom_pub,
-        &odom_msg,
-        NULL);
+  target_speed_l = constrain(target_speed_l, -MAX_SPEED_MS, MAX_SPEED_MS);
+  target_speed_r = constrain(target_speed_r, -MAX_SPEED_MS, MAX_SPEED_MS);
+  last_cmd_time = millis();
 }
 
-
 // ============================================================
-// CONTROL LOOP
+// DIRECT LEFT COMMAND
 // ============================================================
-
-void controlLoop()
+void left_cmd_callback(const void * msvin)
 {
-    uint32_t now =
-        millis();
+  const std_msgs__msg__Float32 * msg =
+    (const std_msgs__msg__Float32 *)msvin;
+  target_speed_l = constrain(msg->data, -MAX_SPEED_MS, MAX_SPEED_MS);
+  last_cmd_time = millis();
+}
 
+// ============================================================
+// DIRECT RIGHT COMMAND
+// ============================================================
+void right_cmd_callback(const void * msvin)
+{
+  const std_msgs__msg__Float32 * msg =
+    (const std_msgs__msg__Float32 *)msvin;
+  target_speed_r = constrain(msg->data, -MAX_SPEED_MS, MAX_SPEED_MS);
+  last_cmd_time = millis();
+}
 
-    if ((now - last_control_ms) <
-        CONTROL_PERIOD_MS)
+// ============================================================
+// RESET CALIBRATION COUNTERS
+// ============================================================
+void pulse_reset_callback(const void * msvin)
+{
+  const std_msgs__msg__Bool * msg =
+    (const std_msgs__msg__Bool *)msvin;
+  if (msg->data)
+  {
+    noInterrupts();
+    cal_pulse_l = 0;
+    cal_pulse_r = 0;
+    interrupts();
+  }
+}
+
+// ============================================================
+// MICRO-ROS CREATE ENTITIES
+// ============================================================
+bool create_entities()
+{
+  allocator = rcl_get_default_allocator();
+
+  if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) return false;
+  if (rclc_node_init_default(&node, "stm32_motor_node", "", &support) != RCL_RET_OK) return false;
+
+  rmw_uros_sync_session(1000);
+
+  // SUBSCRIBERS
+  if (rclc_subscription_init_default(&subscriber, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel") != RCL_RET_OK) return false;
+  if (rclc_subscription_init_default(&sub_left_cmd, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "motor/left/cmd") != RCL_RET_OK) return false;
+  if (rclc_subscription_init_default(&sub_right_cmd, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "motor/right/cmd") != RCL_RET_OK) return false;
+  if (rclc_subscription_init_default(&sub_pulse_reset, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "motor/pulse_reset") != RCL_RET_OK) return false;
+
+  // PUBLISHERS
+  if (rclc_publisher_init_default(&odom_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "wheel/odom") != RCL_RET_OK) return false;
+  if (rclc_publisher_init_default(&left_speed_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel/left/speed") != RCL_RET_OK) return false;
+  if (rclc_publisher_init_default(&right_speed_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel/right/speed") != RCL_RET_OK) return false;
+  if (rclc_publisher_init_default(&left_dac_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel/left/dac") != RCL_RET_OK) return false;
+  if (rclc_publisher_init_default(&right_dac_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel/right/dac") != RCL_RET_OK) return false;
+  if (rclc_publisher_init_default(&left_pulse_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "wheel/left/pulse_count") != RCL_RET_OK) return false;
+  if (rclc_publisher_init_default(&right_pulse_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "wheel/right/pulse_count") != RCL_RET_OK) return false;
+
+  // EXECUTOR
+  if (rclc_executor_init(&executor, &support.context, 4, &allocator) != RCL_RET_OK) return false;
+  if (rclc_executor_add_subscription(&executor, &subscriber, &msg_twist, subscription_callback, ON_NEW_DATA) != RCL_RET_OK) return false;
+  if (rclc_executor_add_subscription(&executor, &sub_left_cmd, &msg_left_cmd, left_cmd_callback, ON_NEW_DATA) != RCL_RET_OK) return false;
+  if (rclc_executor_add_subscription(&executor, &sub_right_cmd, &msg_right_cmd, right_cmd_callback, ON_NEW_DATA) != RCL_RET_OK) return false;
+  if (rclc_executor_add_subscription(&executor, &sub_pulse_reset, &msg_pulse_reset, pulse_reset_callback, ON_NEW_DATA) != RCL_RET_OK) return false;
+
+  // ODOM FRAME NAMES
+  rosidl_runtime_c__String__assign(&odom_msg.header.frame_id, "odom");
+  rosidl_runtime_c__String__assign(&odom_msg.child_frame_id, "base_link");
+
+  reset_speed_controller();
+  last_control_time = millis();
+  return true;
+}
+
+// ============================================================
+// DESTROY ENTITIES
+// ============================================================
+void destroy_entities()
+{
+  rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
+  (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+  rosidl_runtime_c__String__fini(&odom_msg.header.frame_id);
+  rosidl_runtime_c__String__fini(&odom_msg.child_frame_id);
+
+  (void) rcl_publisher_fini(&odom_publisher, &node);
+  (void) rcl_publisher_fini(&left_speed_publisher, &node);
+  (void) rcl_publisher_fini(&right_speed_publisher, &node);
+  (void) rcl_publisher_fini(&left_dac_publisher, &node);
+  (void) rcl_publisher_fini(&right_dac_publisher, &node);
+  (void) rcl_publisher_fini(&left_pulse_publisher, &node);
+  (void) rcl_publisher_fini(&right_pulse_publisher, &node);
+
+  (void) rcl_subscription_fini(&subscriber, &node);
+  (void) rcl_subscription_fini(&sub_left_cmd, &node);
+  (void) rcl_subscription_fini(&sub_right_cmd, &node);
+  (void) rcl_subscription_fini(&sub_pulse_reset, &node);
+
+  (void) rclc_executor_fini(&executor);
+  (void) rcl_node_fini(&node);
+  (void) rclc_support_fini(&support);
+}
+
+// ============================================================
+// RESET SPEED CONTROLLER
+// ============================================================
+void reset_speed_controller()
+{
+  raw_speed_l = 0.0f; raw_speed_r = 0.0f;
+  control_speed_l = 0.0f; control_speed_r = 0.0f;
+  odom_speed_l = 0.0f; odom_speed_r = 0.0f;
+  prev_error_l = 0.0f; prev_error_r = 0.0f;
+  integral_l = 0.0f; integral_r = 0.0f;
+  desired_dac_l = 0.0f; desired_dac_r = 0.0f;
+  dac_output_l = 0; dac_output_r = 0;
+  left_dac_msg.data = 0.0f; right_dac_msg.data = 0.0f;
+  current_target_l = 0.0f; current_target_r = 0.0f;
+
+  startup_speed_diff = 0.0f;
+  startup_left_correction = 0.0f;
+  startup_right_correction = 0.0f;
+  startup_balance_start = 0;
+  startup_balance_active = false;
+  startup_balance_had_command = false;
+
+  left_launch_active = false;
+  left_launch_had_command = false;
+  left_launch_start = 0;
+
+  right_launch_active = false;
+  right_launch_had_command = false;
+  right_launch_start = 0;
+
+  velocity_pulse_l = 0; velocity_pulse_r = 0;
+  history_index = 0; history_initialized = false;
+  for (int i = 0; i < VELOCITY_HISTORY_SIZE; i++)
+  {
+    pulse_history_l[i] = 0; pulse_history_r[i] = 0; time_history[i] = 0;
+  }
+}
+
+// ============================================================
+// COMMAND TIMEOUT
+// ============================================================
+void check_cmd_timeout()
+{
+  if (last_cmd_time == 0 || millis() - last_cmd_time > CMD_TIMEOUT_MS)
+  {
+    target_speed_l = 0.0f;
+    target_speed_r = 0.0f;
+  }
+}
+
+// ============================================================
+// ACCELERATION RAMP
+// ============================================================
+void update_ramped_targets(float dt)
+{
+  float accel_step = MAX_ACCEL * dt;
+  float decel_step = MAX_DECEL * dt;
+
+  if (fabs(target_speed_l) < STOP_TARGET_THRESHOLD) current_target_l = 0.0f;
+  else if (current_target_l < target_speed_l) current_target_l = min(current_target_l + accel_step, target_speed_l);
+  else if (current_target_l > target_speed_l) current_target_l = max(current_target_l - decel_step, target_speed_l);
+
+  if (fabs(target_speed_r) < STOP_TARGET_THRESHOLD) current_target_r = 0.0f;
+  else if (current_target_r < target_speed_r) current_target_r = min(current_target_r + accel_step, target_speed_r);
+  else if (current_target_r > target_speed_r) current_target_r = max(current_target_r - decel_step, target_speed_r);
+}
+
+// ============================================================
+// READ ENCODER
+// ============================================================
+void read_encoder_counts(long &count_l, long &count_r)
+{
+  noInterrupts();
+  count_l = pulse_l; count_r = pulse_r;
+  pulse_l = 0; pulse_r = 0;
+  interrupts();
+}
+
+// ============================================================
+// VELOCITY ESTIMATOR
+// ============================================================
+void update_velocity_estimator(long count_l, long count_r, unsigned long now)
+{
+  bool left_forward = current_target_l >= 0.0f;
+  bool right_forward = current_target_r >= 0.0f;
+
+  long signed_l = left_forward ? count_l : -count_l;
+  long signed_r = right_forward ? count_r : -count_r;
+
+  velocity_pulse_l += signed_l;
+  velocity_pulse_r += signed_r;
+
+  if (!history_initialized)
+  {
+    for (int i = 0; i < VELOCITY_HISTORY_SIZE; i++)
     {
-        return;
+      pulse_history_l[i] = velocity_pulse_l;
+      pulse_history_r[i] = velocity_pulse_r;
+      time_history[i] = now;
     }
+    history_index = 0;
+    history_initialized = true;
+    raw_speed_l = 0.0f;
+    raw_speed_r = 0.0f;
+    return;
+  }
 
+  pulse_history_l[history_index] = velocity_pulse_l;
+  pulse_history_r[history_index] = velocity_pulse_r;
+  time_history[history_index] = now;
 
-    float dt =
-        (now - last_control_ms) /
-        1000.0f;
+  int oldest_index = (history_index + 1) % VELOCITY_HISTORY_SIZE;
+  unsigned long elapsed_ms = now - time_history[oldest_index];
 
+  if (elapsed_ms >= VELOCITY_WINDOW_MS)
+  {
+    long delta_pulse_l = velocity_pulse_l - pulse_history_l[oldest_index];
+    long delta_pulse_r = velocity_pulse_r - pulse_history_r[oldest_index];
 
-    last_control_ms =
-        now;
+    float distance_l = ((float)delta_pulse_l / ENCODER_PPR) * wheel_circumference;
+    float distance_r = ((float)delta_pulse_r / ENCODER_PPR) * wheel_circumference;
 
-
-    if (dt <= 0.0f ||
-        dt > 0.5f)
+    float dt = elapsed_ms / 1000.0f;
+    if (dt > 0.0f)
     {
-        dt =
-            CONTROL_PERIOD_MS /
-            1000.0f;
+      raw_speed_l = distance_l / dt;
+      raw_speed_r = distance_r / dt;
     }
-
-
-    updateVelocity();
-
-
-    updateMotorControl(dt);
-
-
-    updateOdometry(dt);
-
-
-    publishWheelData();
-
-
-    publishOdometry();
+  }
+  history_index = (history_index + 1) % VELOCITY_HISTORY_SIZE;
 }
 
+// ============================================================
+// LOW PASS FILTERS
+// ============================================================
+void update_control_filters()
+{
+  control_speed_l = CONTROL_FILTER_ALPHA_L * raw_speed_l + (1.0f - CONTROL_FILTER_ALPHA_L) * control_speed_l;
+  control_speed_r = CONTROL_FILTER_ALPHA_R * raw_speed_r + (1.0f - CONTROL_FILTER_ALPHA_R) * control_speed_r;
+}
+
+void update_odom_filters()
+{
+  odom_speed_l = ODOM_FILTER_ALPHA_L * raw_speed_l + (1.0f - ODOM_FILTER_ALPHA_L) * odom_speed_l;
+  odom_speed_r = ODOM_FILTER_ALPHA_R * raw_speed_r + (1.0f - ODOM_FILTER_ALPHA_R) * odom_speed_r;
+}
+
+// ============================================================
+// DAC INTERPOLATION (extrapolates below speed_table[0] from the origin,
+// and beyond speed_table[CAL_POINTS-1] linearly - see calibration comment)
+// ============================================================
+float interpolate_dac(float target_speed, const float * dac_table)
+{
+  float speed = fabs(target_speed);
+  if (speed <= 0.001f) return 0.0f;
+
+  if (speed <= speed_table[0])
+  {
+    float ratio = speed / speed_table[0];
+    return constrain(ratio * dac_table[0], (float)DAC_MIN, (float)DAC_MAX);
+  }
+
+  for (int i = 0; i < CAL_POINTS - 1; i++)
+  {
+    if (speed >= speed_table[i] && speed <= speed_table[i + 1])
+    {
+      float ratio = (speed - speed_table[i]) / (speed_table[i + 1] - speed_table[i]);
+      float result = dac_table[i] + ratio * (dac_table[i + 1] - dac_table[i]);
+      return constrain(result, (float)DAC_MIN, (float)DAC_MAX);
+    }
+  }
+
+  // V9.8 note: > 1.0 m/s ใช้ extrapolation แล้ว constrain ที่ 4095
+  // (ไม่ถึง 1.5 ก็ไม่เป็นไร - DAC จะอิ่มที่เพดาน)
+  float slope = (dac_table[CAL_POINTS - 1] - dac_table[CAL_POINTS - 2]) / (speed_table[CAL_POINTS - 1] - speed_table[CAL_POINTS - 2]);
+  float result = dac_table[CAL_POINTS - 1] + slope * (speed - speed_table[CAL_POINTS - 1]);
+  return constrain(result, (float)DAC_MIN, (float)DAC_MAX);
+}
+
+// ============================================================
+// FEED-FORWARD
+// ============================================================
+float compute_feedforward_left(float target_speed)
+{
+  return interpolate_dac(target_speed, left_dac_table);
+}
+
+float compute_feedforward_right(float target_speed)
+{
+  return interpolate_dac(target_speed, right_dac_table);
+}
+
+// ============================================================
+// V9.3 LEFT LAUNCH BOOST STATE
+// ============================================================
+void update_left_launch()
+{
+  bool commanded = fabs(current_target_l) > 0.001f;
+  if (!commanded)
+  {
+    left_launch_active = false;
+    left_launch_had_command = false;
+    return;
+  }
+  if (!left_launch_had_command)
+  {
+    left_launch_had_command = true;
+    left_launch_active = true;
+    left_launch_start = millis();
+  }
+  if (left_launch_active)
+  {
+    bool moving = fabs(raw_speed_l) > LEFT_LAUNCH_SPEED_THRESHOLD;
+    bool timed_out = (millis() - left_launch_start) > LEFT_LAUNCH_TIMEOUT_MS;
+    if (moving || timed_out) left_launch_active = false;
+  }
+}
+
+// ============================================================
+// V9.4 RIGHT LAUNCH HOLD STATE
+// ============================================================
+void update_right_launch()
+{
+  bool commanded = fabs(current_target_r) > 0.001f;
+  if (!commanded)
+  {
+    right_launch_active = false;
+    right_launch_had_command = false;
+    return;
+  }
+  if (!right_launch_had_command)
+  {
+    right_launch_had_command = true;
+    right_launch_active = true;
+    right_launch_start = millis();
+  }
+  if (right_launch_active)
+  {
+    bool left_moving = fabs(raw_speed_l) > LEFT_LAUNCH_SPEED_THRESHOLD;
+    bool timed_out = (millis() - right_launch_start) > RIGHT_LAUNCH_TIMEOUT_MS;
+    if (left_moving || timed_out) right_launch_active = false;
+  }
+}
+
+// ============================================================
+// V9.1 / V9.6 BIDIRECTIONAL STARTUP BALANCE
+// ============================================================
+void update_startup_balance()
+{
+  bool commanded = fabs(current_target_l) > STARTUP_BALANCE_START_SPEED ||
+                   fabs(current_target_r) > STARTUP_BALANCE_START_SPEED;
+
+  if (!commanded)
+  {
+    startup_balance_active = false;
+    startup_balance_had_command = false;
+    startup_speed_diff = 0.0f;
+    startup_left_correction = 0.0f;
+    startup_right_correction = 0.0f;
+    return;
+  }
+
+  if (!startup_balance_had_command)
+  {
+    startup_balance_had_command = true;
+    startup_balance_active = true;
+    startup_balance_start = millis();
+    startup_speed_diff = 0.0f;
+    startup_left_correction = 0.0f;
+    startup_right_correction = 0.0f;
+  }
+
+  if (!startup_balance_active)
+  {
+    startup_left_correction = 0.0f;
+    startup_right_correction = 0.0f;
+    return;
+  }
+
+  if (millis() - startup_balance_start > STARTUP_BALANCE_TIME_MS)
+  {
+    startup_balance_active = false;
+    startup_left_correction = 0.0f;
+    startup_right_correction = 0.0f;
+    return;
+  }
+
+  float diff = fabs(raw_speed_r) - fabs(raw_speed_l);
+  startup_speed_diff = STARTUP_BALANCE_ALPHA * diff + (1.0f - STARTUP_BALANCE_ALPHA) * startup_speed_diff;
+
+  // V9.6: bidirectional -- ช่วยข้างที่ "ช้ากว่า"
+  if (startup_speed_diff > STARTUP_BALANCE_ERROR_ON)
+  {
+    startup_left_correction  = constrain(STARTUP_BALANCE_K * (startup_speed_diff - STARTUP_BALANCE_ERROR_OFF), 0.0f, STARTUP_BALANCE_MAX_DAC);
+    startup_right_correction = 0.0f;
+  }
+  else if (startup_speed_diff < -STARTUP_BALANCE_ERROR_ON)
+  {
+    startup_right_correction = constrain(STARTUP_BALANCE_K * (-startup_speed_diff - STARTUP_BALANCE_ERROR_OFF), 0.0f, STARTUP_BALANCE_MAX_DAC);
+    startup_left_correction  = 0.0f;
+  }
+  else
+  {
+    startup_left_correction  = 0.0f;
+    startup_right_correction = 0.0f;
+  }
+}
+
+float get_startup_left_correction()  { return startup_left_correction; }
+float get_startup_right_correction() { return startup_right_correction; }
+
+// ============================================================
+// CONTROLLERS (V9.7/V9.8 anti-windup)
+// ============================================================
+float compute_left_dac(float target_speed, float measured_speed, float dt)
+{
+  float target_mag = fabs(target_speed);
+  if (target_mag <= 0.001f)
+  {
+    prev_error_l = 0.0f; integral_l = 0.0f; return 0.0f;
+  }
+
+  float error = target_mag - fabs(measured_speed);
+  if (fabs(error) < SPEED_DEADBAND) error = 0.0f;
+
+  float derivative = (dt > 0.0f) ? (error - prev_error_l) / dt : 0.0f;
+
+  // V9.7: ไม่ integrate ตอนล้อหยุด (กัน wind-up ตอนออกตัว)
+  // V9.8: ไม่ integrate ขึ้นต่อตอน DAC อิ่มตัว (กัน wind-up ที่ target สูงเกินเอื้อม)
+  bool saturated = (desired_dac_l >= (float)(DAC_MAX - 1)) && (error > 0.0f);
+  if (dt > 0.0f && fabs(error) < 0.20f &&
+      fabs(measured_speed) > 0.05f && !saturated)
+  {
+    integral_l += error * dt;
+    integral_l = constrain(integral_l, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+  }
+  prev_error_l = error;
+
+  float ff = compute_feedforward_left(target_speed);
+  float correction = Kp_L * error + Ki_L * integral_l + Kd_L * derivative;
+  float output = ff + correction + get_startup_left_correction();
+
+  return constrain(output, (float)DAC_MIN, (float)DAC_MAX);
+}
+
+float compute_right_dac(float target_speed, float measured_speed, float dt)
+{
+  float target_mag = fabs(target_speed);
+  if (target_mag <= 0.001f)
+  {
+    prev_error_r = 0.0f; integral_r = 0.0f; return 0.0f;
+  }
+
+  float error = target_mag - fabs(measured_speed);
+  if (fabs(error) < SPEED_DEADBAND) error = 0.0f;
+
+  float derivative = (dt > 0.0f) ? (error - prev_error_r) / dt : 0.0f;
+
+  bool saturated = (desired_dac_r >= (float)(DAC_MAX - 1)) && (error > 0.0f);
+  if (dt > 0.0f && fabs(error) < 0.20f &&
+      fabs(measured_speed) > 0.05f && !saturated)
+  {
+    integral_r += error * dt;
+    integral_r = constrain(integral_r, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+  }
+  prev_error_r = error;
+
+  float ff = compute_feedforward_right(target_speed);
+  float correction = Kp_R * error + Ki_R * integral_r + Kd_R * derivative;
+  float output = ff + correction + get_startup_right_correction();
+
+  return constrain(output, (float)DAC_MIN, (float)DAC_MAX);
+}
+
+// ============================================================
+// DAC SLEW LIMITER
+// ============================================================
+int apply_dac_slew(float desired, int current, float max_step)
+{
+  float difference = desired - (float)current;
+  if (difference > max_step) difference = max_step;
+  if (difference < -max_step) difference = -max_step;
+  return constrain((int)((float)current + difference), DAC_MIN, DAC_MAX);
+}
+
+// ============================================================
+// MOTOR OUTPUT
+// ============================================================
+void motor_control_process()
+{
+  digitalWrite(L_FR_PIN, (current_target_l >= 0.0f) ? HIGH : LOW);
+  digitalWrite(R_FR_PIN, (current_target_r >= 0.0f) ? LOW : HIGH);
+  analogWrite(L_SP_PIN, dac_output_l);
+  analogWrite(R_SP_PIN, dac_output_r);
+}
+
+// ============================================================
+// UPDATE CONTROL + ODOM
+// ============================================================
+void update_and_publish_odom()
+{
+  unsigned long now = millis();
+  unsigned long elapsed = now - last_control_time;
+  if (elapsed < CONTROL_PERIOD_MS) return;
+
+  float dt = elapsed / 1000.0f;
+  if (dt <= 0.0f) return;
+  if (dt > 0.2f) dt = 0.05f;
+  last_control_time = now;
+
+  update_ramped_targets(dt);
+
+  long count_l = 0, count_r = 0;
+  read_encoder_counts(count_l, count_r);
+  update_velocity_estimator(count_l, count_r, now);
+
+  update_control_filters();
+  update_odom_filters();
+
+  update_startup_balance();
+  update_left_launch();
+  update_right_launch();
+
+  if (fabs(target_speed_l) < STOP_TARGET_THRESHOLD && fabs(target_speed_r) < STOP_TARGET_THRESHOLD)
+  {
+    if (fabs(raw_speed_l) < STOP_SPEED_THRESHOLD) odom_speed_l = 0.0f;
+    if (fabs(raw_speed_r) < STOP_SPEED_THRESHOLD) odom_speed_r = 0.0f;
+  }
+
+  desired_dac_l = compute_left_dac(current_target_l, control_speed_l, dt);
+  desired_dac_r = compute_right_dac(current_target_r, control_speed_r, dt);
+
+  // V9.8: speed-proportional normal slew
+  float slew_l = SLEW_BASE + (SLEW_MAX - SLEW_BASE) * constrain(fabs(current_target_l) / SLEW_FULL_SPEED, 0.0f, 1.0f);
+  float slew_r = SLEW_BASE + (SLEW_MAX - SLEW_BASE) * constrain(fabs(current_target_r) / SLEW_FULL_SPEED, 0.0f, 1.0f);
+
+  // LEFT SLEW
+  float dac_step_l = (fabs(target_speed_l) < STOP_TARGET_THRESHOLD) ? STOP_DAC_STEP_L :
+                     (left_launch_active) ? LAUNCH_DAC_STEP_L : slew_l;
+  dac_output_l = apply_dac_slew(desired_dac_l, dac_output_l, dac_step_l);
+
+  // RIGHT SLEW
+  float dac_step_r = (fabs(target_speed_r) < STOP_TARGET_THRESHOLD) ? STOP_DAC_STEP_R :
+                     (right_launch_active) ? RIGHT_LAUNCH_DAC_STEP : slew_r;
+  dac_output_r = apply_dac_slew(desired_dac_r, dac_output_r, dac_step_r);
+
+  // PUBLISH SPEED
+  left_speed_msg.data = odom_speed_l;
+  rcl_publish(&left_speed_publisher, &left_speed_msg, NULL);
+  right_speed_msg.data = odom_speed_r;
+  rcl_publish(&right_speed_publisher, &right_speed_msg, NULL);
+
+  // PUBLISH DAC
+  left_dac_msg.data = (float)dac_output_l;
+  rcl_publish(&left_dac_publisher, &left_dac_msg, NULL);
+  right_dac_msg.data = (float)dac_output_r;
+  rcl_publish(&right_dac_publisher, &right_dac_msg, NULL);
+
+  // ODOMETRY CALCULATION
+  float v = (odom_speed_r + odom_speed_l) / 2.0f;
+  float w = (odom_speed_r - odom_speed_l) / wheel_sep;
+  float delta_s = v * dt;
+  float delta_theta = w * dt;
+
+  pose_x += delta_s * cos(pose_theta + delta_theta / 2.0f);
+  pose_y += delta_s * sin(pose_theta + delta_theta / 2.0f);
+  pose_theta += delta_theta;
+
+  while (pose_theta > PI) pose_theta -= 2.0f * PI;
+  while (pose_theta < -PI) pose_theta += 2.0f * PI;
+
+  // ROS TIME
+  int64_t time_ms = rmw_uros_epoch_millis();
+  odom_msg.header.stamp.sec = time_ms / 1000;
+  odom_msg.header.stamp.nanosec = (time_ms % 1000) * 1000000;
+
+  // POSITION
+  odom_msg.pose.pose.position.x = pose_x;
+  odom_msg.pose.pose.position.y = pose_y;
+  odom_msg.pose.pose.position.z = 0.0;
+
+  // ORIENTATION
+  odom_msg.pose.pose.orientation.x = 0.0;
+  odom_msg.pose.pose.orientation.y = 0.0;
+  odom_msg.pose.pose.orientation.z = sin(pose_theta / 2.0f);
+  odom_msg.pose.pose.orientation.w = cos(pose_theta / 2.0f);
+
+  // VELOCITY
+  odom_msg.twist.twist.linear.x = v;
+  odom_msg.twist.twist.angular.z = w;
+
+  rcl_publish(&odom_publisher, &odom_msg, NULL);
+}
+
+// ============================================================
+// PUBLISH PULSE COUNTERS
+// ============================================================
+void publish_pulse_counts()
+{
+  unsigned long now = millis();
+  if (now - last_pulse_pub_time < 200) return;
+
+  long l = 0, r = 0;
+  noInterrupts();
+  l = cal_pulse_l; r = cal_pulse_r;
+  interrupts();
+
+  left_pulse_msg.data = (int32_t)l;
+  rcl_publish(&left_pulse_publisher, &left_pulse_msg, NULL);
+  right_pulse_msg.data = (int32_t)r;
+  rcl_publish(&right_pulse_publisher, &right_pulse_msg, NULL);
+  last_pulse_pub_time = now;
+}
 
 // ============================================================
 // SETUP
 // ============================================================
-
 void setup()
 {
-    // --------------------------------------------------------
-    // Serial
-    // --------------------------------------------------------
+  pinMode(R_FR_PIN, OUTPUT); pinMode(R_RUN_PIN, OUTPUT);
+  pinMode(L_FR_PIN, OUTPUT); pinMode(L_RUN_PIN, OUTPUT);
+  pinMode(L_HAL, INPUT_PULLUP); pinMode(R_HAL, INPUT_PULLUP);
 
-    Serial.begin(115200);
+  attachInterrupt(digitalPinToInterrupt(L_HAL), L_HAL_ISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(R_HAL), R_HAL_ISR, CHANGE);
 
+  analogWriteResolution(12);
+  analogWrite(R_SP_PIN, 0); analogWrite(L_SP_PIN, 0);
 
-    // --------------------------------------------------------
-    // Motor pins
-    // --------------------------------------------------------
+  digitalWrite(R_FR_PIN, LOW); digitalWrite(L_FR_PIN, LOW);
 
-    pinMode(L_SP, OUTPUT);
-    pinMode(L_FR, OUTPUT);
-    pinMode(L_RUN, OUTPUT);
+  digitalWrite(R_RUN_PIN, HIGH); digitalWrite(L_RUN_PIN, HIGH);
+  delay(500);
+  digitalWrite(R_RUN_PIN, LOW); digitalWrite(L_RUN_PIN, LOW);
 
-    pinMode(R_SP, OUTPUT);
-    pinMode(R_FR, OUTPUT);
-    pinMode(R_RUN, OUTPUT);
+  Serial.begin(115200);
+  set_microros_serial_transports(Serial);
 
-
-    // --------------------------------------------------------
-    // Encoder pins
-    // --------------------------------------------------------
-
-    pinMode(L_HAL, INPUT_PULLUP);
-    pinMode(R_HAL, INPUT_PULLUP);
-
-
-    // --------------------------------------------------------
-    // Motor direction
-    // --------------------------------------------------------
-
-    digitalWrite(
-        L_FR,
-        HIGH);
-
-    digitalWrite(
-        R_FR,
-        HIGH);
-
-
-    // --------------------------------------------------------
-    // Start with motor OFF
-    // --------------------------------------------------------
-
-    digitalWrite(
-        L_RUN,
-        LOW);
-
-    digitalWrite(
-        R_RUN,
-        LOW);
-
-
-    writeLeftDAC(0);
-
-    writeRightDAC(0);
-
-
-    // --------------------------------------------------------
-    // Encoder interrupt
-    // --------------------------------------------------------
-
-    attachInterrupt(
-        digitalPinToInterrupt(L_HAL),
-        leftEncoderISR,
-        RISING);
-
-
-    attachInterrupt(
-        digitalPinToInterrupt(R_HAL),
-        rightEncoderISR,
-        RISING);
-
-
-    // --------------------------------------------------------
-    // micro-ROS
-    // --------------------------------------------------------
-
-    set_microros_serial_transports(
-        Serial);
-
-
-    delay(2000);
-
-
-    allocator =
-        rcl_get_default_allocator();
-
-
-    rclc_support_init(
-        &support,
-        0,
-        NULL,
-        &allocator);
-
-
-    // --------------------------------------------------------
-    // NODE
-    // --------------------------------------------------------
-
-    rclc_node_init_default(
-        &node,
-        "wheel_speed_controller",
-        "",
-        &support);
-
-
-    // --------------------------------------------------------
-    // cmd_vel
-    // --------------------------------------------------------
-
-    rclc_subscription_init_default(
-        &cmd_vel_sub,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(
-            geometry_msgs,
-            msg,
-            Twist),
-        "/cmd_vel");
-
-
-    // --------------------------------------------------------
-    // Direct left
-    // --------------------------------------------------------
-
-    rclc_subscription_init_default(
-        &left_cmd_sub,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(
-            std_msgs,
-            msg,
-            Float32),
-        "/motor/left/cmd");
-
-
-    // --------------------------------------------------------
-    // Direct right
-    // --------------------------------------------------------
-
-    rclc_subscription_init_default(
-        &right_cmd_sub,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(
-            std_msgs,
-            msg,
-            Float32),
-        "/motor/right/cmd");
-
-
-    // --------------------------------------------------------
-    // Reset
-    // --------------------------------------------------------
-
-    rclc_subscription_init_default(
-        &pulse_reset_sub,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(
-            std_msgs,
-            msg,
-            Bool),
-        "/motor/pulse_reset");
-
-
-    // --------------------------------------------------------
-    // SPEED PUB
-    // --------------------------------------------------------
-
-    rclc_publisher_init_default(
-        &left_speed_pub,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(
-            std_msgs,
-            msg,
-            Float32),
-        "/wheel/left/speed");
-
-
-    rclc_publisher_init_default(
-        &right_speed_pub,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(
-            std_msgs,
-            msg,
-            Float32),
-        "/wheel/right/speed");
-
-
-    // --------------------------------------------------------
-    // DAC PUB
-    // --------------------------------------------------------
-
-    rclc_publisher_init_default(
-        &left_dac_pub,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(
-            std_msgs,
-            msg,
-            Float32),
-        "/wheel/left/dac");
-
-
-    rclc_publisher_init_default(
-        &right_dac_pub,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(
-            std_msgs,
-            msg,
-            Float32),
-        "/wheel/right/dac");
-
-
-    // --------------------------------------------------------
-    // ODOM
-    // --------------------------------------------------------
-
-    rclc_publisher_init_default(
-        &odom_pub,
-        &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(
-            nav_msgs,
-            msg,
-            Odometry),
-        "/wheel/odom");
-
-
-    // --------------------------------------------------------
-    // Executor
-    // --------------------------------------------------------
-
-    rclc_executor_init(
-        &executor,
-        &support.context,
-        4,
-        &allocator);
-
-
-    rclc_executor_add_subscription(
-        &executor,
-        &cmd_vel_sub,
-        &cmd_vel_msg,
-        &cmdVelCallback,
-        ON_NEW_DATA);
-
-
-    rclc_executor_add_subscription(
-        &executor,
-        &left_cmd_sub,
-        &left_cmd_msg,
-        &leftCmdCallback,
-        ON_NEW_DATA);
-
-
-    rclc_executor_add_subscription(
-        &executor,
-        &right_cmd_sub,
-        &right_cmd_msg,
-        &rightCmdCallback,
-        ON_NEW_DATA);
-
-
-    rclc_executor_add_subscription(
-        &executor,
-        &pulse_reset_sub,
-        &pulse_reset_msg,
-        &pulseResetCallback,
-        ON_NEW_DATA);
-
-
-    // --------------------------------------------------------
-    // Initial controller state
-    // --------------------------------------------------------
-
-    resetSpeedController();
-
-
-    cmd_linear = 0.0f;
-    cmd_angular = 0.0f;
-
-    cmd_linear_filtered = 0.0f;
-    cmd_angular_filtered = 0.0f;
-
-
-    odom_x = 0.0f;
-    odom_y = 0.0f;
-    odom_yaw = 0.0f;
-
-
-    last_control_ms =
-        millis();
-
-    last_velocity_ms =
-        millis();
-
-
-    // --------------------------------------------------------
-    // MOTOR ENABLE
-    // --------------------------------------------------------
-
-    digitalWrite(
-        L_RUN,
-        HIGH);
-
-    digitalWrite(
-        R_RUN,
-        HIGH);
+  state = WAITING_AGENT;
+  last_control_time = millis();
+  last_cmd_time = 0;
+  reset_speed_controller();
 }
-
 
 // ============================================================
 // LOOP
 // ============================================================
-
 void loop()
 {
-    rclc_executor_spin_some(
-        &executor,
-        RCL_MS_TO_NS(5));
+  switch (state)
+  {
+    case WAITING_AGENT:
+      state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_AVAILABLE : WAITING_AGENT;
+      break;
 
+    case AGENT_AVAILABLE:
+      state = create_entities() ? AGENT_CONNECTED : WAITING_AGENT;
+      if (state == AGENT_CONNECTED)
+      {
+        connected_at_ms = millis();
+        time_resynced = false;
+      }
+      else
+      {
+        destroy_entities();
+      }
+      break;
 
-    controlLoop();
+    case AGENT_CONNECTED:
+      if (millis() - last_ping_time > 2000)
+      {
+        last_ping_time = millis();
+        if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK)
+        {
+          state = AGENT_DISCONNECTED;
+          break;
+        }
+      }
+
+      // V9.5: re-sync เวลาหลัง connect นิ่งแล้ว 3 วิ
+      if (!time_resynced && (millis() - connected_at_ms) > 3000)
+      {
+        rmw_uros_sync_session(1000);
+        time_resynced = true;
+      }
+
+      rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
+      update_and_publish_odom();
+      publish_pulse_counts();
+      break;
+
+    case AGENT_DISCONNECTED:
+      target_speed_l = 0.0f; target_speed_r = 0.0f;
+      reset_speed_controller();
+      dac_output_l = 0; dac_output_r = 0;
+      motor_control_process();
+      destroy_entities();
+      state = WAITING_AGENT;
+      break;
+  }
+
+  if (state == AGENT_CONNECTED) check_cmd_timeout();
+  else { target_speed_l = 0.0f; target_speed_r = 0.0f; }
+
+  motor_control_process();
 }
