@@ -204,38 +204,29 @@ bool startup_balance_had_command = false;
 // ============================================================
 // INDIVIDUAL WHEEL DAC CALIBRATION TABLE
 //
-// V9.14 full-range recalibration (2026-09-11): re-collected
-// wheel_data010 through wheel_data100 (0.10-1.00 m/s, all 10 calibrated
-// points) CLOSED-LOOP and read the fully-converged steady-state (dac,
-// speed) pairs directly as table entries - NOT a regression line, and NO
-// extrapolation anywhere in-range. Every run converged (std dev on dac
-// in the last 10% of each run was <=1.41 counts on every point out of
-// 20):
-//   speed (m/s):        0.10   0.20    0.30     0.40    0.50    0.60    0.70    0.80    0.90    1.00
-//   left  dac (counts):  386.00 716.00 1043.63  1373.00 1693.90 2020.88 2348.05 2668.42 2999.00 3325.24
-//   right dac (counts):  467.00 827.12 1202.21  1593.60 1953.90 2284.00 2528.20 2828.65 3178.00 3525.51
-//   speed error vs target: left +0.10 to +0.91%, right -1.35 to +0.94%
-//     (worst case is 0.10 m/s, where the fixed 0.003 m/s SPEED_DEADBAND
-//     is a much larger fraction of the target than at high speed - this
-//     is expected controller resolution, not a table defect)
-//
-// Right dac tracks noticeably nonlinear (curve, not a line) relative to
-// left across the full range - a single straight-line fit through a few
-// points (tried at V9.12/V9.13) does not track the true right-side
-// dac/speed curve. Per-point storage (this table) is the correct
-// representation for that, not a formula.
+// V9.11 recalibration (2026-09-08): re-collected wheel_data010/020/030
+// CLOSED-LOOP (current firmware, corrected PPR, reverted Kp/Ki) and used
+// the fully-converged steady-state (dac, speed) pairs directly as ground
+// truth - std dev on both dac and speed was negligible in the last ~10%
+// of each run, i.e. true equilibrium. (wheel_data040 was excluded: at
+// 30 s it had not yet converged - L was still 0.383 vs target 0.40 - so
+// its dac/speed pair does not represent equilibrium and would bias the
+// fit.)
+//   left  total_dac(speed) = 3257.14 * speed + 57.34   (resid <= 1.2 counts)
+//   right total_dac(speed) = 3250.05 * speed + 55.16   (resid <= 0.1 counts)
+// Both slopes land close together (~3250), consistent with identical
+// motor/gearbox hardware on both wheels.
 //
 // Both tables store total_dac(speed) directly - no per-wheel trim step
 // (see file header: the original RIGHT_TRIM cancelled itself out exactly
 // at every calibration point, so it was removed here rather than kept as
 // a no-op multiply).
 //
-// All 10 points on both tables are now real converged closed-loop data -
-// no extrapolation remains in the 0.10-1.00 m/s operating range. Only
-// >1.00 m/s (outside MAX_SPEED_MS's normal use) still extrapolates from
-// the last table segment via interpolate_dac(). Re-verify this table
-// periodically (e.g. after mechanical service) since the right-side
-// asymmetry seen here may drift with wear.
+// CAUTION: only 0.10-0.30 m/s were fit from real converged data; 0.40-1.00
+// m/s remain a LINEAR EXTRAPOLATION beyond the measured range (0.40 is
+// close to measured but not verified converged) - re-collect wheel_data at
+// 0.40-0.50 m/s and let it run long enough to fully converge (>15 s, watch
+// dac AND speed both go flat) before trusting that region in production.
 // ============================================================
 const int CAL_POINTS = 10;
 const float speed_table[CAL_POINTS] =
@@ -246,14 +237,14 @@ const float speed_table[CAL_POINTS] =
 
 const float left_dac_table[CAL_POINTS] =
 {
-  386.00f, 716.00f, 1043.63f, 1373.00f, 1693.90f,
-  2020.88f, 2348.05f, 2668.42f, 2999.00f, 3325.24f
+  383.05f, 708.76f, 1034.48f, 1360.19f, 1685.91f,
+  2011.62f, 2337.33f, 2663.05f, 2988.76f, 3314.47f
 };
 
 const float right_dac_table[CAL_POINTS] =
 {
-  467.00f, 827.12f, 1202.21f, 1593.60f, 1953.90f,
-  2284.00f, 2528.20f, 2828.65f, 3178.00f, 3525.51f
+  380.17f, 705.17f, 1030.18f, 1355.18f, 1680.19f,
+  2005.19f, 2330.20f, 2655.20f, 2980.21f, 3305.21f
 };
 
 // ============================================================
