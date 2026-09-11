@@ -12,6 +12,7 @@
   <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>lifecycle_msgs</exec_depend>
   <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>laser_filters</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

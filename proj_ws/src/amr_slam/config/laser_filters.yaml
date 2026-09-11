@@ -1,0 +1,34 @@
+scan_to_scan_filter_chain:
+  ros__parameters:
+    # LaserScanAngularBoundsFilterInPlace blanks (sets to range_max + 1.0)
+    # everything INSIDE [lower_angle, upper_angle] - verified empirically via
+    # `ros2 topic echo /scan_filtered --full-length` (2026-09-11): points in
+    # [-120,120] deg came back as a flat 17.0 = range_max(16.0)+1, while the
+    # rear sector outside that window kept real sensor values. This is the
+    # opposite of "keep inside / blank outside".
+    #
+    # Goal: blank the REAR sector where the teleop operator walks (~180 deg,
+    # behind the robot), keep the front +/-120 deg cone as real mapping data.
+    # The rear sector straddles the +/-180 deg wrap point, so it needs two
+    # filters (one per side) since this filter can't wrap lower>upper.
+    #
+    # REP-103 convention: 0 rad = straight ahead (+x, lidar_link forward),
+    # angle increases counter-clockwise.
+    #
+    # !!! CALIBRATE FOR YOUR ROBOT !!!
+    # Confirm lidar_link's 0-angle orientation and the actual angle the
+    # operator walks at before trusting these values - verify live with
+    # `ros2 topic echo /scan_filtered --full-length` while someone walks
+    # behind the robot.
+    filter1:
+      name: angular_bounds_filter_rear_positive_side
+      type: laser_filters/LaserScanAngularBoundsFilterInPlace
+      params:
+        lower_angle: 2.0944    # +120 deg
+        upper_angle: 3.14159   # +180 deg
+    filter2:
+      name: angular_bounds_filter_rear_negative_side
+      type: laser_filters/LaserScanAngularBoundsFilterInPlace
+      params:
+        lower_angle: -3.14159  # -180 deg
+        upper_angle: -2.0944   # -120 deg
