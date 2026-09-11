@@ -1,0 +1,520 @@
+#include <Arduino.h>
+#include <math.h>
+#include <micro_ros_platformio.h>
+
+#include <rcl/rcl.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <geometry_msgs/msg/twist.h>
+#include <nav_msgs/msg/odometry.h>
+#include <std_msgs/msg/float32.h>
+#include <std_msgs/msg/int32.h>
+#include <std_msgs/msg/bool.h>
+#include <rosidl_runtime_c/string_functions.h>
+#include <rmw_microros/rmw_microros.h>
+
+// --- กำหนดขาพิน STM32F407VET6 ---
+const int R_SP_PIN  = PA5;  // DAC Channel 2
+const int R_FR_PIN  = PB0;
+const int R_RUN_PIN = PC7;
+const int R_HAL     = PD9;
+
+const int L_SP_PIN  = PA4;  // DAC Channel 1
+const int L_FR_PIN  = PB1;
+const int L_RUN_PIN = PC6;
+const int L_HAL     = PD8;
+
+// --- พารามิเตอร์หุ่นยนต์และเซนเซอร์ ---
+const float wheel_radius = 0.128f;
+const float wheel_sep = 0.472f;
+const float wheel_circumference = 2.0f * PI * wheel_radius;
+
+// --- สเปค Speed Output จาก driver: "PP*3 cycles per round, 50% duty cycle" ---
+const int MOTOR_POLES = 4;
+const float PP = MOTOR_POLES / 2.0f;       // = 2
+const int GR = 20;
+const float PPR = PP * 3.0f * 20;                // = 6 pulses ต่อรอบเพลา (ตามคอมเมนต์เดิม)
+const float MAX_SPEED_MS = 1.5f;
+
+// --- ตัวแปรควบคุมความเร็ว ---
+float target_speed_l = 0.0f;
+float target_speed_r = 0.0f;
+unsigned long last_cmd_time = 0;
+const unsigned long CMD_TIMEOUT_MS = 1000;
+
+// --- โหมดหมุนตามจำนวน pulse (position move) ---
+// ส่งคำสั่งด้วย: ros2 topic pub /motor/left/move_pulses std_msgs/msg/Int32 "{data: 500}" --once
+// data > 0 = หมุนหน้า, data < 0 = หมุนถอยหลัง, |data| = จำนวน pulse ที่ต้องการ
+// มอเตอร์จะวิ่งที่ PULSE_MOVE_SPEED จนครบจำนวน pulse แล้วหยุดเอง (open-loop, นับจาก cal_pulse_*)
+const float PULSE_MOVE_SPEED = 0.3f;   // m/s ที่ใช้ระหว่างโหมดหมุนตามจำนวน pulse
+volatile long target_pulse_l = 0;
+volatile long target_pulse_r = 0;
+bool pulse_move_active_l = false;
+bool pulse_move_active_r = false;
+
+// --- โหมดควบคุม: ใช้ cmd_vel ปกติ หรือสั่งตรงต่อล้อเพื่อ calibrate ---
+enum CmdSource { SRC_CMD_VEL, SRC_DIRECT_L, SRC_DIRECT_R };
+
+// --- ตัวแปรนับ Pulse และ Odometry (รีเซ็ตทุก cycle สำหรับคำนวณความเร็ว/odom) ---
+volatile long pulse_l = 0;
+volatile long pulse_r = 0;
+
+// --- ตัวแปรนับ Pulse สะสม สำหรับ calibrate PPR โดยไม่ต้องขับจริง ---
+// (รีเซ็ตเฉพาะเมื่อสั่งผ่าน /motor/pulse_reset เท่านั้น ไม่ถูกแตะโดย odom loop)
+volatile long cal_pulse_l = 0;
+volatile long cal_pulse_r = 0;
+
+float pose_x = 0.0f;
+float pose_y = 0.0f;
+float pose_theta = 0.0f;
+unsigned long last_odom_time = 0;
+
+// --- ค่าความเร็วล้อที่วัดได้ล่าสุด (สำหรับ publish แยก topic) ---
+float measured_speed_l = 0.0f;
+float measured_speed_r = 0.0f;
+
+// --- micro-ROS Objects ---
+enum States { WAITING_AGENT, AGENT_AVAILABLE, AGENT_CONNECTED, AGENT_DISCONNECTED } state;
+
+rcl_subscription_t subscriber;          // /cmd_vel
+rcl_subscription_t sub_left_cmd;        // /motor/left/cmd  (calibration)
+rcl_subscription_t sub_right_cmd;       // /motor/right/cmd (calibration)
+rcl_subscription_t sub_pulse_reset;     // /motor/pulse_reset (calibration)
+rcl_subscription_t sub_move_left_pulses;   // /motor/left/move_pulses  (หมุนตามจำนวน pulse)
+rcl_subscription_t sub_move_right_pulses;  // /motor/right/move_pulses (หมุนตามจำนวน pulse)
+
+rcl_publisher_t odom_publisher;         // /wheel/odom
+rcl_publisher_t left_speed_publisher;   // /wheel/left/speed
+rcl_publisher_t right_speed_publisher;  // /wheel/right/speed
+rcl_publisher_t left_pulse_publisher;   // /wheel/left/pulse_count
+rcl_publisher_t right_pulse_publisher;  // /wheel/right/pulse_count
+
+geometry_msgs__msg__Twist msg_twist;
+std_msgs__msg__Float32 msg_left_cmd;
+std_msgs__msg__Float32 msg_right_cmd;
+std_msgs__msg__Bool msg_pulse_reset;
+std_msgs__msg__Int32 msg_move_left_pulses;
+std_msgs__msg__Int32 msg_move_right_pulses;
+
+nav_msgs__msg__Odometry odom_msg;
+std_msgs__msg__Float32 left_speed_msg;
+std_msgs__msg__Float32 right_speed_msg;
+std_msgs__msg__Int32 left_pulse_msg;
+std_msgs__msg__Int32 right_pulse_msg;
+
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_allocator_t allocator;
+rcl_node_t node;
+
+unsigned long last_ping_time = 0;
+unsigned long last_pulse_pub_time = 0;
+
+// --- Interrupt Service Routines ---
+void L_HAL_ISR() { pulse_l++; cal_pulse_l++; }
+void R_HAL_ISR() { pulse_r++; cal_pulse_r++; }
+
+// --- Callback รับค่า /cmd_vel (โหมดขับปกติ) ---
+void subscription_callback(const void * msvin) {
+  const geometry_msgs__msg__Twist * msg = (const geometry_msgs__msg__Twist *)msvin;
+  float v = msg->linear.x;
+  float w = msg->angular.z;
+
+  target_speed_l = v - ((w * wheel_sep) / 2.0f);
+  target_speed_r = v + ((w * wheel_sep) / 2.0f);
+
+  // คำสั่งขับปกติมาแทรก -> ยกเลิกโหมดหมุนตามจำนวน pulse ที่ค้างอยู่
+  pulse_move_active_l = false;
+  pulse_move_active_r = false;
+
+  last_cmd_time = millis();
+}
+
+// --- Callback สั่งความเร็วล้อซ้ายตรง ๆ (สำหรับ calibrate) หน่วย m/s ---
+void left_cmd_callback(const void * msvin) {
+  const std_msgs__msg__Float32 * msg = (const std_msgs__msg__Float32 *)msvin;
+  target_speed_l = constrain(msg->data, -MAX_SPEED_MS, MAX_SPEED_MS);
+  pulse_move_active_l = false;
+  last_cmd_time = millis();
+}
+
+// --- Callback สั่งความเร็วล้อขวาตรง ๆ (สำหรับ calibrate) หน่วย m/s ---
+void right_cmd_callback(const void * msvin) {
+  const std_msgs__msg__Float32 * msg = (const std_msgs__msg__Float32 *)msvin;
+  target_speed_r = constrain(msg->data, -MAX_SPEED_MS, MAX_SPEED_MS);
+  pulse_move_active_r = false;
+  last_cmd_time = millis();
+}
+
+// --- Callback รีเซ็ตตัวนับพัลส์สะสม (สำหรับเริ่มรอบทดสอบ calibrate ใหม่) ---
+// เรียกด้วย: ros2 topic pub /motor/pulse_reset std_msgs/msg/Bool "{data: true}" --once
+void pulse_reset_callback(const void * msvin) {
+  const std_msgs__msg__Bool * msg = (const std_msgs__msg__Bool *)msvin;
+  if (msg->data) {
+    noInterrupts();
+    cal_pulse_l = 0;
+    cal_pulse_r = 0;
+    interrupts();
+  }
+}
+
+// --- Callback สั่งหมุนล้อซ้ายตามจำนวน pulse ที่ต้องการ (data > 0 หน้า, < 0 ถอยหลัง) ---
+void move_left_pulses_callback(const void * msvin) {
+  const std_msgs__msg__Int32 * msg = (const std_msgs__msg__Int32 *)msvin;
+  long n = msg->data;
+  if (n == 0) {
+    pulse_move_active_l = false;
+    target_speed_l = 0.0f;
+    return;
+  }
+  noInterrupts();
+  cal_pulse_l = 0;
+  interrupts();
+  target_pulse_l = labs(n);
+  target_speed_l = (n > 0) ? PULSE_MOVE_SPEED : -PULSE_MOVE_SPEED;
+  pulse_move_active_l = true;
+  last_cmd_time = millis();
+}
+
+// --- Callback สั่งหมุนล้อขวาตามจำนวน pulse ที่ต้องการ (data > 0 หน้า, < 0 ถอยหลัง) ---
+void move_right_pulses_callback(const void * msvin) {
+  const std_msgs__msg__Int32 * msg = (const std_msgs__msg__Int32 *)msvin;
+  long n = msg->data;
+  if (n == 0) {
+    pulse_move_active_r = false;
+    target_speed_r = 0.0f;
+    return;
+  }
+  noInterrupts();
+  cal_pulse_r = 0;
+  interrupts();
+  target_pulse_r = labs(n);
+  target_speed_r = (n > 0) ? PULSE_MOVE_SPEED : -PULSE_MOVE_SPEED;
+  pulse_move_active_r = true;
+  last_cmd_time = millis();
+}
+
+// --- ตรวจว่าหมุนครบจำนวน pulse ที่สั่งไว้หรือยัง ถ้าครบให้หยุดมอเตอร์ ---
+// ต้องเรียกทุกรอบ loop ตอน AGENT_CONNECTED เพื่อกันไม่ให้ check_cmd_timeout()
+// ตัดคำสั่งก่อนหมุนครบ (การหมุนอาจใช้เวลานานกว่า CMD_TIMEOUT_MS)
+void check_pulse_targets() {
+  if (pulse_move_active_l) {
+    long done_l;
+    noInterrupts();
+    done_l = cal_pulse_l;
+    interrupts();
+    if (done_l >= target_pulse_l) {
+      target_speed_l = 0.0f;
+      pulse_move_active_l = false;
+    } else {
+      last_cmd_time = millis();
+    }
+  }
+  if (pulse_move_active_r) {
+    long done_r;
+    noInterrupts();
+    done_r = cal_pulse_r;
+    interrupts();
+    if (done_r >= target_pulse_r) {
+      target_speed_r = 0.0f;
+      pulse_move_active_r = false;
+    } else {
+      last_cmd_time = millis();
+    }
+  }
+}
+
+// --- สร้าง Entities ของ micro-ROS ---
+bool create_entities() {
+  allocator = rcl_get_default_allocator();
+  if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) return false;
+  if (rclc_node_init_default(&node, "stm32_motor_node", "", &support) != RCL_RET_OK) return false;
+
+  // ซิงค์เวลากับ Micro-ROS Agent
+  rmw_uros_sync_session(1000);
+
+  // Subscriber: /cmd_vel (โหมดขับปกติ)
+  if (rclc_subscription_init_default(
+        &subscriber, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+        "cmd_vel") != RCL_RET_OK) return false;
+
+  // Subscriber: /motor/left/cmd (calibration, ตั้งความเร็วล้อซ้ายตรง ๆ)
+  if (rclc_subscription_init_default(
+        &sub_left_cmd, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        "motor/left/cmd") != RCL_RET_OK) return false;
+
+  // Subscriber: /motor/right/cmd (calibration, ตั้งความเร็วล้อขวาตรง ๆ)
+  if (rclc_subscription_init_default(
+        &sub_right_cmd, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        "motor/right/cmd") != RCL_RET_OK) return false;
+
+  // Subscriber: /motor/pulse_reset (calibration, รีเซ็ตตัวนับพัลส์สะสม)
+  if (rclc_subscription_init_default(
+        &sub_pulse_reset, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool),
+        "motor/pulse_reset") != RCL_RET_OK) return false;
+
+  // Subscriber: /motor/left/move_pulses (หมุนล้อซ้ายตามจำนวน pulse ที่ต้องการ)
+  if (rclc_subscription_init_default(
+        &sub_move_left_pulses, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+        "motor/left/move_pulses") != RCL_RET_OK) return false;
+
+  // Subscriber: /motor/right/move_pulses (หมุนล้อขวาตามจำนวน pulse ที่ต้องการ)
+  if (rclc_subscription_init_default(
+        &sub_move_right_pulses, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+        "motor/right/move_pulses") != RCL_RET_OK) return false;
+
+  // Publisher: /wheel/odom
+  if (rclc_publisher_init_default(
+        &odom_publisher, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+        "wheel/odom") != RCL_RET_OK) return false;
+
+  // Publisher: /wheel/left/speed (ความเร็วล้อซ้ายที่วัดได้จริง m/s)
+  if (rclc_publisher_init_default(
+        &left_speed_publisher, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        "wheel/left/speed") != RCL_RET_OK) return false;
+
+  // Publisher: /wheel/right/speed (ความเร็วล้อขวาที่วัดได้จริง m/s)
+  if (rclc_publisher_init_default(
+        &right_speed_publisher, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32),
+        "wheel/right/speed") != RCL_RET_OK) return false;
+
+  // Publisher: /wheel/left/pulse_count (พัลส์สะสมล้อซ้าย สำหรับ calibrate โดยไม่ต้องขับจริง)
+  if (rclc_publisher_init_default(
+        &left_pulse_publisher, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+        "wheel/left/pulse_count") != RCL_RET_OK) return false;
+
+  // Publisher: /wheel/right/pulse_count (พัลส์สะสมล้อขวา สำหรับ calibrate โดยไม่ต้องขับจริง)
+  if (rclc_publisher_init_default(
+        &right_pulse_publisher, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+        "wheel/right/pulse_count") != RCL_RET_OK) return false;
+
+  // Executor: ตอนนี้มี 6 subscriptions (cmd_vel, left_cmd, right_cmd, pulse_reset, move_left_pulses, move_right_pulses)
+  if (rclc_executor_init(&executor, &support.context, 6, &allocator) != RCL_RET_OK) return false;
+  if (rclc_executor_add_subscription(&executor, &subscriber, &msg_twist, &subscription_callback, ON_NEW_DATA) != RCL_RET_OK) return false;
+  if (rclc_executor_add_subscription(&executor, &sub_left_cmd, &msg_left_cmd, &left_cmd_callback, ON_NEW_DATA) != RCL_RET_OK) return false;
+  if (rclc_executor_add_subscription(&executor, &sub_right_cmd, &msg_right_cmd, &right_cmd_callback, ON_NEW_DATA) != RCL_RET_OK) return false;
+  if (rclc_executor_add_subscription(&executor, &sub_pulse_reset, &msg_pulse_reset, &pulse_reset_callback, ON_NEW_DATA) != RCL_RET_OK) return false;
+  if (rclc_executor_add_subscription(&executor, &sub_move_left_pulses, &msg_move_left_pulses, &move_left_pulses_callback, ON_NEW_DATA) != RCL_RET_OK) return false;
+  if (rclc_executor_add_subscription(&executor, &sub_move_right_pulses, &msg_move_right_pulses, &move_right_pulses_callback, ON_NEW_DATA) != RCL_RET_OK) return false;
+
+  rosidl_runtime_c__String__assign(&odom_msg.header.frame_id, "odom");
+  rosidl_runtime_c__String__assign(&odom_msg.child_frame_id, "base_link");
+
+  return true;
+}
+
+// --- ทำลาย Entities เมื่อเชื่อมต่อหลุด ---
+void destroy_entities() {
+  rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
+  (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+  // คืน Memory เพื่อป้องกัน Memory Leak
+  rosidl_runtime_c__String__fini(&odom_msg.header.frame_id);
+  rosidl_runtime_c__String__fini(&odom_msg.child_frame_id);
+
+  (void) rcl_publisher_fini(&odom_publisher, &node);
+  (void) rcl_publisher_fini(&left_speed_publisher, &node);
+  (void) rcl_publisher_fini(&right_speed_publisher, &node);
+  (void) rcl_publisher_fini(&left_pulse_publisher, &node);
+  (void) rcl_publisher_fini(&right_pulse_publisher, &node);
+  (void) rcl_subscription_fini(&subscriber, &node);
+  (void) rcl_subscription_fini(&sub_left_cmd, &node);
+  (void) rcl_subscription_fini(&sub_right_cmd, &node);
+  (void) rcl_subscription_fini(&sub_pulse_reset, &node);
+  (void) rcl_subscription_fini(&sub_move_left_pulses, &node);
+  (void) rcl_subscription_fini(&sub_move_right_pulses, &node);
+  (void) rclc_executor_fini(&executor);
+  (void) rcl_node_fini(&node);
+  (void) rclc_support_fini(&support);
+}
+
+// --- ตรวจสอบสัญญาณขาดหาย (Safety Watchdog) ---
+void check_cmd_timeout() {
+  if (last_cmd_time == 0 || (millis() - last_cmd_time > CMD_TIMEOUT_MS)) {
+    target_speed_l = 0.0f;
+    target_speed_r = 0.0f;
+  }
+}
+
+// --- สั่งขับมอเตอร์ (Open-Loop Control) ---
+// หมายเหตุ: ล้อซ้าย (L) ติดตั้งมิเรอร์กับล้อขวา -> ต้อง invert logic ทิศทางของ L_FR_PIN
+void motor_control_process() {
+  digitalWrite(L_FR_PIN, (target_speed_l >= 0.0f) ? HIGH : LOW);  // inverted
+  int dac_l = (int)((fabs(target_speed_l) / MAX_SPEED_MS) * 4095.0f);
+  analogWrite(L_SP_PIN, constrain(dac_l, 0, 4095));
+
+  digitalWrite(R_FR_PIN, (target_speed_r >= 0.0f) ? LOW : HIGH);
+  int dac_r = (int)((fabs(target_speed_r) / MAX_SPEED_MS) * 4095.0f);
+  analogWrite(R_SP_PIN, constrain(dac_r, 0, 4095));
+}
+
+// --- คำนวณ Forward Kinematics, Publish Odometry และความเร็วล้อแยกแต่ละข้าง ---
+void update_and_publish_odom() {
+  unsigned long now = millis();
+  float dt = (now - last_odom_time) / 1000.0f;
+  if (dt < 0.1f) return; // 10 Hz
+
+  noInterrupts();
+  long count_l = pulse_l; pulse_l = 0;
+  long count_r = pulse_r; pulse_r = 0;
+  interrupts();
+
+  float dist_l = (count_l / PPR) * wheel_circumference;
+  float dist_r = (count_r / PPR) * wheel_circumference;
+
+  if (digitalRead(L_FR_PIN) == LOW) dist_l = -dist_l;   // logic กลับด้าน ตาม motor_control_process()
+  if (digitalRead(R_FR_PIN) == HIGH) dist_r = -dist_r;
+
+  float speed_l = dist_l / dt;
+  float speed_r = dist_r / dt;
+
+  // Sanity clamp: ทิ้งค่ารอบนี้ถ้าความเร็ววัดได้เกินขีดจำกัดทางกายภาพ (noise/glitch pulse)
+  const float MAX_PLAUSIBLE_SPEED = MAX_SPEED_MS * 1.5f;
+  if (fabs(speed_l) > MAX_PLAUSIBLE_SPEED || fabs(speed_r) > MAX_PLAUSIBLE_SPEED) {
+    last_odom_time = now;
+    return;
+  }
+
+  measured_speed_l = speed_l;
+  measured_speed_r = speed_r;
+
+  // --- Publish ความเร็วล้อซ้าย/ขวาแยก topic สำหรับดู/ calibrate ---
+  left_speed_msg.data = measured_speed_l;
+  rcl_publish(&left_speed_publisher, &left_speed_msg, NULL);
+
+  right_speed_msg.data = measured_speed_r;
+  rcl_publish(&right_speed_publisher, &right_speed_msg, NULL);
+
+  float v = (speed_r + speed_l) / 2.0f;
+  float w = (speed_r - speed_l) / wheel_sep;
+
+  float delta_s = (dist_r + dist_l) / 2.0f;
+  float delta_theta = (dist_r - dist_l) / wheel_sep;
+
+  pose_x += delta_s * cos(pose_theta + (delta_theta / 2.0f));
+  pose_y += delta_s * sin(pose_theta + (delta_theta / 2.0f));
+  pose_theta += delta_theta;
+
+  while (pose_theta > PI)  pose_theta -= 2.0f * PI;
+  while (pose_theta < -PI) pose_theta += 2.0f * PI;
+
+  int64_t time_ms = rmw_uros_epoch_millis();
+  odom_msg.header.stamp.sec = time_ms / 1000;
+  odom_msg.header.stamp.nanosec = (time_ms % 1000) * 1000000;
+
+  odom_msg.pose.pose.position.x = pose_x;
+  odom_msg.pose.pose.position.y = pose_y;
+  odom_msg.pose.pose.position.z = 0.0;
+
+  odom_msg.pose.pose.orientation.x = 0.0;
+  odom_msg.pose.pose.orientation.y = 0.0;
+  odom_msg.pose.pose.orientation.z = sin(pose_theta / 2.0f);
+  odom_msg.pose.pose.orientation.w = cos(pose_theta / 2.0f);
+
+  odom_msg.twist.twist.linear.x = v;
+  odom_msg.twist.twist.angular.z = w;
+
+  rcl_publish(&odom_publisher, &odom_msg, NULL);
+  last_odom_time = now;
+}
+
+// --- Publish ค่าพัลส์สะสม (ไม่รีเซ็ตเอง) สำหรับ calibrate PPR โดยไม่ต้องขับจริง ---
+// ใช้คู่กับ /motor/pulse_reset: reset -> หมุนล้อ N รอบ (มือ หรือสั่งมอเตอร์หมุนช้า ๆ) -> อ่านค่านี้ -> หาร N
+void publish_pulse_counts() {
+  unsigned long now = millis();
+  if (now - last_pulse_pub_time < 200) return; // publish ที่ ~5 Hz พอสำหรับดูระหว่าง calibrate
+
+  long l, r;
+  noInterrupts();
+  l = cal_pulse_l;
+  r = cal_pulse_r;
+  interrupts();
+
+  left_pulse_msg.data = (int32_t)l;
+  rcl_publish(&left_pulse_publisher, &left_pulse_msg, NULL);
+
+  right_pulse_msg.data = (int32_t)r;
+  rcl_publish(&right_pulse_publisher, &right_pulse_msg, NULL);
+
+  last_pulse_pub_time = now;
+}
+
+void setup() {
+  pinMode(R_FR_PIN, OUTPUT); pinMode(R_RUN_PIN, OUTPUT);
+  pinMode(L_FR_PIN, OUTPUT); pinMode(L_RUN_PIN, OUTPUT);
+
+  pinMode(L_HAL, INPUT_PULLUP);
+  pinMode(R_HAL, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(L_HAL), L_HAL_ISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(R_HAL), R_HAL_ISR, RISING);
+
+  analogWriteResolution(12);
+  analogWrite(R_SP_PIN, 0); analogWrite(L_SP_PIN, 0);
+  digitalWrite(R_FR_PIN, LOW); digitalWrite(L_FR_PIN, LOW);
+
+  digitalWrite(R_RUN_PIN, HIGH); digitalWrite(L_RUN_PIN, HIGH);
+  delay(500);
+  digitalWrite(R_RUN_PIN, LOW); digitalWrite(L_RUN_PIN, LOW);
+
+  Serial.begin(115200);
+  set_microros_serial_transports(Serial);
+  state = WAITING_AGENT;
+}
+
+void loop() {
+  switch (state) {
+    case WAITING_AGENT:
+      state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_AVAILABLE : WAITING_AGENT;
+      break;
+
+    case AGENT_AVAILABLE:
+      state = create_entities() ? AGENT_CONNECTED : WAITING_AGENT;
+      if (state == WAITING_AGENT) destroy_entities();
+      break;
+
+    case AGENT_CONNECTED:
+      // ปรับเช็ค Ping ทุกๆ 2 วินาที (2000 ms) แทนการเช็คทุกรอบ loop
+      if (millis() - last_ping_time > 2000) {
+        last_ping_time = millis();
+        if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
+          state = AGENT_DISCONNECTED;
+          break;
+        }
+      }
+
+      rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
+      update_and_publish_odom();
+      publish_pulse_counts();
+      check_pulse_targets();
+      break;
+
+    case AGENT_DISCONNECTED:
+      pulse_move_active_l = false;
+      pulse_move_active_r = false;
+      destroy_entities();
+      state = WAITING_AGENT;
+      break;
+  }
+
+  if (state == AGENT_CONNECTED) {
+    check_cmd_timeout();
+  } else {
+    target_speed_l = 0.0f;
+    target_speed_r = 0.0f;
+    pulse_move_active_l = false;
+    pulse_move_active_r = false;
+  }
+
+  motor_control_process();
+}

@@ -1,0 +1,275 @@
+#include <Arduino.h>
+#include <math.h>
+#include <micro_ros_platformio.h>
+
+#include <rcl/rcl.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <geometry_msgs/msg/twist.h>
+#include <nav_msgs/msg/odometry.h>
+#include <rosidl_runtime_c/string_functions.h>
+#include <rmw_microros/rmw_microros.h>
+
+// --- กำหนดขาพิน STM32F407VET6 ---
+const int R_SP_PIN  = PA5;  // DAC Channel 2
+const int R_FR_PIN  = PB0;  
+const int R_RUN_PIN = PC7;  
+const int R_HAL     = PD9;  
+
+const int L_SP_PIN  = PA4;  // DAC Channel 1
+const int L_FR_PIN  = PB1;  
+const int L_RUN_PIN = PC6;  
+const int L_HAL     = PD8;  
+
+// --- พารามิเตอร์หุ่นยนต์และเซนเซอร์ ---
+const float wheel_radius = 0.128f; 
+const float wheel_sep = 0.472f;    
+const float wheel_circumference = 2.0f * PI * wheel_radius;
+
+// --- สเปค Speed Output จาก driver: "PP*3 cycles per round, 50% duty cycle" ---
+// มอเตอร์ 4 ขั้ว (4-pole) -> Pole Pairs (PP) = จำนวนขั้ว / 2 = 4 / 2 = 2
+// จำนวน cycle สัญญาณต่อรอบเพลาหมุน 1 รอบ = PP * 3 = 2 * 3 = 6 cycles/round
+// สัญญาณเป็น square wave duty 50% -> นับ RISING edge 1 ครั้ง = 1 cycle พอดี
+// ดังนั้น Pulses Per Revolution (PPR) ที่ใช้คำนวณระยะทาง = 6
+const int MOTOR_POLES = 4;
+const float PP = MOTOR_POLES / 2.0f;       // = 2
+const int GR = 20;
+const float PPR = 318.4;                // = 6 pulses ต่อรอบเพลา
+const float MAX_SPEED_MS = 1.5f;   
+
+// --- ตัวแปรควบคุมความเร็ว ---
+float target_speed_l = 0.0f;
+float target_speed_r = 0.0f;
+unsigned long last_cmd_time = 0;
+const unsigned long CMD_TIMEOUT_MS = 1000;
+
+// --- ตัวแปรนับ Pulse และ Odometry ---
+volatile long pulse_l = 0;
+volatile long pulse_r = 0;
+
+float pose_x = 0.0f;
+float pose_y = 0.0f;
+float pose_theta = 0.0f;
+unsigned long last_odom_time = 0;
+
+// --- micro-ROS Objects ---
+enum States { WAITING_AGENT, AGENT_AVAILABLE, AGENT_CONNECTED, AGENT_DISCONNECTED } state;
+
+rcl_subscription_t subscriber;
+rcl_publisher_t odom_publisher;
+geometry_msgs__msg__Twist msg_twist;
+nav_msgs__msg__Odometry odom_msg;
+
+rclc_executor_t executor;
+rclc_support_t support;
+rcl_allocator_t allocator;
+rcl_node_t node;
+
+unsigned long last_ping_time = 0;
+
+// --- Interrupt Service Routines ---
+void L_HAL_ISR() { pulse_l++; }
+void R_HAL_ISR() { pulse_r++; }
+
+// --- Callback รับค่า /cmd_vel ---
+void subscription_callback(const void * msvin) {
+  const geometry_msgs__msg__Twist * msg = (const geometry_msgs__msg__Twist *)msvin;
+  float v = msg->linear.x;
+  float w = msg->angular.z;
+
+  target_speed_l = v - ((w * wheel_sep) / 2.0f);
+  target_speed_r = v + ((w * wheel_sep) / 2.0f);
+
+  last_cmd_time = millis();
+}
+
+// --- สร้าง Entities ของ micro-ROS ---
+bool create_entities() {
+  allocator = rcl_get_default_allocator();
+  if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) return false;
+  if (rclc_node_init_default(&node, "stm32_motor_node", "", &support) != RCL_RET_OK) return false;
+
+  // ซิงค์เวลากับ Micro-ROS Agent
+  rmw_uros_sync_session(1000);
+
+  // Subscriber: /cmd_vel
+  if (rclc_subscription_init_default(
+        &subscriber, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+        "cmd_vel") != RCL_RET_OK) return false;
+
+  // Publisher: /wheel/odom
+  if (rclc_publisher_init_default(
+        &odom_publisher, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+        "wheel/odom") != RCL_RET_OK) return false;
+
+  // Executor
+  if (rclc_executor_init(&executor, &support.context, 1, &allocator) != RCL_RET_OK) return false;
+  if (rclc_executor_add_subscription(&executor, &subscriber, &msg_twist, &subscription_callback, ON_NEW_DATA) != RCL_RET_OK) return false;
+
+  rosidl_runtime_c__String__assign(&odom_msg.header.frame_id, "odom");
+  rosidl_runtime_c__String__assign(&odom_msg.child_frame_id, "base_link");
+
+  return true;
+}
+
+// --- ทำลาย Entities เมื่อเชื่อมต่อหลุด ---
+void destroy_entities() {
+  rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
+  (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+  // คืน Memory เพื่อป้องกัน Memory Leak
+  rosidl_runtime_c__String__fini(&odom_msg.header.frame_id);
+  rosidl_runtime_c__String__fini(&odom_msg.child_frame_id);
+
+  (void) rcl_publisher_fini(&odom_publisher, &node);
+  (void) rcl_subscription_fini(&subscriber, &node);
+  (void) rclc_executor_fini(&executor);
+  (void) rcl_node_fini(&node);
+  (void) rclc_support_fini(&support);
+}
+
+// --- ตรวจสอบสัญญาณขาดหาย (Safety Watchdog) ---
+void check_cmd_timeout() {
+  if (last_cmd_time == 0 || (millis() - last_cmd_time > CMD_TIMEOUT_MS)) {
+    target_speed_l = 0.0f;
+    target_speed_r = 0.0f;
+  }
+}
+
+// --- สั่งขับมอเตอร์ (Open-Loop Control) ---
+// หมายเหตุ: ล้อซ้าย (L) ติดตั้งมิเรอร์กับล้อขวา -> ต้อง invert logic ทิศทางของ L_FR_PIN
+void motor_control_process() {
+  digitalWrite(L_FR_PIN, (target_speed_l >= 0.0f) ? HIGH : LOW);  // inverted
+  int dac_l = (int)((fabs(target_speed_l) / MAX_SPEED_MS) * 4095.0f);
+  analogWrite(L_SP_PIN, constrain(dac_l, 0, 4095));
+
+  digitalWrite(R_FR_PIN, (target_speed_r >= 0.0f) ? LOW : HIGH);
+  int dac_r = (int)((fabs(target_speed_r) / MAX_SPEED_MS) * 4095.0f);
+  analogWrite(R_SP_PIN, constrain(dac_r, 0, 4095));
+}
+
+// --- คำนวณ Forward Kinematics และ Publish Odometry ---
+void update_and_publish_odom() {
+  unsigned long now = millis();
+  float dt = (now - last_odom_time) / 1000.0f;
+  if (dt < 0.1f) return; // 10 Hz - ยืดหน้าต่างเวลาให้มีพัลส์สะสมมากขึ้น ลด quantization noise จาก PPR ต่ำ
+
+  noInterrupts();
+  long count_l = pulse_l; pulse_l = 0;
+  long count_r = pulse_r; pulse_r = 0;
+  interrupts();
+
+  float dist_l = (count_l / PPR) * wheel_circumference;
+  float dist_r = (count_r / PPR) * wheel_circumference;
+
+  if (digitalRead(L_FR_PIN) == LOW) dist_l = -dist_l;   // logic กลับด้าน ตาม motor_control_process()
+  if (digitalRead(R_FR_PIN) == HIGH) dist_r = -dist_r;
+
+  float speed_l = dist_l / dt;
+  float speed_r = dist_r / dt;
+
+  // Sanity clamp: ถ้าความเร็วที่วัดได้เกินขีดจำกัดทางกายภาพของหุ่นยนต์ (เช่น noise/glitch pulse)
+  // ให้ทิ้งค่ารอบนี้ ไม่นำไปสะสมใน pose เพื่อกัน odom ลอยหนี
+  const float MAX_PLAUSIBLE_SPEED = MAX_SPEED_MS * 1.5f;
+  if (fabs(speed_l) > MAX_PLAUSIBLE_SPEED || fabs(speed_r) > MAX_PLAUSIBLE_SPEED) {
+    last_odom_time = now;
+    return;
+  }
+
+  float v = (speed_r + speed_l) / 2.0f;
+  float w = (speed_r - speed_l) / wheel_sep;
+
+  float delta_s = (dist_r + dist_l) / 2.0f;
+  float delta_theta = (dist_r - dist_l) / wheel_sep;
+
+  pose_x += delta_s * cos(pose_theta + (delta_theta / 2.0f));
+  pose_y += delta_s * sin(pose_theta + (delta_theta / 2.0f));
+  pose_theta += delta_theta;
+
+  while (pose_theta > PI)  pose_theta -= 2.0f * PI;
+  while (pose_theta < -PI) pose_theta += 2.0f * PI;
+
+  int64_t time_ms = rmw_uros_epoch_millis();
+  odom_msg.header.stamp.sec = time_ms / 1000;
+  odom_msg.header.stamp.nanosec = (time_ms % 1000) * 1000000;
+
+  odom_msg.pose.pose.position.x = pose_x;
+  odom_msg.pose.pose.position.y = pose_y;
+  odom_msg.pose.pose.position.z = 0.0;
+
+  odom_msg.pose.pose.orientation.x = 0.0;
+  odom_msg.pose.pose.orientation.y = 0.0;
+  odom_msg.pose.pose.orientation.z = sin(pose_theta / 2.0f);
+  odom_msg.pose.pose.orientation.w = cos(pose_theta / 2.0f);
+
+  odom_msg.twist.twist.linear.x = v;
+  odom_msg.twist.twist.angular.z = w;
+
+  rcl_publish(&odom_publisher, &odom_msg, NULL);
+  last_odom_time = now;
+}
+
+void setup() {
+  pinMode(R_FR_PIN, OUTPUT); pinMode(R_RUN_PIN, OUTPUT);
+  pinMode(L_FR_PIN, OUTPUT); pinMode(L_RUN_PIN, OUTPUT);
+
+  pinMode(L_HAL, INPUT_PULLUP);
+  pinMode(R_HAL, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(L_HAL), L_HAL_ISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(R_HAL), R_HAL_ISR, RISING);
+
+  analogWriteResolution(12);
+  analogWrite(R_SP_PIN, 0); analogWrite(L_SP_PIN, 0);
+  digitalWrite(R_FR_PIN, LOW); digitalWrite(L_FR_PIN, LOW);
+
+  digitalWrite(R_RUN_PIN, HIGH); digitalWrite(L_RUN_PIN, HIGH);
+  delay(500);
+  digitalWrite(R_RUN_PIN, LOW); digitalWrite(L_RUN_PIN, LOW);
+
+  Serial.begin(115200);
+  set_microros_serial_transports(Serial);
+  state = WAITING_AGENT;
+}
+
+void loop() {
+  switch (state) {
+    case WAITING_AGENT:
+      state = (RMW_RET_OK == rmw_uros_ping_agent(100, 1)) ? AGENT_AVAILABLE : WAITING_AGENT;
+      break;
+
+    case AGENT_AVAILABLE:
+      state = create_entities() ? AGENT_CONNECTED : WAITING_AGENT;
+      if (state == WAITING_AGENT) destroy_entities();
+      break;
+
+    case AGENT_CONNECTED:
+      // ปรับเช็ค Ping ทุกๆ 2 วินาที (2000 ms) แทนการเช็คทุกรอบ loop
+      if (millis() - last_ping_time > 2000) {
+        last_ping_time = millis();
+        if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
+          state = AGENT_DISCONNECTED;
+          break;
+        }
+      }
+
+      rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
+      update_and_publish_odom();
+      break;
+
+    case AGENT_DISCONNECTED:
+      destroy_entities();
+      state = WAITING_AGENT;
+      break;
+  }
+
+  if (state == AGENT_CONNECTED) {
+    check_cmd_timeout();
+  } else {
+    target_speed_l = 0.0f;
+    target_speed_r = 0.0f;
+  }
+
+  motor_control_process();
+}

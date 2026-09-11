@@ -1,0 +1,48 @@
+wheel_diameter = 128mm
+wheel_sep = 472mm
+wheel_thick = 40mm
+
+base_width = 496mm
+base_depth = 951mm
+base_height =301mm
+
+camera_width = 89.8mm
+camera_height = 19mm
+camera_depth = 25mm
+
+lidar_radius =21.5mm
+lidar_height =41.3mm(29.8mm laser) 18.2
+
+
+
+left wheel
+- sp -> A4
+- f/r -> B1
+- run -> C6
+- fo -> d8
+
+right wheel
+- sp -> A5
+- f/r -> B0
+- run -> C7
+- fo -> d9
+
+RPLIDAR C 10Hz 360degree
+-max range: 12m
+-min range: 0.05m
+
+
+camera x 3  
+ 	y 
+ 	 z 144
+lidar x 290
+	y 
+	 z -20
+	 
+	 
+RFID 
+wiring : blue 485b
+	 black gnd
+	 white 485a
+	 brown vcc
+

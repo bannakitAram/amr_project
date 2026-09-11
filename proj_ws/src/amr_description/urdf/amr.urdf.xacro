@@ -1,0 +1,149 @@
+<?xml version="1.0"?>
+<robot name="amr" xmlns:xacro="http://www.ros.org/wiki/xacro"> <!--robot name = AMR-->
+
+<!--Visualization materials-->
+<material name="safety_orange">
+    <color rgba="1.0 0.35 0.0 1.0"/>
+</material>
+<material name="dark_grey">
+    <color rgba="0.2 0.2 0.2 1.0"/>
+</material>
+
+<!--Define dimension wheel-->
+<xacro:property name="wheel_diameter" value="0.128"/>
+<xacro:property name="wheel_radius" value="${wheel_diameter / 2}"/>
+<xacro:property name="wheel_separation" value="0.472"/>
+<xacro:property name="wheel_thick" value="0.04"/>
+
+<!--Define dimension base-->
+<xacro:property name="base_height" value="0.275"/>
+<xacro:property name="base_width" value="0.496"/>
+<xacro:property name="base_depth" value="0.951"/>
+
+<!--Define dimension lidar-->
+<xacro:property name="lidar_height" value="0.0182"/>
+<xacro:property name="lidar_radius" value="0.0278"/>
+
+<!--Define dimension 3Dcamera-->
+<xacro:property name="camera_height" value="0.019"/>
+<xacro:property name="camera_width" value="0.0898"/>
+<xacro:property name="camera_depth" value="0.025"/>
+
+<!--Define position and offset-->
+<xacro:property name="base_offset_height" value="${wheel_radius}"/>
+
+<xacro:property name="lidar_x" value="${(base_depth / 2) - 0.290}"/>
+<xacro:property name="lidar_z" value="${(base_height - 0.021) + (lidar_height / 2) + 0.0031}"/>
+
+<xacro:property name="camera_x" value="${base_depth / 2}"/>
+<xacro:property name="camera_z" value="${(-0.021) + 0.144}"/>
+
+<!--Base footprint-->
+<link name="base_footprint"/>
+<joint name='joint_base' type='fixed'>
+    <parent link="base_footprint"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 ${base_offset_height}" rpy="0 0 0"/>
+</joint>
+
+<!--Base link-->
+<link name="base_link">
+    <visual>
+        <origin xyz="0 0 ${(base_height / 2) - 0.021}" rpy="0 0 0"/>
+        <geometry>
+            <box size="${base_depth} ${base_width} ${base_height}"/>
+        </geometry>
+        <material name="safety_orange"/>
+    </visual>
+</link>
+
+<!--Lidar link-->
+<link name="lidar_link">
+    <visual>
+        <geometry>
+            <cylinder radius="${lidar_radius}" length="${lidar_height}"/>
+        </geometry>
+        <material name="dark_grey"/>
+    </visual>
+</link>
+
+<!--Lidar joint-->
+<joint name="joint_lidar" type="fixed">
+    <parent link="base_link"/>
+    <child link="lidar_link"/>
+    <origin xyz="${lidar_x} 0 ${lidar_z}" rpy="0 0 0"/>
+</joint>
+
+<!--Camera link-->
+<link name="camera_link">
+    <visual>
+        <origin xyz="-0.0095 0 0" rpy="0 0 0"/>
+        <geometry>
+            <box size="${camera_depth} ${camera_width} ${camera_height}"/>
+        </geometry>
+        <material name="dark_grey"/>
+    </visual>
+</link>
+
+<!--Camera joint-->
+<joint name="joint_camera" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+    <origin xyz="${camera_x} 0 ${camera_z}" rpy="0 0 0"/>
+</joint>
+<!--Camera optical frame-->
+<joint name="camera_joint_frame" type="fixed">
+    <parent link="camera_link"/>
+    <child link="camera_optical_frame"/>
+    <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
+</joint>
+<link name="camera_optical_frame"/>
+
+<!--Drive wheel-->
+<xacro:macro name="drive_wheel" params="prefix reflect">
+    <!--Drive wheel link-->
+    <link name="${prefix}_drive_wheel_link">
+        <visual>
+            <geometry>
+                <cylinder radius="${wheel_radius}" length="${wheel_thick}"/>
+            </geometry>
+            <material name="dark_grey"/>
+        </visual>
+    </link>
+
+    <!--Drive wheel joint-->
+    <joint name="joint_${prefix}_drive_wheel" type="continuous">
+        <parent link="base_link"/>
+        <child link="${prefix}_drive_wheel_link"/>
+        <origin xyz="0.008 ${reflect * wheel_separation / 2 } 0" rpy="${pi/2} 0 0"/>
+        <axis xyz="0 0 1"/>
+    </joint>
+</xacro:macro>
+<xacro:drive_wheel prefix="left" reflect="1"/>
+<xacro:drive_wheel prefix="right" reflect="-1"/>
+
+<!--Caster wheel-->
+<xacro:macro name="caster_wheel" params="prefix1 prefix2 x_shift y_shift">
+    <!--Caster wheel link-->
+    <link name="${prefix1}_${prefix2}_caster_wheel_link">
+        <visual>
+            <geometry>
+                <sphere radius="${wheel_radius}"/>
+            </geometry>
+            <material name="dark_grey"/>
+        </visual>
+    </link>
+    <!--Caster wheel joint-->
+    <joint name="joint_${prefix1}_${prefix2}_caster_wheel" type="fixed">
+        <parent link="base_link"/>
+        <child link="${prefix1}_${prefix2}_caster_wheel_link"/>
+        <origin xyz="${x_shift} ${y_shift * 0.148} 0" rpy="0 0 0"/>
+    </joint>
+</xacro:macro>
+<xacro:caster_wheel prefix1="front" prefix2="left" x_shift="0.3725" y_shift="1"/>
+<xacro:caster_wheel prefix1="front" prefix2="right" x_shift="0.3725" y_shift="-1"/>
+<xacro:caster_wheel prefix1="back" prefix2="left" x_shift="-0.4181" y_shift="1"/>
+<xacro:caster_wheel prefix1="back" prefix2="right" x_shift="-0.4181" y_shift="-1"/>
+</robot>
+
+

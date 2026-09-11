@@ -1,0 +1,10 @@
+# Topic bridge configuration for parameter_bridge (ros_gz_bridge)
+# Lets a ROS 2 node drive the "pedestrian" dynamic-obstacle model defined
+# in complex_world.sdf via its VelocityControl plugin.
+# Usage: ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=<this file>
+
+- ros_topic_name: "/pedestrian/cmd_vel"
+  gz_topic_name: "/model/pedestrian/cmd_vel"
+  ros_type_name: "geometry_msgs/msg/Twist"
+  gz_type_name: "gz.msgs.Twist"
+  direction: ROS_TO_GZ

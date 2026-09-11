@@ -1,0 +1,19 @@
+# PlatformIO build cache
+stm/.pio/
+
+# Colcon workspace build artifacts
+proj_ws/build/
+proj_ws/install/
+proj_ws/log/
+sim_ws/build/
+sim_ws/install/
+sim_ws/log/
+
+# External repos with their own .git (not vendored as submodules)
+proj_ws/src/micro_ros_agent/
+proj_ws/src/micro_ros_msgs/
+proj_ws/src/micro_ros_setup/
+
+# Python cache
+__pycache__/
+*.pyc
