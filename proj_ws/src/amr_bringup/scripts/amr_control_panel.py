@@ -7,6 +7,7 @@ import glob
 import os
 import re
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -14,12 +15,40 @@ import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 
+from urllib.parse import quote
+
+import qrcode
+from PIL import ImageTk
+
 from ament_index_python.packages import get_package_share_directory
 
 MAPS_DIR = os.path.join(
     get_package_share_directory('amr_navigation'), '..', '..', '..', '..',
     'src', 'amr_navigation', 'maps')
 MAPS_DIR = os.path.normpath(MAPS_DIR)
+
+ROSBOARD_PORT = 8888
+
+# Topics auto-subscribed on the rosboard page so the operator's phone shows
+# the right panels the moment the QR code is scanned - no manual picking.
+MAPPING_MONITOR_TOPICS = {
+    # /map opens rosboard's combined Map+Scan viewer (see MapScanViewer.js),
+    # which pulls /scan in on its own via TF - no need to list it here too.
+    '/map': 'nav_msgs/msg/OccupancyGrid',
+    # NOTE: the EKF (ekf.yaml) publishes fused odometry on /odometry/filtered,
+    # not /odom - using the wrong name here would just show "Waiting for data".
+    '/odometry/filtered': 'nav_msgs/msg/Odometry',
+}
+
+
+def build_rosboard_url(ip, topics):
+    base = f'http://{ip}:{ROSBOARD_PORT}/'
+    if not topics:
+        return base
+    params = '&'.join(
+        f'{quote(name.replace("/", chr(92)))}={quote(msg_type.replace("/", chr(92)))}'
+        for name, msg_type in topics.items())
+    return f'{base}?{params}'
 
 BG = '#f4f6f8'
 CARD_BG = '#ffffff'
@@ -38,6 +67,39 @@ def sanitize_map_name(raw):
     return name
 
 
+def get_local_ip():
+    """Best-effort LAN IP of this machine (no packets actually sent - UDP
+    connect() just makes the kernel pick the outbound interface/address)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('10.255.255.255', 1))
+        return s.getsockname()[0]
+    except OSError:
+        return '127.0.0.1'
+    finally:
+        s.close()
+
+
+def get_rosboard_pin():
+    """Reads the access PIN rosboard.py generates and writes to disk on
+    startup (see rosboard.py's __init__). Returns None if rosboard hasn't
+    written one yet (not running, or old version without the PIN gate)."""
+    try:
+        with open(os.path.expanduser('~/.rosboard_pin')) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def is_port_open(host, port, timeout=0.5):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex((host, port)) == 0
+    finally:
+        s.close()
+
+
 class AmrControlPanel(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -49,6 +111,8 @@ class AmrControlPanel(tk.Tk):
         self._proc = None
         self._mode = None  # 'mapping' | 'navigation'
         self._status_poll_job = None
+        self._rosboard_proc = None
+        self._qr_photo = None  # keep a reference so Tk doesn't GC the image
 
         self._build_fonts()
         self._build_ui()
@@ -212,6 +276,75 @@ class AmrControlPanel(tk.Tk):
             'ros2', 'launch', 'amr_bringup', 'bringup.launch.py',
             'rviz:=false', 'foxglove:=true', 'slam:=true', 'navigation:=false',
         ], mode='mapping', label='โหมดสร้างแผนที่ (Mapping)')
+        threading.Thread(target=self._ensure_rosboard_then_show_qr,
+                          daemon=True).start()
+
+    # ---------- rosboard / monitor QR ----------
+    def _ensure_rosboard_then_show_qr(self):
+        ip = get_local_ip()
+        if not is_port_open(ip, ROSBOARD_PORT):
+            self._start_rosboard()
+            # give it a moment to bind the port before we render the QR
+            for _ in range(20):
+                time.sleep(0.5)
+                if is_port_open(ip, ROSBOARD_PORT):
+                    break
+        url = build_rosboard_url(ip, MAPPING_MONITOR_TOPICS)
+        self.after(0, lambda: self._show_monitor_qr(url))
+
+    def _start_rosboard(self):
+        if self._rosboard_proc is not None and self._rosboard_proc.poll() is None:
+            return
+        env = os.environ.copy()
+        try:
+            self._rosboard_proc = subprocess.Popen(
+                ['ros2', 'run', 'rosboard', 'rosboard_node'],
+                preexec_fn=os.setsid, env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            self._rosboard_proc = None
+
+    def _show_monitor_qr(self, url):
+        img = qrcode.make(url).resize((260, 260))
+        self._qr_photo = ImageTk.PhotoImage(img)
+
+        win = tk.Toplevel(self)
+        win.title('Monitor บนมือถือ')
+        win.configure(bg=CARD_BG)
+        win.transient(self)
+        win.resizable(False, False)
+
+        tk.Label(win, text='สแกนเพื่อดูสถานะ SLAM แบบ Real-time',
+                 font=self.f_status, bg=CARD_BG, fg=TEXT_MAIN,
+                 wraplength=280, justify='center'
+                 ).pack(padx=20, pady=(18, 10))
+        tk.Label(win, image=self._qr_photo, bg=CARD_BG).pack(padx=20)
+        tk.Label(win, text=url, font=self.f_small, bg=CARD_BG,
+                 fg=TEXT_MUTED, wraplength=280, justify='center'
+                 ).pack(padx=20, pady=(8, 4))
+        tk.Label(win, text='ต่อ WiFi วงเดียวกับ Jetson นี้ก่อนสแกน',
+                 font=self.f_small, bg=CARD_BG, fg=TEXT_MUTED,
+                 wraplength=280, justify='center'
+                 ).pack(padx=20, pady=(0, 6))
+
+        pin = get_rosboard_pin()
+        if pin:
+            pin_frame = tk.Frame(win, bg='#fff8e1', highlightthickness=1,
+                                  highlightbackground='#f9a825')
+            pin_frame.pack(padx=20, pady=(4, 10), fill='x')
+            tk.Label(pin_frame, text='รหัสเข้าใช้งาน (PIN)', font=self.f_small,
+                     bg='#fff8e1', fg=TEXT_MUTED).pack(pady=(8, 0))
+            tk.Label(pin_frame, text=pin, font=tkfont.Font(
+                family='Sans', size=24, weight='bold'),
+                bg='#fff8e1', fg='#e65100').pack(pady=(0, 8))
+
+        tk.Button(win, text='ปิด', font=self.f_button_sub, bg='#ffffff',
+                  fg=TEXT_MUTED, relief='solid', bd=1, padx=14, pady=8,
+                  cursor='hand2', command=win.destroy
+                  ).pack(pady=(4, 18))
+
+        win.update_idletasks()
+        self._center_toplevel(win, 320, win.winfo_reqheight() + 10)
 
     def _on_click_navigation(self):
         if self._proc is not None:
