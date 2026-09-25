@@ -7,6 +7,21 @@
 amcl:
   ros__parameters:
     use_sim_time: false
+    # The robot is always physically placed at the same spot slam_toolbox
+    # was started from (map frame (0,0,0) is, by definition, wherever the
+    # robot was when mapping began - see the mapping-origin discussion
+    # this was set from) before every navigation run, so that's a valid
+    # fixed initial pose - amcl no longer starts from its own default
+    # (wide, unconverged) particle spread and needs no manual "2D Pose
+    # Estimate"/"ตั้งตำแหน่งเริ่มต้น" tap. If that physical starting spot
+    # ever changes, this must be updated to match, or amcl will converge
+    # confidently on the WRONG pose instead of the right one.
+    set_initial_pose: true
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
     alpha1: 0.2
     alpha2: 0.2
     alpha3: 0.2
@@ -24,8 +39,21 @@ amcl:
     laser_min_range: -1.0
     laser_model_type: "likelihood_field"
     max_beams: 60
-    max_particles: 2000
-    min_particles: 500
+    # Lowered from 2000/500 to reduce amcl's CPU cost (it was the single
+    # highest-CPU node on this Jetson - 51.7% in a `top` snapshot taken
+    # while load average sat at 10+ on this 6-core board, well past
+    # capacity - see the CPU-overload discussion this was tuned from).
+    # amcl's own cost scales roughly with particle_count * max_beams, so
+    # this cut is a rough 2x reduction on the worst case (max_particles-
+    # bound). Structured indoor environment + now-fused IMU heading (see
+    # amr_bringup/config/ekf.yaml) should still converge reliably at this
+    # count, but this needs to be validated on the real robot, not
+    # assumed - watch for slower/less robust re-localization (e.g. after
+    # the "kidnapped robot" case, or in the long straight/featureless
+    # corridors called out elsewhere in this file) and raise these back
+    # up if convergence becomes unreliable.
+    max_particles: 1000
+    min_particles: 200
     odom_frame_id: "odom"
     pf_err: 0.05
     pf_z: 0.99
@@ -62,8 +90,10 @@ bt_navigator:
     bt_loop_duration: 10
     default_server_timeout: 20
     wait_for_service_timeout: 1000
-    default_nav_to_pose_bt_xml: "/opt/ros/humble/share/nav2_bt_navigator/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml"
-    default_nav_through_poses_bt_xml: "/opt/ros/humble/share/nav2_bt_navigator/behavior_trees/navigate_through_poses_w_replanning_and_recovery.xml"
+    # Copies of the stock Nav2 BTs with recovery Spin limited to 1.39 rad (~80 deg)
+    # instead of 1.57 (90 deg) - see behavior_trees/.
+    default_nav_to_pose_bt_xml: "/home/nvidia/AMR_Project/proj_ws/install/amr_navigation/share/amr_navigation/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml"
+    default_nav_through_poses_bt_xml: "/home/nvidia/AMR_Project/proj_ws/install/amr_navigation/share/amr_navigation/behavior_trees/navigate_through_poses_w_replanning_and_recovery.xml"
     plugin_lib_names:
       - nav2_compute_path_to_pose_action_bt_node
       - nav2_compute_path_through_poses_action_bt_node
@@ -150,8 +180,13 @@ controller_server:
       vx_std: 0.2
       vy_std: 0.0
       wz_std: 0.4
-      vx_max: 0.5
-      vx_min: -0.35
+      vx_max: 0.2
+      # 0.0, not negative: normal path-following (FollowPath/MPPI) never
+      # plans a reversing trajectory. The BackUp recovery behavior (see
+      # recovery_plugins below) is untouched and still backs up on its own
+      # when the robot gets stuck - that's a separate, deliberate escape
+      # action, not everyday driving.
+      vx_min: 0.0
       vy_max: 0.0
       wz_max: 1.0
       iteration_count: 1
@@ -380,8 +415,8 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.5, 0.0, 1.0]
-    min_velocity: [-0.5, 0.0, -1.0]
+    max_velocity: [0.2, 0.0, 1.0]
+    min_velocity: [-0.2, 0.0, -1.0]
     max_accel: [1.0, 0.0, 2.0]
     max_decel: [-1.0, 0.0, -2.0]
     odom_topic: "/odometry/filtered"

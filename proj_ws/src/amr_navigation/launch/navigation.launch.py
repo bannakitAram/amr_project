@@ -46,6 +46,7 @@ def generate_launch_description():
         'bt_navigator',
         'waypoint_follower',
         'velocity_smoother',
+        'collision_monitor',
     ]
 
     common_params = [params_file, {'use_sim_time': use_sim_time}]
@@ -106,13 +107,41 @@ def generate_launch_description():
         output='screen',
         parameters=common_params,
     )
+    # NOTE: output stays on the smoother's own default topic
+    # ("cmd_vel_smoothed"), NOT remapped straight to "cmd_vel" - that old
+    # remap made this collide with controller_server's own "cmd_vel"
+    # publisher (two publishers on the same topic). collision_monitor below
+    # is now the sole node that publishes the final "cmd_vel" sent to the
+    # robot, per its cmd_vel_in_topic/cmd_vel_out_topic config in
+    # nav2_params.yaml.
     velocity_smoother_node = Node(
         package='nav2_velocity_smoother',
         executable='velocity_smoother',
         name='velocity_smoother',
         output='screen',
         parameters=common_params,
-        remappings=[('cmd_vel_smoothed', 'cmd_vel')],
+    )
+    # LiDAR-based independent safety layer, sitting between the smoother and
+    # the robot: slows/stops any outgoing cmd_vel if the configured
+    # footprint polygon (see nav2_params.yaml's FootprintApproach) predicts
+    # a collision from /scan data, regardless of what MPPI/planner decided.
+    collision_monitor_node = Node(
+        package='nav2_collision_monitor',
+        executable='collision_monitor',
+        name='collision_monitor',
+        output='screen',
+        parameters=common_params,
+    )
+
+    # Bridges the rosboard goal_picker web page (tap-to-navigate / draw-a-
+    # path) to Nav2's navigate_to_pose / navigate_through_poses actions -
+    # see nav_goal_executor_node.py's module docstring.
+    nav_goal_executor_node = Node(
+        package='amr_navigation',
+        executable='nav_goal_executor_node.py',
+        name='nav_goal_executor_node',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
     )
 
     lifecycle_manager_localization = Node(
@@ -152,6 +181,8 @@ def generate_launch_description():
         bt_navigator_node,
         waypoint_follower_node,
         velocity_smoother_node,
+        collision_monitor_node,
+        nav_goal_executor_node,
         lifecycle_manager_localization,
         lifecycle_manager_navigation,
     ])

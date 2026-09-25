@@ -7,28 +7,31 @@ scan_to_scan_filter_chain:
     # rear sector outside that window kept real sensor values. This is the
     # opposite of "keep inside / blank outside".
     #
-    # Goal: blank the REAR sector where the teleop operator walks (~180 deg,
-    # behind the robot), keep the front +/-120 deg cone as real mapping data.
-    # The rear sector straddles the +/-180 deg wrap point, so it needs two
-    # filters (one per side) since this filter can't wrap lower>upper.
+    # Goal: blank the REAR sector where the teleop operator walks (physically
+    # behind the robot), keep the rest of the scan as real mapping data.
+    #
+    # 2026-09-17: the lidar_link hardware mount is physically flipped 180 deg
+    # on this robot, so lidar-frame 0 rad now points at the physical rear
+    # (where the operator walks), not the front - the blanked window was
+    # rotated 180 deg (centered on 0 rad instead of +/-180 rad) to keep
+    # blanking the same physical rear location. Front/rear no longer
+    # straddles the +/-180 deg wrap point, so a single filter is enough.
     #
     # REP-103 convention: 0 rad = straight ahead (+x, lidar_link forward),
-    # angle increases counter-clockwise.
+    # angle increases counter-clockwise. This is the LIDAR's own frame, which
+    # is now rotated 180 deg relative to the robot body due to the flipped
+    # mount - "straight ahead" here means physical rear.
     #
     # !!! CALIBRATE FOR YOUR ROBOT !!!
     # Confirm lidar_link's 0-angle orientation and the actual angle the
     # operator walks at before trusting these values - verify live with
     # `ros2 topic echo /scan_filtered --full-length` while someone walks
-    # behind the robot.
+    # behind the robot. Blanking the wrong sector hides real obstacles from
+    # SLAM/nav, which is a safety issue under ISO 3691-4 - re-verify after
+    # any change to the lidar mount orientation.
     filter1:
-      name: angular_bounds_filter_rear_positive_side
+      name: angular_bounds_filter_rear
       type: laser_filters/LaserScanAngularBoundsFilterInPlace
       params:
-        lower_angle: 2.0944    # +120 deg
-        upper_angle: 3.14159   # +180 deg
-    filter2:
-      name: angular_bounds_filter_rear_negative_side
-      type: laser_filters/LaserScanAngularBoundsFilterInPlace
-      params:
-        lower_angle: -3.14159  # -180 deg
-        upper_angle: -2.0944   # -120 deg
+        lower_angle: -1.0472   # -60 deg
+        upper_angle: 1.0472    # +60 deg
