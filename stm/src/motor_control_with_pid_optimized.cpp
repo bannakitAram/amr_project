@@ -9,6 +9,7 @@
 #include <std_msgs/msg/float32.h>
 #include <std_msgs/msg/int32.h>
 #include <std_msgs/msg/bool.h>
+#include <sensor_msgs/msg/imu.h>
 #include <rosidl_runtime_c/string_functions.h>
 #include <rmw_microros/rmw_microros.h>
 
@@ -57,6 +58,7 @@ const int R_SP_PIN  = PA5;   // DAC / PWM Channel 2
 const int R_FR_PIN  = PB0;
 const int R_RUN_PIN = PC7;
 const int R_HAL     = PD11;
+
 const int L_SP_PIN  = PA4;   // DAC / PWM Channel 1
 const int L_FR_PIN  = PB1;
 const int L_RUN_PIN = PC6;
@@ -65,9 +67,17 @@ const int L_HAL     = PD8;
 // ============================================================
 // ROBOT PARAMETERS
 // ============================================================
-const float wheel_radius = 0.128f / 2.0f;
+// Per-wheel effective radius (m). Both default to the nominal 0.128 m
+// diameter, so behaviour is unchanged until calibrated: a common scale
+// error is fixed by moving both together, a left/right ratio (straight-line
+// drift) by moving them apart - see calib_straight_node.py. Use the loaded,
+// on-floor effective radius (tyre sag under payload shrinks it), not the
+// unloaded catalogue value. Do NOT compensate via ENCODER_PPR (ground truth).
+const float wheel_radius_l = 0.128f / 2.0f;
+const float wheel_radius_r = 0.128f / 2.0f;
 const float wheel_sep    = 0.472f;
-const float wheel_circumference = 2.0f * PI * wheel_radius;
+const float wheel_circumference_l = 2.0f * PI * wheel_radius_l;
+const float wheel_circumference_r = 2.0f * PI * wheel_radius_r;
 
 // ============================================================
 // ENCODER PPR
@@ -145,7 +155,14 @@ float current_target_r = 0.0f;
 // COMMAND TIMEOUT
 // ============================================================
 unsigned long last_cmd_time = 0;
-const unsigned long CMD_TIMEOUT_MS = 1000;
+// Lowered from 1000ms (2026-09-17): at 1000ms a stalled/blocked high-level
+// control loop (e.g. GIL contention on the Jetson side) could keep the
+// robot moving at the last received cmd_vel for up to a full second after
+// the caller intended to stop, causing measured overshoot on "move forward
+// X meters" tests (~0.15-0.2m at 0.15 m/s). 200ms still gives >2x margin
+// over typical cmd_vel publish periods (teleop/joystick ~33-100ms, Nav2
+// controller ~50ms) while bounding failsafe-stop latency much tighter.
+const unsigned long CMD_TIMEOUT_MS = 200;
 
 // ============================================================
 // DAC LIMITS
@@ -240,7 +257,7 @@ const float left_dac_table[CAL_POINTS] =
 
 const float right_dac_table[CAL_POINTS] =
 {
-  393.05f, 718.76f, 1044.48f, 1370.19f, 1695.91f,
+  388.05f, 718.76f, 1044.48f, 1370.19f, 1695.91f,
   2021.62f, 2347.33f, 2673.05f, 2998.76f, 3324.47f
 };
 
@@ -295,6 +312,280 @@ float pose_y = 0.0f;
 float pose_theta = 0.0f;
 unsigned long last_control_time = 0;
 unsigned long last_pulse_pub_time = 0;
+unsigned long last_imu_pub_time = 0;
+
+// ============================================================
+// IMU (MPU6050) - HAND-ROLLED BIT-BANGED I2C
+//
+// PB7 (SDA) and PC13 (SCL) were chosen from what's actually broken out on
+// this board's headers - both sit on header P4, so both IMU wires land on
+// the same connector. They don't share a hardware I2C peripheral (and
+// PC13 isn't an I2C pin on this chip at all), which the STM32 HAL's Wire
+// can't bridge across - but that's fine here since this is bit-banged:
+// it just toggles two arbitrary GPIOs, so no peripheral pairing is
+// required. (SCL started out on PB10, on a different header (P3) shared
+// with this board's nRF24L01 footprint - moved to PC13 for simpler
+// wiring and to free PB10 back up for that.)
+//
+// Not using Adafruit_MPU6050/Wire: Adafruit_BusIO's I2CDevice hard-
+// requires a real TwoWire*, and the only pre-built software-I2C Arduino
+// library available (testato/SoftwareWire) is AVR-only - it pokes raw
+// AVR port registers directly and doesn't compile for STM32 at all. So
+// this talks to the MPU6050 registers directly instead.
+// ============================================================
+#define IMU_SDA_PIN PB7
+#define IMU_SCL_PIN PC13
+#define MPU6050_ADDR      0x68
+#define MPU6050_REG_WHOAMI      0x75
+#define MPU6050_REG_PWR_MGMT_1  0x6B
+#define MPU6050_REG_CONFIG       0x1A
+#define MPU6050_REG_GYRO_CONFIG  0x1B
+#define MPU6050_REG_ACCEL_CONFIG 0x1C
+#define MPU6050_REG_ACCEL_XOUT_H 0x3B
+// AFS_SEL=2 (+-8g, 4096 LSB/g) / FS_SEL=1 (+-500 dps, 65.5 LSB/(deg/s)) -
+// matches the ranges used on the (now retired) Arduino Mega IMU prototype.
+#define MPU6050_ACCEL_LSB_PER_G   4096.0f
+#define MPU6050_GYRO_LSB_PER_DPS  65.5f
+
+bool mpu_ok = false;
+
+static inline void i2c_sda_release() { pinMode(IMU_SDA_PIN, INPUT_PULLUP); }
+static inline void i2c_sda_low()     { pinMode(IMU_SDA_PIN, OUTPUT); digitalWrite(IMU_SDA_PIN, LOW); }
+static inline void i2c_scl_release() { pinMode(IMU_SCL_PIN, INPUT_PULLUP); }
+static inline void i2c_scl_low()     { pinMode(IMU_SCL_PIN, OUTPUT); digitalWrite(IMU_SCL_PIN, LOW); }
+
+void i2c_start()
+{
+  i2c_sda_release(); i2c_scl_release(); delayMicroseconds(3);
+  i2c_sda_low(); delayMicroseconds(3);
+  i2c_scl_low(); delayMicroseconds(3);
+}
+
+void i2c_stop()
+{
+  i2c_sda_low(); delayMicroseconds(3);
+  i2c_scl_release(); delayMicroseconds(3);
+  i2c_sda_release(); delayMicroseconds(3);
+}
+
+// Returns true on ACK
+bool i2c_write_byte(uint8_t b)
+{
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    if (b & 0x80) i2c_sda_release(); else i2c_sda_low();
+    b <<= 1;
+    delayMicroseconds(3);
+    i2c_scl_release(); delayMicroseconds(3);
+    i2c_scl_low();
+  }
+  i2c_sda_release(); delayMicroseconds(3);
+  i2c_scl_release(); delayMicroseconds(3);
+  bool ack = (digitalRead(IMU_SDA_PIN) == LOW);
+  i2c_scl_low();
+  return ack;
+}
+
+uint8_t i2c_read_byte(bool ack)
+{
+  uint8_t b = 0;
+  i2c_sda_release();
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    delayMicroseconds(3);
+    i2c_scl_release(); delayMicroseconds(3);
+    b = (b << 1) | (digitalRead(IMU_SDA_PIN) == HIGH ? 1 : 0);
+    i2c_scl_low();
+  }
+  if (ack) i2c_sda_low(); else i2c_sda_release();
+  delayMicroseconds(3);
+  i2c_scl_release(); delayMicroseconds(3);
+  i2c_scl_low();
+  i2c_sda_release();
+  return b;
+}
+
+bool mpu6050_write_reg(uint8_t reg, uint8_t val)
+{
+  i2c_start();
+  bool ok = i2c_write_byte(MPU6050_ADDR << 1);
+  ok = ok && i2c_write_byte(reg);
+  ok = ok && i2c_write_byte(val);
+  i2c_stop();
+  return ok;
+}
+
+// Burst-reads `len` bytes starting at `reg` into buf[]. Returns true on ACK.
+bool mpu6050_read_regs(uint8_t reg, uint8_t *buf, uint8_t len)
+{
+  i2c_start();
+  bool ok = i2c_write_byte(MPU6050_ADDR << 1);
+  ok = ok && i2c_write_byte(reg);
+  if (!ok) { i2c_stop(); return false; }
+
+  i2c_start();
+  ok = i2c_write_byte((MPU6050_ADDR << 1) | 0x01);
+  if (!ok) { i2c_stop(); return false; }
+
+  for (uint8_t i = 0; i < len; i++) buf[i] = i2c_read_byte(i < len - 1);
+  i2c_stop();
+  return true;
+}
+
+bool mpu6050_init()
+{
+  i2c_sda_release(); i2c_scl_release();
+
+  uint8_t whoami = 0;
+  if (!mpu6050_read_regs(MPU6050_REG_WHOAMI, &whoami, 1)) return false;
+  // 0x68 = MPU6050, 0x69 = some MPU6050 clones, 0x70 = MPU6500, 0x71 =
+  // MPU9250 - all register-compatible with the reads/writes used here.
+  // (This board's "GY-521" breakout reads back 0x70 - it's actually an
+  // MPU6500 under the same silkscreen/pinout, a common substitution.)
+  if (whoami != 0x68 && whoami != 0x69 && whoami != 0x70 && whoami != 0x71) return false;
+
+  if (!mpu6050_write_reg(MPU6050_REG_PWR_MGMT_1, 0x00)) return false;  // wake from sleep
+  delay(10);
+  if (!mpu6050_write_reg(MPU6050_REG_ACCEL_CONFIG, 0x10)) return false;  // +-8g
+  if (!mpu6050_write_reg(MPU6050_REG_GYRO_CONFIG, 0x08)) return false;   // +-500 dps
+  // DLPF_CFG=4: ~21Hz accel bandwidth / ~20Hz gyro bandwidth - same
+  // setting the retired Arduino Mega prototype used (MPU6050_BAND_21_HZ).
+  // Without this the chip defaults to its widest (~260Hz) bandwidth,
+  // passing through most of the vibration noise from being mounted next
+  // to the motor driver circuitry on this same board.
+  if (!mpu6050_write_reg(MPU6050_REG_CONFIG, 0x04)) return false;
+  return true;
+}
+
+// ============================================================
+// IMU BIAS AUTO-CALIBRATION (gyro + accel)
+//
+// Averages raw (pre-unit-conversion) gyro/accel counts over `samples`
+// reads (one combined 14-byte burst read per sample, so this doesn't cost
+// extra I2C traffic over gyro-only calibration) to find each axis's
+// zero-rate/zero-g offset, then those averages are subtracted from every
+// live reading in publish_imu().
+//
+// Gyro: a stationary sensor should read exactly 0 rad/s on all 3 axes,
+// so the raw average IS the bias directly. Without correcting this, even
+// a small constant bias (e.g. 0.01 rad/s) integrates into large heading
+// drift over time once fused into the EKF - see ekf.yaml's odom0_config
+// comment on why heading accuracy matters here.
+//
+// Accel: a stationary, LEVEL sensor should read (0, 0, +1g) - gravity is
+// real, not bias, so only the DEVIATION from that is bias. x/y biases are
+// just their raw averages (expected 0); z's bias is (raw average - the
+// raw count representing 1g), so the correction still leaves gravity in
+// the published reading rather than zeroing it out. This was added after
+// a stationary, level reading came back as x=1.14 y=-0.08 z=10.67 m/s^2 -
+// magnitude 10.73 vs the true 9.81 m/s^2 of gravity, which is too large
+// to be explained by mounting tilt alone (tilt redistributes gravity
+// across axes but can't change the total magnitude), confirming a real
+// per-axis sensor offset.
+//
+// Only called from setup(), before the ROS executor/agent connection
+// exists (state machine starts at WAITING_AGENT after this returns) -
+// so no cmd_vel can reach the motors while this runs. The robot MUST be
+// stationary AND level for the ~1s this takes: gyro calibration only
+// needs "stationary", but accel calibration also needs "level", or the
+// z-axis bias above will absorb the tilt error too.
+// ============================================================
+float gyro_bias_x = 0.0f;
+float gyro_bias_y = 0.0f;
+float gyro_bias_z = 0.0f;
+float accel_bias_x = 0.0f;
+float accel_bias_y = 0.0f;
+float accel_bias_z = 0.0f;
+
+// ============================================================
+// WHEEL SLIP DETECTION (approach A - detect only, don't correct)
+//
+// Compares wheel-odometry's own yaw rate estimate (`w` in
+// update_and_publish_odom(), computed purely from encoder counts) against
+// the gyro's independently-measured angular_velocity.z. Encoders can't
+// tell the difference between "wheel turned because the robot turned"
+// and "wheel turned because it slipped in place" - the gyro can, since
+// it measures the body's actual rotation regardless of what the wheels
+// are doing. A sustained mismatch between the two means the wheels
+// aren't tracking the ground truth motion, i.e. slip.
+//
+// This only reports the condition (wheel/slip_detected) - it does NOT
+// feed back into motor_control_process() to correct anything. Closing
+// that loop would make the gyro a safety-critical input to motion
+// control itself (a bad gyro reading could then directly distort motor
+// commands, not just localization) - see the mounting-height/motor-
+// control discussion this was scoped down from. If detections in
+// practice show slip is frequent enough to matter, that's a separate,
+// more involved change to design and test carefully.
+// ============================================================
+float latest_gyro_yaw_rate_rad_s = 0.0f;
+bool gyro_yaw_rate_valid = false;  // true once publish_imu() has stored a real reading
+
+const float SLIP_YAW_RATE_THRESHOLD_RAD_S = 0.15f;  // ~8.6 deg/s - above normal filter-lag mismatch between the two signals
+const unsigned long SLIP_DEBOUNCE_MS = 300;          // mismatch must persist this long before latching true (avoids false positives from turning transients)
+unsigned long slip_mismatch_start = 0;
+bool slip_mismatch_active = false;
+bool wheel_slip_detected = false;
+
+// ============================================================
+// CONTINUOUS GYRO BIAS TRACKING (ZUPT - zero-rate update)
+//
+// calibrate_imu_bias() only measures bias once at boot, while the chip is
+// still cold. MEMS gyro zero-rate offset drifts with die temperature -
+// as the chip (and the motor driver board it shares) warms up during
+// operation, the true bias moves away from that one boot-time snapshot,
+// showing up as a residual angular_velocity.z that never quite settles
+// to 0 even at rest (observed ~-0.027 rad/s / -1.5 deg/s after boot
+// calibration - enough to integrate into real heading drift if left
+// uncorrected over an idle period).
+//
+// Fix: whenever the robot is genuinely commanded-and-measured stationary
+// (same condition update_and_publish_odom() already uses to zero
+// odom_speed_l/r - see robot_stationary below), nudge each gyro bias
+// slowly toward the current raw reading (true angular velocity is 0 at
+// rest, so the raw reading IS the current bias). ZUPT_ALPHA is small so
+// this tracks slow thermal drift over tens of seconds, not noise on a
+// single sample.
+//
+// robot_stationary is keyed off target_speed_l/r (what was COMMANDED),
+// not just measured speed, so a robot forced to a sudden stop (e.g. an
+// obstacle) doesn't get misread as "idle, safe to recalibrate" - matches
+// the same commanded-vs-measured distinction STOP_TARGET_THRESHOLD/
+// STOP_SPEED_THRESHOLD already draw elsewhere in this file.
+// ============================================================
+bool robot_stationary = false;
+const float ZUPT_ALPHA = 0.01f;  // time constant ~= 1/(ZUPT_ALPHA * 20Hz) = ~5s
+
+void calibrate_imu_bias(uint16_t samples)
+{
+  int32_t sum_gx = 0, sum_gy = 0, sum_gz = 0;
+  int32_t sum_ax = 0, sum_ay = 0, sum_az = 0;
+  uint16_t got = 0;
+  uint8_t raw[14];
+
+  for (uint16_t i = 0; i < samples; i++)
+  {
+    if (mpu6050_read_regs(MPU6050_REG_ACCEL_XOUT_H, raw, 14))
+    {
+      sum_ax += (int16_t)((raw[0] << 8) | raw[1]);
+      sum_ay += (int16_t)((raw[2] << 8) | raw[3]);
+      sum_az += (int16_t)((raw[4] << 8) | raw[5]);
+      sum_gx += (int16_t)((raw[8]  << 8) | raw[9]);
+      sum_gy += (int16_t)((raw[10] << 8) | raw[11]);
+      sum_gz += (int16_t)((raw[12] << 8) | raw[13]);
+      got++;
+    }
+    delay(3);
+  }
+
+  if (got == 0) return;  // leave biases at 0 rather than divide by zero
+  gyro_bias_x = (float)sum_gx / got;
+  gyro_bias_y = (float)sum_gy / got;
+  gyro_bias_z = (float)sum_gz / got;
+  accel_bias_x = (float)sum_ax / got;
+  accel_bias_y = (float)sum_ay / got;
+  accel_bias_z = ((float)sum_az / got) - MPU6050_ACCEL_LSB_PER_G;
+}
 
 // ============================================================
 // MICRO-ROS
@@ -316,24 +607,33 @@ rcl_subscription_t sub_left_cmd;
 rcl_subscription_t sub_right_cmd;
 rcl_subscription_t sub_pulse_reset;
 rcl_publisher_t odom_publisher;
-rcl_publisher_t left_speed_publisher;
-rcl_publisher_t right_speed_publisher;
-rcl_publisher_t left_dac_publisher;
-rcl_publisher_t right_dac_publisher;
 rcl_publisher_t left_pulse_publisher;
 rcl_publisher_t right_pulse_publisher;
+rcl_publisher_t raw_distance_publisher;
+rcl_publisher_t imu_publisher;
 
 geometry_msgs__msg__Twist msg_twist;
 std_msgs__msg__Float32 msg_left_cmd;
 std_msgs__msg__Float32 msg_right_cmd;
 std_msgs__msg__Bool msg_pulse_reset;
 nav_msgs__msg__Odometry odom_msg;
-std_msgs__msg__Float32 left_speed_msg;
-std_msgs__msg__Float32 right_speed_msg;
-std_msgs__msg__Float32 left_dac_msg;
-std_msgs__msg__Float32 right_dac_msg;
 std_msgs__msg__Int32 left_pulse_msg;
 std_msgs__msg__Int32 right_pulse_msg;
+std_msgs__msg__Float32 raw_distance_msg;
+sensor_msgs__msg__Imu imu_msg;
+
+// Cumulative signed distance integrated straight from raw_speed_l/r (the
+// unfiltered, VELOCITY_WINDOW_MS-averaged encoder speed), NOT from
+// odom_speed_l/r. odom_speed_l/r goes through ODOM_FILTER_ALPHA (a heavy
+// 0.08 low-pass) before being published on wheel/odom and fused by the
+// EKF, which lags real distance during any speed transient (e.g. the
+// accel ramp at the start of a move) - see move_forward_node.py's
+// docstring for the overshoot this caused. This value skips that filter
+// entirely so callers who need close-to-real-time distance (like
+// move_forward_node.py) don't inherit that lag. Monotonically-signed
+// running total from boot, not reset between moves - callers diff against
+// their own captured start value.
+float raw_distance_traveled = 0.0f;
 
 rclc_executor_t executor;
 rclc_support_t support;
@@ -346,6 +646,18 @@ unsigned long last_ping_time = 0;
 // ============================================================
 unsigned long connected_at_ms = 0;
 bool time_resynced = false;
+
+// Periodic re-sync: the STM32 clock measured ~46 ms/min (~775 ppm) fast
+// against the Jetson, so odom/IMU header stamps drifted into the future
+// (2026-09-25 measurement, `now - stamp` -115 ms after 150 s) when synced
+// only at connect + 3 s. Re-syncing every TIME_SYNC_PERIOD_MS bounds the
+// error to ~4 ms. rmw_uros_sync_session() blocks the main loop (motor PID
+// keeps its last DAC output meanwhile), so it uses a SHORT timeout here:
+// a slow/absent agent must not stall control for the 1000 ms the
+// connect-time sync allows. A failed sync is simply retried next period.
+const unsigned long TIME_SYNC_PERIOD_MS  = 5000;
+const int           TIME_SYNC_TIMEOUT_MS = 100;
+unsigned long last_time_sync_ms = 0;
 
 // ============================================================
 // FUNCTION PROTOTYPES
@@ -373,6 +685,8 @@ float get_startup_right_correction();
 void motor_control_process();
 void update_and_publish_odom();
 void publish_pulse_counts();
+void publish_imu();
+int16_t median3(int16_t a, int16_t b, int16_t c);
 void L_HAL_ISR();
 void R_HAL_ISR();
 
@@ -479,12 +793,10 @@ bool create_entities()
 
   // PUBLISHERS
   if (rclc_publisher_init_default(&odom_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "wheel/odom") != RCL_RET_OK) return false;
-  if (rclc_publisher_init_default(&left_speed_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel/left/speed") != RCL_RET_OK) return false;
-  if (rclc_publisher_init_default(&right_speed_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel/right/speed") != RCL_RET_OK) return false;
-  if (rclc_publisher_init_default(&left_dac_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel/left/dac") != RCL_RET_OK) return false;
-  if (rclc_publisher_init_default(&right_dac_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel/right/dac") != RCL_RET_OK) return false;
   if (rclc_publisher_init_default(&left_pulse_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "wheel/left/pulse_count") != RCL_RET_OK) return false;
   if (rclc_publisher_init_default(&right_pulse_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "wheel/right/pulse_count") != RCL_RET_OK) return false;
+  if (rclc_publisher_init_default(&raw_distance_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel/raw_distance") != RCL_RET_OK) return false;
+  if (rclc_publisher_init_default(&imu_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu), "imu/data") != RCL_RET_OK) return false;
 
   // EXECUTOR
   if (rclc_executor_init(&executor, &support.context, 4, &allocator) != RCL_RET_OK) return false;
@@ -496,6 +808,42 @@ bool create_entities()
   // ODOM FRAME NAMES
   rosidl_runtime_c__String__assign(&odom_msg.header.frame_id, "odom");
   rosidl_runtime_c__String__assign(&odom_msg.child_frame_id, "base_link");
+
+  // IMU FRAME NAME + orientation covariance[0] = -1 means "orientation not
+  // computed" (REP 145) - accel/gyro readings themselves are real (see
+  // publish_imu()), only orientation (which this sensor can't produce
+  // without its own separate fusion) is left unset.
+  rosidl_runtime_c__String__assign(&imu_msg.header.frame_id, "imu_link");
+  imu_msg.orientation_covariance[0] = -1.0;
+
+  // angular_velocity_covariance / linear_acceleration_covariance default
+  // to all-zero (sensor_msgs__msg__Imu's generated struct zero-inits
+  // float arrays) if never set - and an all-zero covariance matrix is
+  // NOT "no noise", it's invalid input to ekf_node's Kalman gain
+  // computation (which divides by the measurement covariance). This was
+  // exactly what caused /odom to stop publishing entirely after imu0 was
+  // enabled in ekf.yaml: the singular covariance produced NaNs that
+  // propagated through the filter's state and then got silently dropped
+  // by tf2 (which refuses to broadcast a NaN transform), while
+  // ekf_filter_node itself kept running without crashing - "ros2 node
+  // list" still showed it alive even though it had stopped producing
+  // any output.
+  //
+  // Diagonal-only (3x3 row-major, so indices 0/4/8), off-diagonal terms
+  // left at 0 (no known cross-axis correlation). Values are order-of-
+  // magnitude estimates, not measured: gyro variance is low since it's
+  // bias-calibrated + DLPF-filtered + median-of-3 filtered (see
+  // publish_imu()); accel variance is higher since it's only bias-
+  // calibrated (not full 6-point scale/cross-axis calibrated) - matches
+  // why ekf.yaml's imu0_config doesn't fuse accel at all, this value is
+  // just here so the field isn't a singular matrix for anything that
+  // reads it.
+  imu_msg.angular_velocity_covariance[0] = 0.001;  // x
+  imu_msg.angular_velocity_covariance[4] = 0.001;  // y
+  imu_msg.angular_velocity_covariance[8] = 0.001;  // z - the one ekf.yaml actually fuses
+  imu_msg.linear_acceleration_covariance[0] = 0.05;  // x
+  imu_msg.linear_acceleration_covariance[4] = 0.05;  // y
+  imu_msg.linear_acceleration_covariance[8] = 0.05;  // z
 
   reset_speed_controller();
   last_control_time = millis();
@@ -512,14 +860,13 @@ void destroy_entities()
 
   rosidl_runtime_c__String__fini(&odom_msg.header.frame_id);
   rosidl_runtime_c__String__fini(&odom_msg.child_frame_id);
+  rosidl_runtime_c__String__fini(&imu_msg.header.frame_id);
 
   (void) rcl_publisher_fini(&odom_publisher, &node);
-  (void) rcl_publisher_fini(&left_speed_publisher, &node);
-  (void) rcl_publisher_fini(&right_speed_publisher, &node);
-  (void) rcl_publisher_fini(&left_dac_publisher, &node);
-  (void) rcl_publisher_fini(&right_dac_publisher, &node);
   (void) rcl_publisher_fini(&left_pulse_publisher, &node);
   (void) rcl_publisher_fini(&right_pulse_publisher, &node);
+  (void) rcl_publisher_fini(&raw_distance_publisher, &node);
+  (void) rcl_publisher_fini(&imu_publisher, &node);
 
   (void) rcl_subscription_fini(&subscriber, &node);
   (void) rcl_subscription_fini(&sub_left_cmd, &node);
@@ -543,7 +890,6 @@ void reset_speed_controller()
   integral_l = 0.0f; integral_r = 0.0f;
   desired_dac_l = 0.0f; desired_dac_r = 0.0f;
   dac_output_l = 0; dac_output_r = 0;
-  left_dac_msg.data = 0.0f; right_dac_msg.data = 0.0f;
   current_target_l = 0.0f; current_target_r = 0.0f;
 
   startup_speed_diff = 0.0f;
@@ -650,8 +996,8 @@ void update_velocity_estimator(long count_l, long count_r, unsigned long now)
     long delta_pulse_l = velocity_pulse_l - pulse_history_l[oldest_index];
     long delta_pulse_r = velocity_pulse_r - pulse_history_r[oldest_index];
 
-    float distance_l = ((float)delta_pulse_l / ENCODER_PPR) * wheel_circumference;
-    float distance_r = ((float)delta_pulse_r / ENCODER_PPR) * wheel_circumference;
+    float distance_l = ((float)delta_pulse_l / ENCODER_PPR) * wheel_circumference_l;
+    float distance_r = ((float)delta_pulse_r / ENCODER_PPR) * wheel_circumference_r;
 
     float dt = elapsed_ms / 1000.0f;
     if (dt > 0.0f)
@@ -921,6 +1267,11 @@ int apply_dac_slew(float desired, int current, float max_step)
 // ============================================================
 void motor_control_process()
 {
+  // RUN/EN: LOW = run, HIGH = stop/disable driver.
+  // ตัด RUN/EN เมื่อ DAC ของล้อนั้น slew ลงถึง 0 แล้วเท่านั้น (รอเบรกจบก่อน ไม่ตัดกะทันหันตาม cmd_vel)
+  digitalWrite(L_RUN_PIN, (dac_output_l == 0) ? HIGH : LOW);
+  digitalWrite(R_RUN_PIN, (dac_output_r == 0) ? HIGH : LOW);
+
   digitalWrite(L_FR_PIN, (current_target_l >= 0.0f) ? HIGH : LOW);
   digitalWrite(R_FR_PIN, (current_target_r >= 0.0f) ? LOW : HIGH);
   analogWrite(L_SP_PIN, dac_output_l);
@@ -954,10 +1305,15 @@ void update_and_publish_odom()
   update_left_launch();
   update_right_launch();
 
+  robot_stationary = false;
   if (fabs(target_speed_l) < STOP_TARGET_THRESHOLD && fabs(target_speed_r) < STOP_TARGET_THRESHOLD)
   {
     if (fabs(raw_speed_l) < STOP_SPEED_THRESHOLD) odom_speed_l = 0.0f;
     if (fabs(raw_speed_r) < STOP_SPEED_THRESHOLD) odom_speed_r = 0.0f;
+    // Also true stationary for ZUPT gyro bias tracking - see its
+    // declaration comment - same commanded+measured check as above.
+    if (fabs(raw_speed_l) < STOP_SPEED_THRESHOLD && fabs(raw_speed_r) < STOP_SPEED_THRESHOLD)
+      robot_stationary = true;
   }
 
   desired_dac_l = compute_left_dac(current_target_l, control_speed_l, dt);
@@ -977,23 +1333,50 @@ void update_and_publish_odom()
                      (right_launch_active) ? RIGHT_LAUNCH_DAC_STEP : slew_r;
   dac_output_r = apply_dac_slew(desired_dac_r, dac_output_r, dac_step_r);
 
-  // PUBLISH SPEED
-  left_speed_msg.data = odom_speed_l;
-  rcl_publish(&left_speed_publisher, &left_speed_msg, NULL);
-  right_speed_msg.data = odom_speed_r;
-  rcl_publish(&right_speed_publisher, &right_speed_msg, NULL);
+  // RAW (UNFILTERED-BY-ODOM_FILTER_ALPHA) DISTANCE
+  // Same integration as the odometry below, but from raw_speed_l/r instead
+  // of odom_speed_l/r - see raw_distance_traveled's declaration comment.
+  float v_raw = (raw_speed_r + raw_speed_l) / 2.0f;
+  raw_distance_traveled += v_raw * dt;
+  raw_distance_msg.data = raw_distance_traveled;
+  rcl_publish(&raw_distance_publisher, &raw_distance_msg, NULL);
 
-  // PUBLISH DAC
-  left_dac_msg.data = (float)dac_output_l;
-  rcl_publish(&left_dac_publisher, &left_dac_msg, NULL);
-  right_dac_msg.data = (float)dac_output_r;
-  rcl_publish(&right_dac_publisher, &right_dac_msg, NULL);
+  // RAW (UNFILTERED-BY-ODOM_FILTER_ALPHA) YAW RATE - same rationale as
+  // v_raw/raw_distance_traveled above. ODOM_FILTER_ALPHA=0.08 at
+  // CONTROL_PERIOD_MS=50ms gives a ~625ms EMA time constant, which made
+  // pose_theta (and the /wheel/odom vyaw the EKF fuses) lag real heading
+  // changes by up to ~1-2s - the robot visibly finished turning well
+  // before its map icon caught up. w_raw drives pose integration and the
+  // published twist instead of the heavily-filtered w below.
+  float w_raw = (raw_speed_r - raw_speed_l) / wheel_sep;
 
   // ODOMETRY CALCULATION
   float v = (odom_speed_r + odom_speed_l) / 2.0f;
   float w = (odom_speed_r - odom_speed_l) / wheel_sep;
+
+  // WHEEL SLIP DETECTION - see its declaration comment for why this
+  // compares against the gyro instead of trusting encoders alone.
+  if (gyro_yaw_rate_valid)
+  {
+    if (fabs(w - latest_gyro_yaw_rate_rad_s) > SLIP_YAW_RATE_THRESHOLD_RAD_S)
+    {
+      if (!slip_mismatch_active) { slip_mismatch_active = true; slip_mismatch_start = now; }
+      else if (now - slip_mismatch_start > SLIP_DEBOUNCE_MS) wheel_slip_detected = true;
+    }
+    else
+    {
+      slip_mismatch_active = false;
+      wheel_slip_detected = false;
+    }
+  }
+  else
+  {
+    slip_mismatch_active = false;
+    wheel_slip_detected = false;
+  }
+
   float delta_s = v * dt;
-  float delta_theta = w * dt;
+  float delta_theta = w_raw * dt;
 
   pose_x += delta_s * cos(pose_theta + delta_theta / 2.0f);
   pose_y += delta_s * sin(pose_theta + delta_theta / 2.0f);
@@ -1020,7 +1403,7 @@ void update_and_publish_odom()
 
   // VELOCITY
   odom_msg.twist.twist.linear.x = v;
-  odom_msg.twist.twist.angular.z = w;
+  odom_msg.twist.twist.angular.z = w_raw;
 
   rcl_publish(&odom_publisher, &odom_msg, NULL);
 }
@@ -1043,6 +1426,151 @@ void publish_pulse_counts()
   right_pulse_msg.data = (int32_t)r;
   rcl_publish(&right_pulse_publisher, &right_pulse_msg, NULL);
   last_pulse_pub_time = now;
+}
+
+// Returns the median of 3 values - used by publish_imu() to reject a
+// single bit-bang I2C read glitched by encoder-ISR timing jitter (see
+// that function's comment) without needing to track any state between
+// calls.
+int16_t median3(int16_t a, int16_t b, int16_t c)
+{
+  if (a > b) { int16_t t = a; a = b; b = t; }
+  if (b > c) { int16_t t = b; b = c; c = t; }
+  if (a > b) { int16_t t = a; a = b; b = t; }
+  return b;
+}
+
+// ============================================================
+// PUBLISH IMU
+//
+// Rate-limited to 20Hz like publish_pulse_counts() above, on a hand-
+// rolled bit-banged I2C bus (PB7/PC13 - see the IMU_SDA_PIN/IMU_SCL_PIN
+// comment above) - bit-banging is slower and
+// burns more CPU per byte than hardware I2C (and this reads 3x per
+// publish for the median filter below), so keeping this at 20Hz instead
+// of polling every loop() iteration matters more here than it would with
+// a real I2C peripheral, to avoid adding jitter to the PID/encoder timing.
+//
+// orientation_covariance[0] stays at -1 (REP 145: "orientation not
+// computed") because the MPU6050/MPU6500 has no onboard sensor fusion -
+// only raw accel/gyro are filled in below. ekf_node fuses those directly.
+// If mpu6050_init() failed at setup() (sensor not wired/detected), this
+// leaves linear_acceleration/angular_velocity at their last (zero-
+// initialized) values rather than publishing stale/garbage reads.
+// ============================================================
+void publish_imu()
+{
+  unsigned long now = millis();
+  if (now - last_imu_pub_time < 50) return;
+  last_imu_pub_time = now;
+
+  int64_t time_ms = rmw_uros_epoch_millis();
+  imu_msg.header.stamp.sec = time_ms / 1000;
+  imu_msg.header.stamp.nanosec = (time_ms % 1000) * 1000000;
+
+  if (mpu_ok)
+  {
+    // Sanity-check + median-of-3 against bit-bang I2C glitches: an
+    // encoder ISR (L_HAL_ISR/R_HAL_ISR) firing mid-transaction can skew
+    // this driver's microsecond-level bit timing and corrupt a byte
+    // without failing the ACK check. This showed up as brief nonsense
+    // spikes (angular_velocity.y ~9.6 rad/s, then x ~-6.6, then x ~-5.3
+    // while stationary) - and that last one nearly slipped past a single
+    // absolute-threshold check (20000 raw / ~305deg/s), because a single
+    // bit flipping near the middle of a 16-bit reading lands the
+    // corrupted value in a fairly consistent, not-always-extreme range -
+    // an absolute cutoff alone isn't reliable against that.
+    //
+    // Reading 3 times in a row (~1ms apart, well within the 50ms publish
+    // period) and taking the per-axis median instead is far more robust:
+    // a stuck-timing glitch on any ONE of the 3 reads gets outvoted by
+    // the other 2 good ones, whereas the same bit corrupting in exactly
+    // the same way on 2+ of 3 back-to-back reads is effectively
+    // impossible for a timing-jitter-driven fault like this.
+    //
+    // Rather than disabling interrupts around the I2C transfer (which
+    // would risk dropping encoder pulses and hurt PID accuracy - not
+    // worth it here), a still-implausible median (e.g. bus genuinely
+    // disconnected) falls back to republishing the last good imu_msg
+    // values instead (with a fresh timestamp).
+    int16_t ax3[3], ay3[3], az3[3], gx3[3], gy3[3], gz3[3];
+    uint8_t got = 0;
+    for (uint8_t i = 0; i < 3; i++)
+    {
+      uint8_t raw[14];
+      if (!mpu6050_read_regs(MPU6050_REG_ACCEL_XOUT_H, raw, 14)) continue;
+      ax3[got] = (raw[0] << 8) | raw[1];
+      ay3[got] = (raw[2] << 8) | raw[3];
+      az3[got] = (raw[4] << 8) | raw[5];
+      // raw[6..7] = temperature, unused here
+      gx3[got] = (raw[8] << 8) | raw[9];
+      gy3[got] = (raw[10] << 8) | raw[11];
+      gz3[got] = (raw[12] << 8) | raw[13];
+      got++;
+    }
+
+    if (got == 3)
+    {
+      int16_t ax = median3(ax3[0], ax3[1], ax3[2]);
+      int16_t ay = median3(ay3[0], ay3[1], ay3[2]);
+      int16_t az = median3(az3[0], az3[1], az3[2]);
+      int16_t gx = median3(gx3[0], gx3[1], gx3[2]);
+      int16_t gy = median3(gy3[0], gy3[1], gy3[2]);
+      int16_t gz = median3(gz3[0], gz3[1], gz3[2]);
+
+      const int16_t GYRO_RAW_SANITY_MAX = 20000;   // ~305 deg/s - normal operation shouldn't approach this
+      const int16_t ACCEL_RAW_SANITY_MAX = 30000;  // ~7.3g - normal operation/vibration shouldn't approach this
+      bool sane =
+          abs(ax) < ACCEL_RAW_SANITY_MAX && abs(ay) < ACCEL_RAW_SANITY_MAX && abs(az) < ACCEL_RAW_SANITY_MAX &&
+          abs(gx) < GYRO_RAW_SANITY_MAX  && abs(gy) < GYRO_RAW_SANITY_MAX  && abs(gz) < GYRO_RAW_SANITY_MAX;
+
+      if (!sane)
+      {
+        rcl_publish(&imu_publisher, &imu_msg, NULL);
+        return;
+      }
+
+      // ZUPT: slowly track thermal drift while genuinely stationary -
+      // see robot_stationary's declaration comment. Uses the clean
+      // (sanity-checked, median-of-3) raw counts above, not raw byte
+      // reads, so a glitched sample can't corrupt the bias estimate.
+      if (robot_stationary)
+      {
+        gyro_bias_x += ZUPT_ALPHA * (gx - gyro_bias_x);
+        gyro_bias_y += ZUPT_ALPHA * (gy - gyro_bias_y);
+        gyro_bias_z += ZUPT_ALPHA * (gz - gyro_bias_z);
+      }
+
+      const float IMU_G_TO_MS2 = 9.80665f;
+      const float IMU_DEG_TO_RAD = PI / 180.0f;
+
+      // Subtract the boot-time offsets (calibrate_imu_bias()) before
+      // converting to physical units - see that function's comment for
+      // why accel's z-axis bias is relative to +1g rather than 0.
+      //
+      // x/y are then negated: the board is physically mounted rotated
+      // 180deg about z relative to the robot's forward axis, so the raw
+      // sensor's +x/+y point the opposite way from base_link's +x/+y.
+      // z is unaffected by a rotation about the z axis itself. Since this
+      // correction is applied here, imu_link's <origin rpy=".."> in the
+      // URDF must stay "0 0 0" - don't also rotate it there, or the flip
+      // gets applied twice and cancels out.
+      imu_msg.linear_acceleration.x = -(((ax - accel_bias_x) / MPU6050_ACCEL_LSB_PER_G) * IMU_G_TO_MS2);
+      imu_msg.linear_acceleration.y = -(((ay - accel_bias_y) / MPU6050_ACCEL_LSB_PER_G) * IMU_G_TO_MS2);
+      imu_msg.linear_acceleration.z = ((az - accel_bias_z) / MPU6050_ACCEL_LSB_PER_G) * IMU_G_TO_MS2;
+      imu_msg.angular_velocity.x = -(((gx - gyro_bias_x) / MPU6050_GYRO_LSB_PER_DPS) * IMU_DEG_TO_RAD);
+      imu_msg.angular_velocity.y = -(((gy - gyro_bias_y) / MPU6050_GYRO_LSB_PER_DPS) * IMU_DEG_TO_RAD);
+      imu_msg.angular_velocity.z = ((gz - gyro_bias_z) / MPU6050_GYRO_LSB_PER_DPS) * IMU_DEG_TO_RAD;
+
+      // For wheel-slip detection (see its declaration comment) -
+      // update_and_publish_odom() reads this to compare against its own
+      // encoder-derived yaw rate.
+      latest_gyro_yaw_rate_rad_s = imu_msg.angular_velocity.z;
+      gyro_yaw_rate_valid = true;
+    }
+  }
+
+  rcl_publish(&imu_publisher, &imu_msg, NULL);
 }
 
 // ============================================================
@@ -1068,6 +1596,9 @@ void setup()
 
   Serial.begin(115200);
   set_microros_serial_transports(Serial);
+
+  mpu_ok = mpu6050_init();
+  if (mpu_ok) calibrate_imu_bias(300);  // ~1s @ 3ms/sample - robot must be still AND level
 
   state = WAITING_AGENT;
   last_control_time = millis();
@@ -1115,11 +1646,19 @@ void loop()
       {
         rmw_uros_sync_session(1000);
         time_resynced = true;
+        last_time_sync_ms = millis();
+      }
+      // Periodic re-sync every TIME_SYNC_PERIOD_MS (clock drift, see above)
+      else if (time_resynced && (millis() - last_time_sync_ms) >= TIME_SYNC_PERIOD_MS)
+      {
+        (void) rmw_uros_sync_session(TIME_SYNC_TIMEOUT_MS);
+        last_time_sync_ms = millis();
       }
 
       rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1));
       update_and_publish_odom();
       publish_pulse_counts();
+      publish_imu();
       break;
 
     case AGENT_DISCONNECTED:
