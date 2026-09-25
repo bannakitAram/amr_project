@@ -18,7 +18,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
 
@@ -41,11 +41,15 @@ def generate_launch_description():
 
     declare_use_sim_time = DeclareLaunchArgument('use_sim_time', default_value='false')
     declare_use_rviz = DeclareLaunchArgument(
-        'rviz', default_value='true',
-        description='Launch RViz2 (set false on headless Jetson over SSH)')
+        'rviz', default_value='false',
+        description='Launch RViz2 (normal monitoring is via rosboard instead; '
+                     'set true only when debugging with RViz2 directly)')
     declare_use_foxglove = DeclareLaunchArgument(
         'foxglove', default_value='true',
-        description='Launch foxglove_bridge so Foxglove Studio can visualize/teleop the AMR')
+        description='Launch foxglove_bridge (feeds Lichtblick/Foxglove Studio). Only '
+                     'actually starts while slam:=true (mapping) - the Lichtblick/mobile '
+                     'monitor QR is a mapping-time tool, not needed during navigation. '
+                     'Has no effect when slam:=false.')
     declare_foxglove_port = DeclareLaunchArgument(
         'foxglove_port', default_value='8765',
         description='TCP port for the Foxglove WebSocket server')
@@ -167,7 +171,10 @@ def generate_launch_description():
         actions=[rviz_node]
     )
 
-    # 7) foxglove_bridge (visualize/teleop the AMR remotely from Foxglove Studio)
+    # 7) foxglove_bridge (feeds Lichtblick/Foxglove Studio) - mapping-time only.
+    #    Gated on slam too so it never runs during navigation (where nobody
+    #    connects Lichtblick, and it would just burn CPU the Jetson doesn't
+    #    have to spare during localization).
     foxglove_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_bringup, 'launch', 'foxglove_bridge.launch.py')),
@@ -175,7 +182,9 @@ def generate_launch_description():
             'port': foxglove_port,
             'use_sim_time': use_sim_time,
         }.items(),
-        condition=IfCondition(use_foxglove),
+        condition=IfCondition(PythonExpression(
+            ["'", use_foxglove, "' == 'true' and '", use_slam, "' == 'true'"]
+        )),
     )
 
     # 8) YDLIDAR HP60C depth camera (ascamera) + TF bridge into the URDF tree

@@ -71,7 +71,7 @@
 <joint name="joint_lidar" type="fixed">
     <parent link="base_link"/>
     <child link="lidar_link"/>
-    <origin xyz="${lidar_x} 0 ${lidar_z}" rpy="0 0 0"/>
+    <origin xyz="${lidar_x} 0 ${lidar_z}" rpy="0 0 ${pi}"/>
 </joint>
 
 <!--Camera link-->
@@ -98,6 +98,23 @@
     <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}"/>
 </joint>
 <link name="camera_optical_frame"/>
+
+<!--IMU link (MPU6500 on the STM32 motor controller board) - placed at the
+midpoint between the two drive wheels: x matches the drive wheels' own
+x-offset (0.008, see joint_${prefix}_drive_wheel below) and y=0 since
+the wheels sit at +-wheel_separation/2, symmetric about the centerline.
+z=0 (same height as base_link's own origin, i.e. the drive wheel axle
+height) is a reasonable default in the absence of a measured mounting
+height - height barely affects yaw-rate fusion (see the mounting-height
+discussion this was set from) so this doesn't need to be exact, but
+rpy DOES matter if the board is mounted rotated - update it once known,
+otherwise IMU axes won't line up with the robot body's axes.-->
+<joint name="joint_imu" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="0.008 0 0" rpy="0 0 0"/>
+</joint>
+<link name="imu_link"/>
 
 <!--Drive wheel-->
 <xacro:macro name="drive_wheel" params="prefix reflect">

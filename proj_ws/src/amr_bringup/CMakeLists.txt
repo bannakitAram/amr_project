@@ -12,6 +12,13 @@ install(DIRECTORY
 install(PROGRAMS
   scripts/wheel_joint_state_publisher.py
   scripts/amr_control_panel.py
+  scripts/move_forward_node.py
+  scripts/square_path_node.py
+  scripts/circle_path_node.py
+  scripts/calib_rotate_node.py
+  scripts/calib_straight_node.py
+  scripts/amr_calib_panel.py
+  scripts/calc_wheel_radius.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

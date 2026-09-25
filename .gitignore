@@ -17,3 +17,9 @@ proj_ws/src/micro_ros_setup/
 # Python cache
 __pycache__/
 *.pyc
+
+# External repo with its own .git (rosboard)
+proj_ws/src/rosboard/
+
+# LibreOffice lock files
+.~lock.*

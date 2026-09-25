@@ -22,12 +22,75 @@ from PIL import ImageTk
 
 from ament_index_python.packages import get_package_share_directory
 
+import amr_calib_panel
+
 MAPS_DIR = os.path.join(
     get_package_share_directory('amr_navigation'), '..', '..', '..', '..',
     'src', 'amr_navigation', 'maps')
 MAPS_DIR = os.path.normpath(MAPS_DIR)
 
 ROSBOARD_PORT = 8888
+
+# "Move forward" straight-line command (Control panel button, not the
+# rosboard joystick). Closed-loop on /odometry/filtered, not open-loop
+# timing, so it isn't thrown off by wheel slip/PID variance. Speed matches
+# the rosboard joystick's walking-pace cap (see joystick.js) for consistency.
+MOVE_FORWARD_SPEED_DEFAULT = 0.15  # m/s - matches the rosboard joystick's walking-pace cap
+MOVE_FORWARD_SPEED_MIN = 0.05     # m/s - stepper floor
+MOVE_FORWARD_SPEED_MAX = 0.40     # m/s - diagnostic ceiling; ISO 3691-4 review this before raising
+MOVE_FORWARD_SPEED_STEP = 0.05    # m/s - +/- button increment
+MOVE_FORWARD_STEP_M = 0.5        # m - +/- button increment
+MOVE_FORWARD_MIN_M = MOVE_FORWARD_STEP_M  # m - stepper floor (one step)
+MOVE_FORWARD_MAX_M = 5.0         # m - hard UI cap; raised from 3.0 - review path length vs. sensor range/stopping distance under ISO 3691-4 before raising further
+MOVE_FORWARD_TIMEOUT_FACTOR = 3.0  # abort if it takes > (distance/speed)*this - odom stall/stuck robot
+
+# "Square path" command: 4x {straight leg, 90 degree CCW turn}, closed-loop
+# the same way as "Move forward" (see square_path_node.py's module
+# docstring). Side length capped lower than a single straight move's cap -
+# it is 4 legs run back-to-back with no operator confirmation in between,
+# so review ISO 3691-4 stopping-distance/path-length implications before
+# raising it.
+SQUARE_SIDE_DEFAULT = 1.0  # m
+SQUARE_SIDE_MIN = 0.5      # m - stepper floor
+SQUARE_SIDE_MAX = 2.0      # m - hard UI cap per side (4 sides = 8m path)
+SQUARE_SIDE_STEP = 0.5     # m - +/- button increment
+SQUARE_TURN_SPEED = 0.3    # rad/s - matches square_path_node.py's default turn rate
+
+# "Circle path" command: constant-curvature arc, closed-loop on
+# /odometry/filtered yaw (see circle_path_node.py's module docstring).
+# Angular speed is fixed (not operator-adjustable) per spec - radius is the
+# only speed-affecting control, so its UI cap is chosen to keep
+# linear.x = CIRCLE_ANGULAR_SPEED * radius under MOVE_FORWARD_SPEED_MAX.
+CIRCLE_ANGULAR_SPEED = 0.2   # rad/s - fixed
+CIRCLE_RADIUS_DEFAULT = 0.8  # m
+CIRCLE_RADIUS_MIN = 0.3      # m - stepper floor
+CIRCLE_RADIUS_MAX = 1.5      # m - hard UI cap; 1.5*0.2=0.30 m/s, under MOVE_FORWARD_SPEED_MAX (0.40 m/s)
+CIRCLE_RADIUS_STEP = 0.1     # m - +/- button increment
+CIRCLE_ANGLE_DEFAULT = 360   # deg - full circle
+CIRCLE_ANGLE_MIN = 45        # deg - stepper floor
+CIRCLE_ANGLE_MAX = 360       # deg - hard UI cap per run (one full circle)
+CIRCLE_ANGLE_STEP = 45       # deg - +/- button increment
+
+# foxglove_bridge WebSocket port (see amr_bringup bringup.launch.py's
+# 'foxglove_port' launch arg, default 8765) and the static file server that
+# hosts the self-built Lichtblick web bundle (built once from
+# lichtblick-suite/lichtblick's `web:build:prod`; see AMR_Project docs) so
+# phones on the same LAN can open a full Foxglove-style map view with no
+# internet access required.
+FOXGLOVE_WS_PORT = 8765
+LICHTBLICK_PORT = 8098
+LICHTBLICK_DIST_DIR = '/home/nvidia/lichtblick_web/dist'
+
+# Combined mobile page: Lichtblick's map view on top + rosboard's existing,
+# already touch-safe virtual joystick (Pointer Events, deadman-switch,
+# ISO 3691-4 speed clamp - see rosboard/html/js/joystick.js) cropped in at
+# the bottom. Lichtblick's own stock Teleop panel is NOT used for driving -
+# it only handles mouse events (mousedown/mouseup/mouseleave), which mobile
+# browsers do not reliably fire for a press-and-hold drag, so a released
+# finger could fail to send the stop command until the STM32's 1s cmd_vel
+# timeout kicks in. rosboard's joystick has no such gap.
+MOBILE_PORT = 8099
+MOBILE_DIST_DIR = '/home/nvidia/lichtblick_web/mobile'
 
 # Topics auto-subscribed on the rosboard page so the operator's phone shows
 # the right panels the moment the QR code is scanned - no manual picking.
@@ -49,6 +112,29 @@ def build_rosboard_url(ip, topics):
         f'{quote(name.replace("/", chr(92)))}={quote(msg_type.replace("/", chr(92)))}'
         for name, msg_type in topics.items())
     return f'{base}?{params}'
+
+
+def build_lichtblick_url(ip):
+    # ds=foxglove-websocket + ds.url auto-opens the connection on load, so
+    # scanning the QR code lands straight on the live map - no manual
+    # "Open connection" step needed on the phone.
+    return (f'http://{ip}:{LICHTBLICK_PORT}/'
+            f'?ds=foxglove-websocket&ds.url=ws://{ip}:{FOXGLOVE_WS_PORT}')
+
+
+def build_mobile_url(ip):
+    # The mobile wrapper page reads window.location.hostname itself to
+    # build its Lichtblick/rosboard iframe URLs, so it needs no query
+    # params - it works the same regardless of which IP the phone used.
+    return f'http://{ip}:{MOBILE_PORT}/'
+
+
+def build_goal_picker_url(ip):
+    # Served by rosboard itself (html/goal_picker/, same origin as its
+    # websocket at /rosboard/v1) rather than a separate static server/port -
+    # see goal_picker/index.html's module docstring for why that matters
+    # (same-origin websockets, no CORS/check_origin complications).
+    return f'http://{ip}:{ROSBOARD_PORT}/goal_picker/'
 
 BG = '#f4f6f8'
 CARD_BG = '#ffffff'
@@ -105,14 +191,29 @@ class AmrControlPanel(tk.Tk):
         super().__init__()
         self.title('AMR Control')
         self.configure(bg=BG)
-        self.geometry('620x480')
-        self.minsize(560, 440)
+        # Fixed to the AMR's onboard touchscreen resolution (1024x600) - not
+        # resizable, since this runs full-screen/kiosk-style on that panel
+        # with no window manager to drag/resize it against.
+        self.geometry('1024x600')
+        self.minsize(1024, 600)
+        self.resizable(False, False)
 
         self._proc = None
         self._mode = None  # 'mapping' | 'navigation'
         self._status_poll_job = None
         self._rosboard_proc = None
-        self._qr_photo = None  # keep a reference so Tk doesn't GC the image
+        self._lichtblick_proc = None
+        self._mobile_proc = None
+        self._qr_photos = []  # keep references so Tk doesn't GC the images
+
+        # "Move forward" runs as its own OS process (move_forward_node.py),
+        # not a thread here, so it never shares the Tkinter mainloop's GIL -
+        # see move_forward_node.py's module docstring for why that matters.
+        self._move_proc = None
+        self._move_poll_job = None
+        self._move_kind = None  # 'forward' | 'square' | 'circle' - which button started _move_proc
+
+        self._calib_panel = None  # open amr_calib_panel.CalibPanel Toplevel, if any
 
         self._build_fonts()
         self._build_ui()
@@ -128,14 +229,14 @@ class AmrControlPanel(tk.Tk):
 
     def _build_ui(self):
         header = tk.Frame(self, bg=BG)
-        header.pack(fill='x', padx=28, pady=(24, 8))
+        header.pack(fill='x', padx=28, pady=(16, 6))
         tk.Label(header, text='AMR Control', font=self.f_title,
                  bg=BG, fg=TEXT_MAIN).pack(anchor='w')
         tk.Label(header, text='เลือกโหมดการทำงาน', font=self.f_small,
                  bg=BG, fg=TEXT_MUTED).pack(anchor='w')
 
         cards = tk.Frame(self, bg=BG)
-        cards.pack(fill='x', padx=28, pady=8)
+        cards.pack(fill='x', padx=28, pady=6)
         cards.columnconfigure(0, weight=1)
         cards.columnconfigure(1, weight=1)
 
@@ -152,9 +253,9 @@ class AmrControlPanel(tk.Tk):
         # Status card
         status_card = tk.Frame(self, bg=CARD_BG, highlightthickness=1,
                                 highlightbackground='#e0e0e0')
-        status_card.pack(fill='x', padx=28, pady=16)
+        status_card.pack(fill='x', padx=28, pady=10)
         inner = tk.Frame(status_card, bg=CARD_BG)
-        inner.pack(fill='x', padx=18, pady=14)
+        inner.pack(fill='x', padx=18, pady=10)
 
         dot_row = tk.Frame(inner, bg=CARD_BG)
         dot_row.pack(fill='x')
@@ -168,12 +269,12 @@ class AmrControlPanel(tk.Tk):
 
         self.detail_label = tk.Label(inner, text='', font=self.f_small,
                                       bg=CARD_BG, fg=TEXT_MUTED, anchor='w',
-                                      justify='left', wraplength=520)
+                                      justify='left', wraplength=930)
         self.detail_label.pack(fill='x', pady=(6, 0))
 
         # Action row (Save map / Stop)
         actions = tk.Frame(self, bg=BG)
-        actions.pack(fill='x', padx=28, pady=(0, 24))
+        actions.pack(fill='x', padx=28, pady=(0, 14))
 
         self.btn_save_map = tk.Button(
             actions, text='บันทึกแผนที่ (Save Map)', font=self.f_button_sub,
@@ -188,6 +289,225 @@ class AmrControlPanel(tk.Tk):
             relief='solid', bd=1, padx=20, pady=10, cursor='hand2',
             command=self._on_stop, state='disabled')
         self.btn_stop.pack(side='right')
+
+        # Motion-preset card: "Move forward" / "Square path" / "Circle path",
+        # each closed-loop on odom (see their respective *_node.py module
+        # docstrings). Shown as ttk.Notebook tabs, one preset's controls
+        # visible at a time - the control panel's window is fixed to the
+        # onboard touchscreen's 1024x600 resolution and does not fit all
+        # three presets' rows stacked at once (measured ~751px required vs.
+        # 600px available before this was tabbed - the third preset's row
+        # was silently clipped below the visible window).
+        move_card = tk.Frame(self, bg=CARD_BG, highlightthickness=1,
+                              highlightbackground='#e0e0e0')
+        move_card.pack(fill='x', padx=28, pady=(0, 14))
+        move_inner = tk.Frame(move_card, bg=CARD_BG)
+        move_inner.pack(fill='x', padx=18, pady=10)
+
+        style = ttk.Style(self)
+        style.configure('Motion.TNotebook.Tab', font=self.f_status, padding=(12, 6))
+
+        motion_tabs = ttk.Notebook(move_inner, style='Motion.TNotebook')
+        motion_tabs.pack(fill='x')
+
+        tab_forward = tk.Frame(motion_tabs, bg=CARD_BG)
+        motion_tabs.add(tab_forward, text='เดินหน้าตรง')
+        tab_square = tk.Frame(motion_tabs, bg=CARD_BG)
+        motion_tabs.add(tab_square, text='สี่เหลี่ยม')
+        tab_circle = tk.Frame(motion_tabs, bg=CARD_BG)
+        motion_tabs.add(tab_circle, text='วงกลม')
+
+        move_row = tk.Frame(tab_forward, bg=CARD_BG)
+        move_row.pack(fill='x', pady=(8, 0))
+
+        self._move_distance = 1.0
+        self.btn_move_minus = tk.Button(
+            move_row, text='-', font=self.f_button_sub,
+            bg='#ffffff', fg=TEXT_MAIN, relief='solid', bd=1,
+            width=2, cursor='hand2', state='disabled',
+            command=lambda: self._adjust_move_distance(-MOVE_FORWARD_STEP_M))
+        self.btn_move_minus.pack(side='left')
+
+        self.move_distance_label = tk.Label(
+            move_row, text='1.0 ม.', font=self.f_status,
+            bg=CARD_BG, fg=TEXT_MAIN, width=8, anchor='center')
+        self.move_distance_label.pack(side='left', padx=6)
+
+        self.btn_move_plus = tk.Button(
+            move_row, text='+', font=self.f_button_sub,
+            bg='#ffffff', fg=TEXT_MAIN, relief='solid', bd=1,
+            width=2, cursor='hand2', state='disabled',
+            command=lambda: self._adjust_move_distance(MOVE_FORWARD_STEP_M))
+        self.btn_move_plus.pack(side='left', padx=(0, 16))
+
+        self.btn_move_forward = tk.Button(
+            move_row, text='เดินหน้า (Move Forward)', font=self.f_button_sub,
+            bg='#ffffff', fg=NAV_ACCENT_DARK, activebackground='#e3f2fd',
+            relief='solid', bd=1, padx=14, pady=8, cursor='hand2',
+            command=self._on_click_move_forward, state='disabled')
+        self.btn_move_forward.pack(side='left')
+
+        speed_row = tk.Frame(tab_forward, bg=CARD_BG)
+        speed_row.pack(fill='x', pady=(8, 0))
+
+        tk.Label(speed_row, text='ความเร็ว:', font=self.f_status,
+                 bg=CARD_BG, fg=TEXT_MAIN).pack(side='left', padx=(0, 6))
+
+        self._move_speed = MOVE_FORWARD_SPEED_DEFAULT
+        self.btn_speed_minus = tk.Button(
+            speed_row, text='-', font=self.f_button_sub,
+            bg='#ffffff', fg=TEXT_MAIN, relief='solid', bd=1,
+            width=2, cursor='hand2', state='disabled',
+            command=lambda: self._adjust_move_speed(-MOVE_FORWARD_SPEED_STEP))
+        self.btn_speed_minus.pack(side='left')
+
+        self.move_speed_label = tk.Label(
+            speed_row, text=f'{MOVE_FORWARD_SPEED_DEFAULT:.2f} m/s',
+            font=self.f_status, bg=CARD_BG, fg=TEXT_MAIN, width=8, anchor='center')
+        self.move_speed_label.pack(side='left', padx=6)
+
+        self.btn_speed_plus = tk.Button(
+            speed_row, text='+', font=self.f_button_sub,
+            bg='#ffffff', fg=TEXT_MAIN, relief='solid', bd=1,
+            width=2, cursor='hand2', state='disabled',
+            command=lambda: self._adjust_move_speed(MOVE_FORWARD_SPEED_STEP))
+        self.btn_speed_plus.pack(side='left')
+
+        tk.Label(tab_forward,
+                 text=f'ปรับความเร็วได้ {MOVE_FORWARD_SPEED_MIN:.2f}-'
+                      f'{MOVE_FORWARD_SPEED_MAX:.2f} m/s, ระยะจำกัด '
+                      f'{MOVE_FORWARD_MIN_M:.2f}-{MOVE_FORWARD_MAX_M:.1f} ม. '
+                      '- ตรวจสอบพื้นที่ด้านหน้าว่าปลอดภัยก่อนกด (ISO 3691-4)',
+                 font=self.f_small, bg=CARD_BG, fg=TEXT_MUTED, anchor='w',
+                 justify='left', wraplength=930
+                 ).pack(anchor='w', pady=(6, 4))
+
+        # Square path (4x straight leg + 90 deg turn, closed-loop, returns
+        # to the starting point/heading - see square_path_node.py). Shares
+        # tab_forward's speed control (self._move_speed).
+        square_row = tk.Frame(tab_square, bg=CARD_BG)
+        square_row.pack(fill='x', pady=(8, 0))
+
+        self._square_side = SQUARE_SIDE_DEFAULT
+        self.btn_square_minus = tk.Button(
+            square_row, text='-', font=self.f_button_sub,
+            bg='#ffffff', fg=TEXT_MAIN, relief='solid', bd=1,
+            width=2, cursor='hand2', state='disabled',
+            command=lambda: self._adjust_square_side(-SQUARE_SIDE_STEP))
+        self.btn_square_minus.pack(side='left')
+
+        self.square_side_label = tk.Label(
+            square_row, text=f'{SQUARE_SIDE_DEFAULT:.1f} ม./ด้าน',
+            font=self.f_status, bg=CARD_BG, fg=TEXT_MAIN, width=10,
+            anchor='center')
+        self.square_side_label.pack(side='left', padx=6)
+
+        self.btn_square_plus = tk.Button(
+            square_row, text='+', font=self.f_button_sub,
+            bg='#ffffff', fg=TEXT_MAIN, relief='solid', bd=1,
+            width=2, cursor='hand2', state='disabled',
+            command=lambda: self._adjust_square_side(SQUARE_SIDE_STEP))
+        self.btn_square_plus.pack(side='left', padx=(0, 16))
+
+        self.btn_square_path = tk.Button(
+            square_row, text='วิ่งเป็นสี่เหลี่ยม (Square Path)',
+            font=self.f_button_sub, bg='#ffffff', fg=NAV_ACCENT_DARK,
+            activebackground='#e3f2fd', relief='solid', bd=1, padx=14,
+            pady=8, cursor='hand2', command=self._on_click_square_path,
+            state='disabled')
+        self.btn_square_path.pack(side='left')
+
+        tk.Label(tab_square,
+                 text=f'ด้านละ {SQUARE_SIDE_MIN:.1f}-{SQUARE_SIDE_MAX:.1f} ม. '
+                      '(รวม 4 ด้าน) ใช้ความเร็วเดินหน้าเดียวกับแท็บเดินหน้าตรง '
+                      'หมุนกลับทวนเข็มนาฬิกา 90 องศาต่อมุม - ตรวจสอบพื้นที่โดยรอบ'
+                      'หุ่นยนต์ให้ปลอดภัยตลอดเส้นทางก่อนกด (ISO 3691-4)',
+                 font=self.f_small, bg=CARD_BG, fg=TEXT_MUTED, anchor='w',
+                 justify='left', wraplength=930
+                 ).pack(anchor='w', pady=(6, 4))
+
+        # Circle path (constant-curvature arc, closed-loop - see
+        # circle_path_node.py).
+        circle_row = tk.Frame(tab_circle, bg=CARD_BG)
+        circle_row.pack(fill='x', pady=(8, 0))
+
+        tk.Label(circle_row, text='รัศมี:', font=self.f_status,
+                 bg=CARD_BG, fg=TEXT_MAIN).pack(side='left', padx=(0, 4))
+
+        self._circle_radius = CIRCLE_RADIUS_DEFAULT
+        self.btn_circle_radius_minus = tk.Button(
+            circle_row, text='-', font=self.f_button_sub,
+            bg='#ffffff', fg=TEXT_MAIN, relief='solid', bd=1,
+            width=2, cursor='hand2', state='disabled',
+            command=lambda: self._adjust_circle_radius(-CIRCLE_RADIUS_STEP))
+        self.btn_circle_radius_minus.pack(side='left')
+
+        self.circle_radius_label = tk.Label(
+            circle_row, text=f'{CIRCLE_RADIUS_DEFAULT:.1f} ม.',
+            font=self.f_status, bg=CARD_BG, fg=TEXT_MAIN, width=8,
+            anchor='center')
+        self.circle_radius_label.pack(side='left', padx=6)
+
+        self.btn_circle_radius_plus = tk.Button(
+            circle_row, text='+', font=self.f_button_sub,
+            bg='#ffffff', fg=TEXT_MAIN, relief='solid', bd=1,
+            width=2, cursor='hand2', state='disabled',
+            command=lambda: self._adjust_circle_radius(CIRCLE_RADIUS_STEP))
+        self.btn_circle_radius_plus.pack(side='left', padx=(0, 16))
+
+        tk.Label(circle_row, text='มุม:', font=self.f_status,
+                 bg=CARD_BG, fg=TEXT_MAIN).pack(side='left', padx=(0, 4))
+
+        self._circle_angle = CIRCLE_ANGLE_DEFAULT
+        self.btn_circle_angle_minus = tk.Button(
+            circle_row, text='-', font=self.f_button_sub,
+            bg='#ffffff', fg=TEXT_MAIN, relief='solid', bd=1,
+            width=2, cursor='hand2', state='disabled',
+            command=lambda: self._adjust_circle_angle(-CIRCLE_ANGLE_STEP))
+        self.btn_circle_angle_minus.pack(side='left')
+
+        self.circle_angle_label = tk.Label(
+            circle_row, text=f'{CIRCLE_ANGLE_DEFAULT:.0f}°',
+            font=self.f_status, bg=CARD_BG, fg=TEXT_MAIN, width=6,
+            anchor='center')
+        self.circle_angle_label.pack(side='left', padx=6)
+
+        self.btn_circle_angle_plus = tk.Button(
+            circle_row, text='+', font=self.f_button_sub,
+            bg='#ffffff', fg=TEXT_MAIN, relief='solid', bd=1,
+            width=2, cursor='hand2', state='disabled',
+            command=lambda: self._adjust_circle_angle(CIRCLE_ANGLE_STEP))
+        self.btn_circle_angle_plus.pack(side='left', padx=(0, 16))
+
+        self.btn_circle_path = tk.Button(
+            circle_row, text='วิ่งวงกลม (Circle Path)',
+            font=self.f_button_sub, bg='#ffffff', fg=NAV_ACCENT_DARK,
+            activebackground='#e3f2fd', relief='solid', bd=1, padx=14,
+            pady=8, cursor='hand2', command=self._on_click_circle_path,
+            state='disabled')
+        self.btn_circle_path.pack(side='left')
+
+        tk.Label(tab_circle,
+                 text=f'รัศมี {CIRCLE_RADIUS_MIN:.1f}-{CIRCLE_RADIUS_MAX:.1f} ม., '
+                      f'มุม {CIRCLE_ANGLE_MIN}-{CIRCLE_ANGLE_MAX} องศา, '
+                      f'ความเร็วเชิงมุมคงที่ {CIRCLE_ANGULAR_SPEED:.1f} rad/s - '
+                      'ตรวจสอบพื้นที่โดยรอบหุ่นยนต์ตลอดเส้นทางก่อนกด (ISO 3691-4)',
+                 font=self.f_small, bg=CARD_BG, fg=TEXT_MUTED, anchor='w',
+                 justify='left', wraplength=930
+                 ).pack(anchor='w', pady=(6, 4))
+
+        # Calibration launcher: not tied to any one motion preset, so it
+        # lives below the Notebook (always visible regardless of which tab
+        # is selected) rather than inside a tab.
+        calib_row = tk.Frame(move_inner, bg=CARD_BG)
+        calib_row.pack(fill='x', pady=(8, 0))
+
+        self.btn_calibrate = tk.Button(
+            calib_row, text='ปรับเทียบ Localization (Calibrate)',
+            font=self.f_button_sub, bg='#ffffff', fg=NAV_ACCENT_DARK,
+            activebackground='#e3f2fd', relief='solid', bd=1, padx=14,
+            pady=8, cursor='hand2', command=self._on_click_calibrate)
+        self.btn_calibrate.pack(side='left')
 
     def _make_mode_card(self, parent, title_th, title_en, color, color_dark, command):
         # A real tk.Button cannot reliably contain other packed widgets - the
@@ -267,6 +587,34 @@ class AmrControlPanel(tk.Tk):
         self.btn_stop.config(state=('normal' if running else 'disabled'))
         self.btn_save_map.config(
             state=('normal' if (running and mode == 'mapping') else 'disabled'))
+        is_moving = self._move_proc is not None and self._move_proc.poll() is None
+        if not is_moving:
+            self.btn_move_forward.config(
+                state=('normal' if running else 'disabled'),
+                text='เดินหน้า (Move Forward)')
+            self.btn_square_path.config(
+                state=('normal' if running else 'disabled'),
+                text='วิ่งเป็นสี่เหลี่ยม (Square Path)')
+            self.btn_circle_path.config(
+                state=('normal' if running else 'disabled'),
+                text='วิ่งวงกลม (Circle Path)')
+            step_state = 'normal' if running else 'disabled'
+            self.btn_move_minus.config(state=step_state)
+            self.btn_move_plus.config(state=step_state)
+            self.btn_speed_minus.config(state=step_state)
+            self.btn_speed_plus.config(state=step_state)
+            self.btn_square_minus.config(state=step_state)
+            self.btn_square_plus.config(state=step_state)
+            self.btn_circle_radius_minus.config(state=step_state)
+            self.btn_circle_radius_plus.config(state=step_state)
+            self.btn_circle_angle_minus.config(state=step_state)
+            self.btn_circle_angle_plus.config(state=step_state)
+            if running:
+                self._adjust_move_distance(0)  # re-apply min/max bound greying
+                self._adjust_move_speed(0)
+                self._adjust_square_side(0)
+                self._adjust_circle_radius(0)
+                self._adjust_circle_angle(0)
 
     # ---------- mode launches ----------
     def _on_click_mapping(self):
@@ -276,21 +624,46 @@ class AmrControlPanel(tk.Tk):
             'ros2', 'launch', 'amr_bringup', 'bringup.launch.py',
             'rviz:=false', 'foxglove:=true', 'slam:=true', 'navigation:=false',
         ], mode='mapping', label='โหมดสร้างแผนที่ (Mapping)')
-        threading.Thread(target=self._ensure_rosboard_then_show_qr,
+        threading.Thread(target=self._ensure_monitors_then_show_qr,
                           daemon=True).start()
 
-    # ---------- rosboard / monitor QR ----------
-    def _ensure_rosboard_then_show_qr(self):
+    # ---------- rosboard / Lichtblick / mobile monitor QR ----------
+    def _ensure_monitors_then_show_qr(self):
         ip = get_local_ip()
+
         if not is_port_open(ip, ROSBOARD_PORT):
             self._start_rosboard()
-            # give it a moment to bind the port before we render the QR
             for _ in range(20):
                 time.sleep(0.5)
                 if is_port_open(ip, ROSBOARD_PORT):
                     break
-        url = build_rosboard_url(ip, MAPPING_MONITOR_TOPICS)
-        self.after(0, lambda: self._show_monitor_qr(url))
+        rosboard_ok = is_port_open(ip, ROSBOARD_PORT)
+        rosboard_url = build_rosboard_url(ip, MAPPING_MONITOR_TOPICS)
+
+        lichtblick_ok = False
+        if os.path.isdir(LICHTBLICK_DIST_DIR):
+            if not is_port_open(ip, LICHTBLICK_PORT):
+                self._start_static_server(
+                    '_lichtblick_proc', LICHTBLICK_PORT, LICHTBLICK_DIST_DIR)
+                for _ in range(20):
+                    time.sleep(0.5)
+                    if is_port_open(ip, LICHTBLICK_PORT):
+                        break
+            lichtblick_ok = is_port_open(ip, LICHTBLICK_PORT)
+
+        mobile_url = None
+        if lichtblick_ok and rosboard_ok and os.path.isdir(MOBILE_DIST_DIR):
+            if not is_port_open(ip, MOBILE_PORT):
+                self._start_static_server(
+                    '_mobile_proc', MOBILE_PORT, MOBILE_DIST_DIR)
+                for _ in range(20):
+                    time.sleep(0.5)
+                    if is_port_open(ip, MOBILE_PORT):
+                        break
+            if is_port_open(ip, MOBILE_PORT):
+                mobile_url = build_mobile_url(ip)
+
+        self.after(0, lambda: self._show_monitor_qr(mobile_url, rosboard_url))
 
     def _start_rosboard(self):
         if self._rosboard_proc is not None and self._rosboard_proc.poll() is None:
@@ -304,9 +677,42 @@ class AmrControlPanel(tk.Tk):
         except Exception:
             self._rosboard_proc = None
 
-    def _show_monitor_qr(self, url):
-        img = qrcode.make(url).resize((260, 260))
-        self._qr_photo = ImageTk.PhotoImage(img)
+    def _start_static_server(self, proc_attr, port, directory):
+        proc = getattr(self, proc_attr)
+        if proc is not None and proc.poll() is None:
+            return
+        env = os.environ.copy()
+        try:
+            proc = subprocess.Popen(
+                ['python3', '-m', 'http.server', str(port),
+                 '--directory', directory, '--bind', '0.0.0.0'],
+                preexec_fn=os.setsid, env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            proc = None
+        setattr(self, proc_attr, proc)
+
+    def _add_qr_block(self, parent, title, url, extra_note=None):
+        img = qrcode.make(url).resize((220, 220))
+        photo = ImageTk.PhotoImage(img)
+        self._qr_photos.append(photo)  # keep a reference so Tk doesn't GC it
+
+        block = tk.Frame(parent, bg=CARD_BG)
+        tk.Label(block, text=title, font=self.f_status, bg=CARD_BG,
+                 fg=TEXT_MAIN, wraplength=260, justify='center'
+                 ).pack(pady=(0, 8))
+        tk.Label(block, image=photo, bg=CARD_BG).pack()
+        tk.Label(block, text=url, font=self.f_small, bg=CARD_BG,
+                 fg=TEXT_MUTED, wraplength=260, justify='center'
+                 ).pack(pady=(8, 4))
+        if extra_note:
+            tk.Label(block, text=extra_note, font=self.f_small, bg=CARD_BG,
+                     fg=TEXT_MUTED, wraplength=260, justify='center'
+                     ).pack(pady=(0, 4))
+        return block
+
+    def _show_monitor_qr(self, mobile_url, rosboard_url):
+        self._qr_photos = []
 
         win = tk.Toplevel(self)
         win.title('Monitor บนมือถือ')
@@ -314,25 +720,42 @@ class AmrControlPanel(tk.Tk):
         win.transient(self)
         win.resizable(False, False)
 
-        tk.Label(win, text='สแกนเพื่อดูสถานะ SLAM แบบ Real-time',
+        tk.Label(win, text='สแกนเพื่อดูแผนที่ + ควบคุมขับจากมือถือ',
                  font=self.f_status, bg=CARD_BG, fg=TEXT_MAIN,
-                 wraplength=280, justify='center'
-                 ).pack(padx=20, pady=(18, 10))
-        tk.Label(win, image=self._qr_photo, bg=CARD_BG).pack(padx=20)
-        tk.Label(win, text=url, font=self.f_small, bg=CARD_BG,
-                 fg=TEXT_MUTED, wraplength=280, justify='center'
-                 ).pack(padx=20, pady=(8, 4))
-        tk.Label(win, text='ต่อ WiFi วงเดียวกับ Jetson นี้ก่อนสแกน',
+                 wraplength=560, justify='center'
+                 ).pack(padx=20, pady=(18, 4))
+        tk.Label(win, text='ต่อ WiFi วงเดียวกับ Jetson นี้ก่อนสแกน (ไม่ต้องใช้อินเทอร์เน็ต)',
                  font=self.f_small, bg=CARD_BG, fg=TEXT_MUTED,
-                 wraplength=280, justify='center'
-                 ).pack(padx=20, pady=(0, 6))
+                 wraplength=560, justify='center'
+                 ).pack(padx=20, pady=(0, 12))
+
+        cols = tk.Frame(win, bg=CARD_BG)
+        cols.pack(padx=20, fill='x')
+
+        if mobile_url:
+            mobile_block = self._add_qr_block(
+                cols, 'แผนที่ + ควบคุม (แนะนำ)', mobile_url,
+                extra_note='แผนที่แบบ Foxglove (Lichtblick) ด้านบน + จอย'
+                            'สติ๊กควบคุมขับ (rosboard 🕹) ด้านล่าง - '
+                            'โหลดครั้งแรกอาจช้าสักครู่ (~170MB ผ่าน LAN)')
+            mobile_block.grid(row=0, column=0, padx=(0, 16), sticky='n')
+        else:
+            tk.Label(cols, text='หน้ารวม (แผนที่+ควบคุม) ยังไม่พร้อมใช้งาน\n'
+                                 f'(ต้องมีทั้ง rosboard และ {LICHTBLICK_DIST_DIR})',
+                     font=self.f_small, bg=CARD_BG, fg=DANGER,
+                     wraplength=220, justify='center'
+                     ).grid(row=0, column=0, padx=(0, 16), sticky='n')
+
+        rosboard_block = self._add_qr_block(
+            cols, 'Monitor + ควบคุม เบา (rosboard เท่านั้น)', rosboard_url)
+        rosboard_block.grid(row=0, column=1, padx=(16, 0), sticky='n')
 
         pin = get_rosboard_pin()
         if pin:
             pin_frame = tk.Frame(win, bg='#fff8e1', highlightthickness=1,
                                   highlightbackground='#f9a825')
-            pin_frame.pack(padx=20, pady=(4, 10), fill='x')
-            tk.Label(pin_frame, text='รหัสเข้าใช้งาน (PIN)', font=self.f_small,
+            pin_frame.pack(padx=20, pady=(14, 4), fill='x')
+            tk.Label(pin_frame, text='รหัสเข้าใช้งาน rosboard (PIN)', font=self.f_small,
                      bg='#fff8e1', fg=TEXT_MUTED).pack(pady=(8, 0))
             tk.Label(pin_frame, text=pin, font=tkfont.Font(
                 family='Sans', size=24, weight='bold'),
@@ -341,10 +764,11 @@ class AmrControlPanel(tk.Tk):
         tk.Button(win, text='ปิด', font=self.f_button_sub, bg='#ffffff',
                   fg=TEXT_MUTED, relief='solid', bd=1, padx=14, pady=8,
                   cursor='hand2', command=win.destroy
-                  ).pack(pady=(4, 18))
+                  ).pack(pady=(10, 18))
 
         win.update_idletasks()
-        self._center_toplevel(win, 320, win.winfo_reqheight() + 10)
+        self._center_toplevel(win, win.winfo_reqwidth() + 10,
+                               win.winfo_reqheight() + 10)
 
     def _on_click_navigation(self):
         if self._proc is not None:
@@ -363,6 +787,84 @@ class AmrControlPanel(tk.Tk):
             f'map:={map_path}',
         ], mode='navigation',
             label=f'โหมดนำทาง (Navigation)\nแผนที่: {os.path.basename(map_path)}')
+        threading.Thread(target=self._ensure_nav_monitors_then_show_qr,
+                          daemon=True).start()
+
+    # ---------- goal_picker QR (Navigation mode: tap/draw a destination) ----------
+    def _ensure_nav_monitors_then_show_qr(self):
+        ip = get_local_ip()
+
+        if not is_port_open(ip, ROSBOARD_PORT):
+            self._start_rosboard()
+            for _ in range(20):
+                time.sleep(0.5)
+                if is_port_open(ip, ROSBOARD_PORT):
+                    break
+        rosboard_ok = is_port_open(ip, ROSBOARD_PORT)
+
+        goal_picker_url = build_goal_picker_url(ip) if rosboard_ok else None
+        rosboard_url = build_rosboard_url(ip, MAPPING_MONITOR_TOPICS) if rosboard_ok else None
+
+        self.after(0, lambda: self._show_navigation_qr(goal_picker_url, rosboard_url))
+
+    def _show_navigation_qr(self, goal_picker_url, rosboard_url):
+        self._qr_photos = []
+
+        win = tk.Toplevel(self)
+        win.title('ตั้งจุดหมายจากมือถือ')
+        win.configure(bg=CARD_BG)
+        win.transient(self)
+        win.resizable(False, False)
+
+        tk.Label(win, text='สแกนเพื่อเลือกจุดหมาย/วาดเส้นทางให้หุ่นยนต์วิ่งตาม',
+                 font=self.f_status, bg=CARD_BG, fg=TEXT_MAIN,
+                 wraplength=560, justify='center'
+                 ).pack(padx=20, pady=(18, 4))
+        tk.Label(win, text='ต่อ WiFi วงเดียวกับ Jetson นี้ก่อนสแกน (ไม่ต้องใช้อินเทอร์เน็ต)\n'
+                            'หุ่นยนต์จะเคลื่อนที่แบบอัตโนมัติทันทีที่ยืนยันบนหน้าจอนั้น - '
+                            'ตรวจสอบพื้นที่ให้ปลอดภัยก่อนเสมอ (ISO 3691-4)',
+                 font=self.f_small, bg=CARD_BG, fg=TEXT_MUTED,
+                 wraplength=560, justify='center'
+                 ).pack(padx=20, pady=(0, 12))
+
+        cols = tk.Frame(win, bg=CARD_BG)
+        cols.pack(padx=20, fill='x')
+
+        if goal_picker_url:
+            goal_block = self._add_qr_block(
+                cols, 'ตั้งจุดหมาย / ลากเส้นทาง (แนะนำ)', goal_picker_url,
+                extra_note='แตะแผนที่เพื่อส่งหุ่นยนต์ไปจุดนั้น หรือลากเพื่อวาดเส้นทาง')
+            goal_block.grid(row=0, column=0, padx=(0, 16), sticky='n')
+        else:
+            tk.Label(cols, text='หน้าตั้งจุดหมายยังไม่พร้อมใช้งาน (rosboard ไม่ทำงาน)',
+                     font=self.f_small, bg=CARD_BG, fg=DANGER,
+                     wraplength=220, justify='center'
+                     ).grid(row=0, column=0, padx=(0, 16), sticky='n')
+
+        if rosboard_url:
+            rosboard_block = self._add_qr_block(
+                cols, 'Monitor แผนที่ (rosboard)', rosboard_url)
+            rosboard_block.grid(row=0, column=1, padx=(16, 0), sticky='n')
+
+        pin = get_rosboard_pin()
+        if pin:
+            pin_frame = tk.Frame(win, bg='#fff8e1', highlightthickness=1,
+                                  highlightbackground='#f9a825')
+            pin_frame.pack(padx=20, pady=(14, 4), fill='x')
+            tk.Label(pin_frame, text='รหัสเข้าใช้งาน (PIN)', font=self.f_small,
+                     bg='#fff8e1', fg=TEXT_MUTED).pack(pady=(8, 0))
+            tk.Label(pin_frame, text=pin, font=tkfont.Font(
+                family='Sans', size=24, weight='bold'),
+                bg='#fff8e1', fg='#e65100').pack(pady=(0, 8))
+
+        tk.Button(win, text='ปิด', font=self.f_button_sub, bg='#ffffff',
+                  fg=TEXT_MUTED, relief='solid', bd=1, padx=14, pady=8,
+                  cursor='hand2', command=win.destroy
+                  ).pack(pady=(10, 18))
+
+        win.update_idletasks()
+        self._center_toplevel(win, win.winfo_reqwidth() + 10,
+                               win.winfo_reqheight() + 10)
 
     def _center_toplevel(self, win, w, h):
         self.update_idletasks()
@@ -472,6 +974,7 @@ class AmrControlPanel(tk.Tk):
     def _on_stop(self):
         if self._proc is None:
             return
+        self._cancel_move_forward()  # abort any in-progress "move forward" first
         self._set_status('starting', 'กำลังปิดระบบ...')
         proc = self._proc
 
@@ -486,6 +989,269 @@ class AmrControlPanel(tk.Tk):
                     pass
             self.after(0, lambda: self._on_process_exited(0))
         threading.Thread(target=do_stop, daemon=True).start()
+
+    # ---------- move-forward-by-distance ----------
+    def _adjust_move_distance(self, delta):
+        new_value = round(self._move_distance + delta, 2)
+        new_value = max(MOVE_FORWARD_MIN_M, min(MOVE_FORWARD_MAX_M, new_value))
+        self._move_distance = new_value
+        self.move_distance_label.config(text=f'{new_value:.1f} ม.')
+        self.btn_move_minus.config(
+            state=('disabled' if new_value <= MOVE_FORWARD_MIN_M else 'normal'))
+        self.btn_move_plus.config(
+            state=('disabled' if new_value >= MOVE_FORWARD_MAX_M else 'normal'))
+
+    def _adjust_move_speed(self, delta):
+        new_value = round(self._move_speed + delta, 2)
+        new_value = max(MOVE_FORWARD_SPEED_MIN, min(MOVE_FORWARD_SPEED_MAX, new_value))
+        self._move_speed = new_value
+        self.move_speed_label.config(text=f'{new_value:.2f} m/s')
+        self.btn_speed_minus.config(
+            state=('disabled' if new_value <= MOVE_FORWARD_SPEED_MIN else 'normal'))
+        self.btn_speed_plus.config(
+            state=('disabled' if new_value >= MOVE_FORWARD_SPEED_MAX else 'normal'))
+
+    def _adjust_square_side(self, delta):
+        new_value = round(self._square_side + delta, 2)
+        new_value = max(SQUARE_SIDE_MIN, min(SQUARE_SIDE_MAX, new_value))
+        self._square_side = new_value
+        self.square_side_label.config(text=f'{new_value:.1f} ม./ด้าน')
+        self.btn_square_minus.config(
+            state=('disabled' if new_value <= SQUARE_SIDE_MIN else 'normal'))
+        self.btn_square_plus.config(
+            state=('disabled' if new_value >= SQUARE_SIDE_MAX else 'normal'))
+
+    def _adjust_circle_radius(self, delta):
+        new_value = round(self._circle_radius + delta, 2)
+        new_value = max(CIRCLE_RADIUS_MIN, min(CIRCLE_RADIUS_MAX, new_value))
+        self._circle_radius = new_value
+        self.circle_radius_label.config(text=f'{new_value:.1f} ม.')
+        self.btn_circle_radius_minus.config(
+            state=('disabled' if new_value <= CIRCLE_RADIUS_MIN else 'normal'))
+        self.btn_circle_radius_plus.config(
+            state=('disabled' if new_value >= CIRCLE_RADIUS_MAX else 'normal'))
+
+    def _adjust_circle_angle(self, delta):
+        new_value = round(self._circle_angle + delta)
+        new_value = max(CIRCLE_ANGLE_MIN, min(CIRCLE_ANGLE_MAX, new_value))
+        self._circle_angle = new_value
+        self.circle_angle_label.config(text=f'{new_value:.0f}°')
+        self.btn_circle_angle_minus.config(
+            state=('disabled' if new_value <= CIRCLE_ANGLE_MIN else 'normal'))
+        self.btn_circle_angle_plus.config(
+            state=('disabled' if new_value >= CIRCLE_ANGLE_MAX else 'normal'))
+
+    def _cancel_move_forward(self):
+        if self._move_proc is not None and self._move_proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(self._move_proc.pid), signal.SIGINT)
+            except Exception:
+                pass
+
+    def _on_click_move_forward(self):
+        if self._move_proc is not None and self._move_proc.poll() is None:
+            # Already moving - this click means Cancel.
+            self._cancel_move_forward()
+            return
+
+        if self._proc is None:
+            return
+
+        distance = self._move_distance
+        speed = self._move_speed
+
+        if not messagebox.askyesno(
+                'ยืนยันการเคลื่อนที่',
+                f'ให้หุ่นยนต์เดินหน้าตรง {distance:.2f} เมตร '
+                f'ด้วยความเร็ว {speed:.2f} m/s ใช่หรือไม่?\n\n'
+                'ตรวจสอบว่าด้านหน้าหุ่นยนต์ไม่มีคน/สิ่งกีดขวางก่อนยืนยัน'):
+            return
+
+        self._move_kind = 'forward'
+        self.btn_move_forward.config(text='ยกเลิก (Cancel)')
+        self.btn_square_path.config(state='disabled')
+        self.btn_circle_path.config(state='disabled')
+        self._set_card_enabled(self.btn_mapping, False)
+        self._set_card_enabled(self.btn_navigation, False)
+
+        env = os.environ.copy()
+        self._move_proc = subprocess.Popen(
+            ['ros2', 'run', 'amr_bringup', 'move_forward_node.py',
+             f'{distance:.3f}', f'{speed:.3f}'],
+            preexec_fn=os.setsid, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._poll_move_proc()
+
+    def _on_click_calibrate(self):
+        if self._calib_panel is not None and self._calib_panel.winfo_exists():
+            self._calib_panel.lift()
+            self._calib_panel.focus_force()
+            return
+        if self._proc is None:
+            # Calibration nodes need /cmd_vel + /wheel/odom, which only
+            # exist once bringup.launch.py (started by Mapping/Navigation)
+            # is running the STM32 micro_ros_agent link - without it the
+            # rotate/straight tests silently see no odom data.
+            messagebox.showwarning(
+                'ยังไม่ได้เริ่มระบบ',
+                'กรุณากด "สร้างแผนที่ (Mapping)" หรือ "นำทาง (Navigation)" '
+                'เพื่อเชื่อมต่อ STM32/odometry ก่อน แล้วค่อยเปิดหน้าปรับเทียบ')
+            return
+        self._calib_panel = amr_calib_panel.CalibPanel(
+            self, on_close=self._on_calib_panel_closed)
+
+    def _on_calib_panel_closed(self):
+        self._calib_panel = None
+
+    def _on_click_square_path(self):
+        if self._move_proc is not None and self._move_proc.poll() is None:
+            # Already moving - this click means Cancel.
+            self._cancel_move_forward()
+            return
+
+        if self._proc is None:
+            return
+
+        side = self._square_side
+        speed = self._move_speed
+
+        if not messagebox.askyesno(
+                'ยืนยันการเคลื่อนที่',
+                f'ให้หุ่นยนต์วิ่งเป็นสี่เหลี่ยมด้านละ {side:.2f} เมตร '
+                f'ด้วยความเร็ว {speed:.2f} m/s แล้วกลับมาจุดเดิมใช่หรือไม่?\n\n'
+                'ตรวจสอบว่าโดยรอบหุ่นยนต์ไม่มีคน/สิ่งกีดขวางตลอดเส้นทางก่อนยืนยัน'):
+            return
+
+        self._move_kind = 'square'
+        self.btn_square_path.config(text='ยกเลิก (Cancel)')
+        self.btn_move_forward.config(state='disabled')
+        self.btn_circle_path.config(state='disabled')
+        self._set_card_enabled(self.btn_mapping, False)
+        self._set_card_enabled(self.btn_navigation, False)
+
+        env = os.environ.copy()
+        self._move_proc = subprocess.Popen(
+            ['ros2', 'run', 'amr_bringup', 'square_path_node.py',
+             f'{side:.3f}', f'{speed:.3f}', f'{SQUARE_TURN_SPEED:.3f}'],
+            preexec_fn=os.setsid, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._poll_move_proc()
+
+    def _on_click_circle_path(self):
+        if self._move_proc is not None and self._move_proc.poll() is None:
+            # Already moving - this click means Cancel.
+            self._cancel_move_forward()
+            return
+
+        if self._proc is None:
+            return
+
+        radius = self._circle_radius
+        angle = self._circle_angle
+
+        if not messagebox.askyesno(
+                'ยืนยันการเคลื่อนที่',
+                f'ให้หุ่นยนต์วิ่งเป็นวงกลมรัศมี {radius:.2f} เมตร '
+                f'มุม {angle:.0f} องศา ด้วยความเร็วเชิงมุม '
+                f'{CIRCLE_ANGULAR_SPEED:.1f} rad/s ใช่หรือไม่?\n\n'
+                'ตรวจสอบว่าโดยรอบหุ่นยนต์ไม่มีคน/สิ่งกีดขวางตลอดเส้นทางก่อนยืนยัน'):
+            return
+
+        self._move_kind = 'circle'
+        self.btn_circle_path.config(text='ยกเลิก (Cancel)')
+        self.btn_move_forward.config(state='disabled')
+        self.btn_square_path.config(state='disabled')
+        self._set_card_enabled(self.btn_mapping, False)
+        self._set_card_enabled(self.btn_navigation, False)
+
+        env = os.environ.copy()
+        self._move_proc = subprocess.Popen(
+            ['ros2', 'run', 'amr_bringup', 'circle_path_node.py',
+             f'{radius:.3f}', f'{angle:.1f}', f'{CIRCLE_ANGULAR_SPEED:.3f}'],
+            preexec_fn=os.setsid, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self._poll_move_proc()
+
+    def _poll_move_proc(self):
+        proc = self._move_proc
+        if proc is None:
+            return
+        ret = proc.poll()
+        if ret is None:
+            self._move_poll_job = self.after(200, self._poll_move_proc)
+            return
+
+        self._move_poll_job = None
+        self._move_proc = None
+        kind = self._move_kind
+        self._move_kind = None
+        if kind == 'square':
+            if ret == 1:
+                messagebox.showwarning(
+                    'หยุดกลางทาง',
+                    'ใช้เวลานานเกินคาดในช่วงเดินหน้า (odom นิ่ง/หุ่นติดขัด) - หยุดคำสั่งแล้ว')
+            elif ret == 2:
+                messagebox.showerror(
+                    'ไม่สำเร็จ', 'ไม่พบข้อมูล /wheel/raw_distance - ยกเลิกคำสั่ง')
+            elif ret == 3:
+                messagebox.showwarning(
+                    'หยุดกลางทาง',
+                    'ใช้เวลานานเกินคาดในช่วงหมุน (หุ่นติดขัด) - หยุดคำสั่งแล้ว')
+            elif ret == 4:
+                messagebox.showerror(
+                    'ไม่สำเร็จ', 'ไม่พบข้อมูล /odometry/filtered - ยกเลิกคำสั่ง')
+        else:
+            if ret == 1:
+                messagebox.showwarning(
+                    'หยุดกลางทาง',
+                    'ใช้เวลานานเกินคาด (odom นิ่ง/หุ่นติดขัด) - หยุดคำสั่งแล้ว')
+            elif ret == 2:
+                topic = '/wheel/odom' if kind == 'circle' else '/odometry/filtered'
+                messagebox.showerror(
+                    'ไม่สำเร็จ', f'ไม่พบข้อมูล {topic} - ยกเลิกคำสั่ง')
+            elif kind == 'circle' and ret == 0:
+                revs_l, revs_r = self._parse_wheel_revs(proc)
+                if revs_l is not None:
+                    messagebox.showinfo(
+                        'วิ่งวงกลมเสร็จสิ้น',
+                        f'จำนวนรอบที่ล้อหมุนไป:\n'
+                        f'  ล้อซ้าย: {revs_l:.2f} รอบ\n'
+                        f'  ล้อขวา: {revs_r:.2f} รอบ')
+        self._reset_move_ui()
+
+    @staticmethod
+    def _parse_wheel_revs(proc):
+        """Reads circle_path_node.py's 'WHEEL_REVS left=.. right=..' stdout
+        line. Returns (revs_l, revs_r) as floats, or (None, None) if the
+        process produced no parseable output (e.g. no pulse_count data)."""
+        try:
+            output = proc.stdout.read() if proc.stdout else ''
+        except Exception:
+            output = ''
+        for line in output.splitlines():
+            if line.startswith('WHEEL_REVS left='):
+                try:
+                    parts = line.split()
+                    revs_l = float(parts[1].split('=')[1])
+                    revs_r = float(parts[2].split('=')[1])
+                    return revs_l, revs_r
+                except (IndexError, ValueError):
+                    return None, None
+        return None, None
+
+    def _reset_move_ui(self):
+        running = self._proc is not None
+        self.btn_move_forward.config(
+            state=('normal' if running else 'disabled'),
+            text='เดินหน้า (Move Forward)')
+        self.btn_square_path.config(
+            state=('normal' if running else 'disabled'),
+            text='วิ่งเป็นสี่เหลี่ยม (Square Path)')
+        self.btn_circle_path.config(
+            state=('normal' if running else 'disabled'),
+            text='วิ่งวงกลม (Circle Path)')
+        self._set_card_enabled(self.btn_mapping, not running)
+        self._set_card_enabled(self.btn_navigation, not running)
 
     def _show_save_name_dialog(self, default_name):
         result = {'name': None}
@@ -582,6 +1348,16 @@ class AmrControlPanel(tk.Tk):
                 os.killpg(os.getpgid(self._proc.pid), signal.SIGINT)
             except Exception:
                 pass
+        self._cancel_move_forward()
+        if self._move_proc is not None:
+            try:
+                self._move_proc.wait(timeout=2)
+            except Exception:
+                pass
+        if self._move_poll_job is not None:
+            self.after_cancel(self._move_poll_job)
+        if self._calib_panel is not None and self._calib_panel.winfo_exists():
+            self._calib_panel._on_close()
         self.destroy()
 
 
