@@ -27,7 +27,7 @@ slam_toolbox:
     transform_publish_period: 0.02  # if 0 never publishes odometry
     map_update_interval: 2.0
     resolution: 0.05
-    max_laser_range: 16.0           # matches the simulated 2D lidar range
+    max_laser_range: 25.0           # was 16 (sim value) - real 30x50 m hall; RPLIDAR C3 reaches ~40 m on bright surfaces
     min_laser_range: 0.2            # RPLiDAR C1 hardware minimum sensing range
     minimum_time_interval: 0.2
     transform_timeout: 0.3
