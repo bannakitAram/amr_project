@@ -295,20 +295,83 @@ local_costmap:
       # up ~1.5cm/side to cover the drive wheels poking slightly past the
       # base box on Y. Rectangle corners, base_link frame, X forward/Y left.
       footprint: "[[0.49, 0.26], [0.49, -0.26], [-0.49, -0.26], [-0.49, 0.26]]"
-      plugins: ["voxel_layer", "inflation_layer"]
+      # stvl_layer is configured below but NOT loaded: inside controller_server
+      # it marks nothing (0 voxels, 2026-10-05), while the same params in a
+      # standalone costmap work. Until that is fixed, depth only feeds
+      # collision_monitor (slow/stop on low obstacles, no re-planning around
+      # them). Re-enable: add "stvl_layer" between obstacle_layer and
+      # inflation_layer.
+      plugins: ["obstacle_layer", "inflation_layer"]
+      # HP60C depth (amr_bringup/launch/depth_camera.launch.py), 320x240
+      # @ ~8 Hz. Covers what the single LiDAR plane misses: low objects on
+      # the floor and overhangs (tables, forklift forks) below robot height.
+      # STVL instead of VoxelLayer because the factory floor is mirror-glossy
+      # epoxy: the camera gets 0% depth returns off clear floor, so
+      # raytrace clearing (which needs a return to trace to) never removes
+      # a mark - people walking past would leave ghost obstacles. STVL
+      # forgets voxels by time (voxel_decay) and decays faster anything
+      # inside the camera frustum that is no longer seen.
+      stvl_layer:
+        plugin: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"
+        enabled: true
+        voxel_decay: 1.0            # s; 0.2 m/s * 1 s = 20 cm of travel
+        decay_model: 0              # linear
+        voxel_size: 0.05
+        track_unknown_space: true
+        mark_threshold: 0
+        update_footprint_enabled: true
+        combination_method: 1       # max
+        origin_z: 0.0
+        publish_voxel_map: true
+        transform_tolerance: 0.2
+        mapping_mode: false
+        map_save_duration: 60.0
+        observation_sources: depth_mark depth_clear
+        depth_mark:
+          data_type: PointCloud2
+          topic: /depth_camera/points
+          marking: true
+          clearing: false
+          obstacle_range: 2.5       # depth noise grows fast past this
+          min_obstacle_height: 0.05 # drop floor returns
+          max_obstacle_height: 1.8  # above robot top
+          # 0 = off. STVL only counts a message as an update if it has valid
+          # points, so on the glossy floor an empty-but-healthy camera would
+          # warn constantly. Camera liveness needs its own watchdog on the
+          # depth image rate instead.
+          expected_update_rate: 0.0
+          observation_persistence: 0.0
+          inf_is_valid: false
+          filter: "voxel"           # downsample 76.8k pts/frame on-CPU
+          voxel_min_points: 2       # reject single-pixel speckle
+          clear_after_reading: true
+        depth_clear:
+          data_type: PointCloud2
+          topic: /depth_camera/points
+          marking: false
+          clearing: true
+          max_z: 2.5
+          min_z: 0.1
+          vertical_fov_angle: 1.03  # rad, 2*atan(120/212) at 320x240
+          horizontal_fov_angle: 1.29 # rad, 2*atan(160/212)
+          decay_acceleration: 5.0   # in-view voxels not re-seen vanish fast
+          model_type: 0             # depth camera frustum
+          expected_update_rate: 0.0
+          observation_persistence: 0.0
+          inf_is_valid: false
+          filter: ""
+          clear_after_reading: true
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
         inflation_radius: 0.55
-      voxel_layer:
-        plugin: "nav2_costmap_2d::VoxelLayer"
+      # LiDAR is a single plane, so a 2D ObstacleLayer is enough. It was a
+      # VoxelLayer, but with a VoxelLayer in the same costmap the stvl_layer
+      # grid stayed empty (0 voxels) - reproduced 2026-10-05 with the live
+      # parameter dump; ObstacleLayer + STVL marks normally.
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        publish_voxel_map: True
-        origin_z: 0.0
-        z_resolution: 0.05
-        z_voxels: 16
-        max_obstacle_height: 2.0
-        mark_threshold: 0
         observation_sources: scan
         scan:
           topic: /scan

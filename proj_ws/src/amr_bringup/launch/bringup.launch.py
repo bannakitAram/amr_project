@@ -54,9 +54,9 @@ def generate_launch_description():
         'foxglove_port', default_value='8765',
         description='TCP port for the Foxglove WebSocket server')
     declare_use_depth_camera = DeclareLaunchArgument(
-        'depth_camera', default_value='false',
-        description='Launch the YDLIDAR HP60C depth camera (ascamera) + TF bridge; '
-                     'set true once the camera is physically connected')
+        'depth_camera', default_value='true',
+        description='Launch the YDLIDAR HP60C depth camera (depth-only -> /depth_camera/points) '
+                     'for Nav2 obstacle avoidance; set false if the camera is unplugged')
     declare_use_slam = DeclareLaunchArgument(
         'slam', default_value='true',
         description='Launch slam_toolbox for mapping. Mutually exclusive with navigation '
