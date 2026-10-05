@@ -65,8 +65,8 @@ amcl:
     sigma_hit: 0.15
     tf_broadcast: true
     transform_tolerance: 1.0
-    update_min_a: 0.1
-    update_min_d: 0.1
+    update_min_a: 0.05   # was 0.1 - keep updating during slow final approach + in-place yaw correction
+    update_min_d: 0.05   # was 0.1 - ~every scan at 0.5 m/s (C3 ~10 Hz); watch CPU (amcl history of 50%+)
     z_hit: 0.8
     z_max: 0.05
     z_rand: 0.2
