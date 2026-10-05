@@ -138,6 +138,13 @@ const float ODOM_FILTER_ALPHA_R = 0.08f;
 const float SPEED_DEADBAND = 0.003f;   // V9.7: แน่นขึ้น
 const unsigned long CONTROL_PERIOD_MS = 50;
 const unsigned long VELOCITY_WINDOW_MS = 100;
+// Window for the ODOMETRY speed only (pose + /wheel/odom twist + slip check).
+// The PID path (raw_speed_l/r) still uses the oldest history slot = 5 ticks
+// = ~250 ms (the tuned V9.x behaviour) - do NOT shorten that without
+// re-tuning the PID. The odom path instead picks the newest history slot
+// that is at least ODOM_WINDOW_MS old (150 ms at the 50 ms tick, i.e.
+// ~75 ms mean delay instead of ~125 ms) and needs no EMA on top.
+const unsigned long ODOM_WINDOW_MS = 150;
 
 // ============================================================
 // ACCELERATION RAMP
@@ -289,6 +296,10 @@ float control_speed_l = 0.0f;
 float control_speed_r = 0.0f;
 float odom_speed_l = 0.0f;
 float odom_speed_r = 0.0f;
+// Odometry speed from the ODOM_WINDOW_MS window (no EMA) - published in the
+// /wheel/odom twist and used for pose integration and slip detection.
+float odom_win_speed_l = 0.0f;
+float odom_win_speed_r = 0.0f;
 
 // ============================================================
 // PID STATE
@@ -346,6 +357,11 @@ unsigned long last_imu_pub_time = 0;
 // matches the ranges used on the (now retired) Arduino Mega IMU prototype.
 #define MPU6050_ACCEL_LSB_PER_G   4096.0f
 #define MPU6050_GYRO_LSB_PER_DPS  65.5f
+// Yaw-rate scale correction (datasheet sensitivity is only +-3%). Measure
+// with amr_calib_panel.py section 4 (gyro_scale = real angle / integrated
+// angle, rotating the robot against a floor mark - wheel slip has no
+// effect on it). 1.0 = uncalibrated.
+const float GYRO_SCALE_Z = 1.0084f;  // calibrated 2026-10-02: 5-turn hand rotation, CW+CCW mean 1785.0 deg vs 1800 deg
 
 bool mpu_ok = false;
 
@@ -432,9 +448,26 @@ bool mpu6050_read_regs(uint8_t reg, uint8_t *buf, uint8_t len)
   return true;
 }
 
+// Bus recovery: an STM32 reset (e.g. re-flash) mid-read leaves the MPU
+// still driving SDA low partway through a byte, and every later START then
+// fails - mpu6050_init() returned false and /imu/data published all zeros
+// until a power cycle. Clock SCL up to 9 times until the slave releases
+// SDA, then issue a STOP (standard I2C bus-clear procedure).
+void i2c_bus_recover()
+{
+  i2c_sda_release(); i2c_scl_release(); delayMicroseconds(5);
+  for (uint8_t i = 0; i < 9 && digitalRead(IMU_SDA_PIN) == LOW; i++)
+  {
+    i2c_scl_low(); delayMicroseconds(5);
+    i2c_scl_release(); delayMicroseconds(5);
+  }
+  i2c_scl_low(); delayMicroseconds(5);
+  i2c_stop();
+}
+
 bool mpu6050_init()
 {
-  i2c_sda_release(); i2c_scl_release();
+  i2c_bus_recover();
 
   uint8_t whoami = 0;
   if (!mpu6050_read_regs(MPU6050_REG_WHOAMI, &whoami, 1)) return false;
@@ -444,7 +477,11 @@ bool mpu6050_init()
   // MPU6500 under the same silkscreen/pinout, a common substitution.)
   if (whoami != 0x68 && whoami != 0x69 && whoami != 0x70 && whoami != 0x71) return false;
 
-  if (!mpu6050_write_reg(MPU6050_REG_PWR_MGMT_1, 0x00)) return false;  // wake from sleep
+  // Wake from sleep with CLKSEL=1 (PLL referenced to the gyro X MEMS
+  // oscillator) rather than 0 (internal 20MHz RC). The datasheet
+  // recommends the PLL for gyro stability; suspected cause of the
+  // isolated per-axis gyro spikes seen while stationary (accel clean).
+  if (!mpu6050_write_reg(MPU6050_REG_PWR_MGMT_1, 0x01)) return false;
   delay(10);
   if (!mpu6050_write_reg(MPU6050_REG_ACCEL_CONFIG, 0x10)) return false;  // +-8g
   if (!mpu6050_write_reg(MPU6050_REG_GYRO_CONFIG, 0x08)) return false;   // +-500 dps
@@ -554,7 +591,25 @@ bool wheel_slip_detected = false;
 // STOP_SPEED_THRESHOLD already draw elsewhere in this file.
 // ============================================================
 bool robot_stationary = false;
-const float ZUPT_ALPHA = 0.01f;  // time constant ~= 1/(ZUPT_ALPHA * 20Hz) = ~5s
+const float ZUPT_ALPHA = 0.004f; // time constant ~= 1/(ZUPT_ALPHA * 50Hz) = ~5s (IMU_PUBLISH_PERIOD_MS)
+// Only update bias while |raw - bias| < ~0.5 deg/s on every axis (65.5 LSB
+// per deg/s at FS_SEL=1). Thermal drift is far slower than this; real
+// rotation is far faster - see the gate in publish_imu().
+const float ZUPT_GYRO_GATE_LSB = 0.5f * MPU6050_GYRO_LSB_PER_DPS;
+const uint8_t ZUPT_QUIET_SAMPLES = 25;  // 0.5 s at 50 Hz
+uint8_t zupt_quiet_count = 0;
+// Recovery for a bias that is already off by more than the gate above
+// (e.g. boot calibration taken while the gyro was still settling - the
+// narrow gate alone measured 128 deg/min of drift at rest that it could
+// never correct). While the wheels are stationary, collect a window of
+// samples; if every axis stays within ZUPT_SNAP_RANGE_LSB peak-to-peak (a
+// held, still sensor - hand rotation is never this steady) and its mean is
+// within ZUPT_SNAP_MAX_LSB of the current bias, snap the bias to that mean.
+const uint16_t ZUPT_SNAP_SAMPLES = 100;                                  // 2 s at 50 Hz
+const float ZUPT_SNAP_RANGE_LSB = 0.6f * MPU6050_GYRO_LSB_PER_DPS;       // peak-to-peak (sensor noise ~0.3 p-p)
+const float ZUPT_SNAP_MAX_LSB = 5.0f * MPU6050_GYRO_LSB_PER_DPS;         // plausible bias error
+uint16_t zupt_snap_count = 0;
+float zupt_snap_sum[3], zupt_snap_min[3], zupt_snap_max[3];
 
 void calibrate_imu_bias(uint16_t samples)
 {
@@ -610,6 +665,7 @@ rcl_publisher_t odom_publisher;
 rcl_publisher_t left_pulse_publisher;
 rcl_publisher_t right_pulse_publisher;
 rcl_publisher_t raw_distance_publisher;
+rcl_publisher_t slip_publisher;
 rcl_publisher_t imu_publisher;
 
 geometry_msgs__msg__Twist msg_twist;
@@ -620,6 +676,7 @@ nav_msgs__msg__Odometry odom_msg;
 std_msgs__msg__Int32 left_pulse_msg;
 std_msgs__msg__Int32 right_pulse_msg;
 std_msgs__msg__Float32 raw_distance_msg;
+std_msgs__msg__Bool slip_msg;
 sensor_msgs__msg__Imu imu_msg;
 
 // Cumulative signed distance integrated straight from raw_speed_l/r (the
@@ -796,6 +853,7 @@ bool create_entities()
   if (rclc_publisher_init_default(&left_pulse_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "wheel/left/pulse_count") != RCL_RET_OK) return false;
   if (rclc_publisher_init_default(&right_pulse_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "wheel/right/pulse_count") != RCL_RET_OK) return false;
   if (rclc_publisher_init_default(&raw_distance_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32), "wheel/raw_distance") != RCL_RET_OK) return false;
+  if (rclc_publisher_init_default(&slip_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "wheel/slip_detected") != RCL_RET_OK) return false;
   if (rclc_publisher_init_default(&imu_publisher, &node, ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu), "imu/data") != RCL_RET_OK) return false;
 
   // EXECUTOR
@@ -808,6 +866,19 @@ bool create_entities()
   // ODOM FRAME NAMES
   rosidl_runtime_c__String__assign(&odom_msg.header.frame_id, "odom");
   rosidl_runtime_c__String__assign(&odom_msg.child_frame_id, "base_link");
+
+  // ODOM TWIST COVARIANCE - was never set (all zero), which robot_localization
+  // treats as near-infinite confidence, so the EKF effectively ignored the
+  // gyro's vyaw. Row-major 6x6 (vx, vy, vz, wx, wy, wz). vyaw is set much
+  // looser than the gyro (angular_velocity_covariance z = 0.001) so heading
+  // follows the gyro when one wheel slips; vx stays tight - wheels are the
+  // only forward-velocity source.
+  odom_msg.twist.covariance[0]  = 0.002;  // vx
+  odom_msg.twist.covariance[7]  = 0.002;  // vy (diff drive: ~0, not fused)
+  odom_msg.twist.covariance[14] = 1e6;    // vz
+  odom_msg.twist.covariance[21] = 1e6;    // wx
+  odom_msg.twist.covariance[28] = 1e6;    // wy
+  odom_msg.twist.covariance[35] = 0.05;   // vyaw - 50x looser than the gyro
 
   // IMU FRAME NAME + orientation covariance[0] = -1 means "orientation not
   // computed" (REP 145) - accel/gyro readings themselves are real (see
@@ -866,6 +937,7 @@ void destroy_entities()
   (void) rcl_publisher_fini(&left_pulse_publisher, &node);
   (void) rcl_publisher_fini(&right_pulse_publisher, &node);
   (void) rcl_publisher_fini(&raw_distance_publisher, &node);
+  (void) rcl_publisher_fini(&slip_publisher, &node);
   (void) rcl_publisher_fini(&imu_publisher, &node);
 
   (void) rcl_subscription_fini(&subscriber, &node);
@@ -886,6 +958,7 @@ void reset_speed_controller()
   raw_speed_l = 0.0f; raw_speed_r = 0.0f;
   control_speed_l = 0.0f; control_speed_r = 0.0f;
   odom_speed_l = 0.0f; odom_speed_r = 0.0f;
+  odom_win_speed_l = 0.0f; odom_win_speed_r = 0.0f;
   prev_error_l = 0.0f; prev_error_r = 0.0f;
   integral_l = 0.0f; integral_r = 0.0f;
   desired_dac_l = 0.0f; desired_dac_r = 0.0f;
@@ -981,6 +1054,8 @@ void update_velocity_estimator(long count_l, long count_r, unsigned long now)
     history_initialized = true;
     raw_speed_l = 0.0f;
     raw_speed_r = 0.0f;
+    odom_win_speed_l = 0.0f;
+    odom_win_speed_r = 0.0f;
     return;
   }
 
@@ -1004,6 +1079,21 @@ void update_velocity_estimator(long count_l, long count_r, unsigned long now)
     {
       raw_speed_l = distance_l / dt;
       raw_speed_r = distance_r / dt;
+    }
+  }
+
+  // Odometry window: newest slot (k ticks back) that is >= ODOM_WINDOW_MS
+  // old. If none qualifies yet (start-up / long tick gaps) keep last value.
+  for (int k = 1; k < VELOCITY_HISTORY_SIZE; k++)
+  {
+    int idx = (history_index - k + VELOCITY_HISTORY_SIZE) % VELOCITY_HISTORY_SIZE;
+    unsigned long age_ms = now - time_history[idx];
+    if (age_ms >= ODOM_WINDOW_MS)
+    {
+      float inv_dt = 1000.0f / (float)age_ms;
+      odom_win_speed_l = ((float)(velocity_pulse_l - pulse_history_l[idx]) / ENCODER_PPR) * wheel_circumference_l * inv_dt;
+      odom_win_speed_r = ((float)(velocity_pulse_r - pulse_history_r[idx]) / ENCODER_PPR) * wheel_circumference_r * inv_dt;
+      break;
     }
   }
   history_index = (history_index + 1) % VELOCITY_HISTORY_SIZE;
@@ -1308,8 +1398,8 @@ void update_and_publish_odom()
   robot_stationary = false;
   if (fabs(target_speed_l) < STOP_TARGET_THRESHOLD && fabs(target_speed_r) < STOP_TARGET_THRESHOLD)
   {
-    if (fabs(raw_speed_l) < STOP_SPEED_THRESHOLD) odom_speed_l = 0.0f;
-    if (fabs(raw_speed_r) < STOP_SPEED_THRESHOLD) odom_speed_r = 0.0f;
+    if (fabs(raw_speed_l) < STOP_SPEED_THRESHOLD) { odom_speed_l = 0.0f; odom_win_speed_l = 0.0f; }
+    if (fabs(raw_speed_r) < STOP_SPEED_THRESHOLD) { odom_speed_r = 0.0f; odom_win_speed_r = 0.0f; }
     // Also true stationary for ZUPT gyro bias tracking - see its
     // declaration comment - same commanded+measured check as above.
     if (fabs(raw_speed_l) < STOP_SPEED_THRESHOLD && fabs(raw_speed_r) < STOP_SPEED_THRESHOLD)
@@ -1341,18 +1431,16 @@ void update_and_publish_odom()
   raw_distance_msg.data = raw_distance_traveled;
   rcl_publish(&raw_distance_publisher, &raw_distance_msg, NULL);
 
-  // RAW (UNFILTERED-BY-ODOM_FILTER_ALPHA) YAW RATE - same rationale as
-  // v_raw/raw_distance_traveled above. ODOM_FILTER_ALPHA=0.08 at
-  // CONTROL_PERIOD_MS=50ms gives a ~625ms EMA time constant, which made
-  // pose_theta (and the /wheel/odom vyaw the EKF fuses) lag real heading
-  // changes by up to ~1-2s - the robot visibly finished turning well
-  // before its map icon caught up. w_raw drives pose integration and the
-  // published twist instead of the heavily-filtered w below.
-  float w_raw = (raw_speed_r - raw_speed_l) / wheel_sep;
-
-  // ODOMETRY CALCULATION
-  float v = (odom_speed_r + odom_speed_l) / 2.0f;
-  float w = (odom_speed_r - odom_speed_l) / wheel_sep;
+  // ODOMETRY CALCULATION - from the ODOM_WINDOW_MS windowed speed with NO
+  // EMA on top. ODOM_FILTER_ALPHA=0.08 at CONTROL_PERIOD_MS=50ms gives a
+  // ~625ms EMA time constant, which made pose_theta and the /wheel/odom
+  // twist lag real motion by up to ~1-2s (the robot visibly finished
+  // turning well before its map icon caught up; linear.x still carried
+  // that lag until now). v and w both use the same shorter window so pose,
+  // twist and the gyro slip check are mutually consistent. PID feedback
+  // is unchanged (raw_speed_l/r -> control_speed_l/r).
+  float v = (odom_win_speed_r + odom_win_speed_l) / 2.0f;
+  float w = (odom_win_speed_r - odom_win_speed_l) / wheel_sep;
 
   // WHEEL SLIP DETECTION - see its declaration comment for why this
   // compares against the gyro instead of trusting encoders alone.
@@ -1374,9 +1462,13 @@ void update_and_publish_odom()
     slip_mismatch_active = false;
     wheel_slip_detected = false;
   }
+  // Published every odom cycle (not just on change) so a late subscriber
+  // or a dropped message can't leave a stale "true" latched downstream.
+  slip_msg.data = wheel_slip_detected;
+  rcl_publish(&slip_publisher, &slip_msg, NULL);
 
   float delta_s = v * dt;
-  float delta_theta = w_raw * dt;
+  float delta_theta = w * dt;
 
   pose_x += delta_s * cos(pose_theta + delta_theta / 2.0f);
   pose_y += delta_s * sin(pose_theta + delta_theta / 2.0f);
@@ -1403,7 +1495,7 @@ void update_and_publish_odom()
 
   // VELOCITY
   odom_msg.twist.twist.linear.x = v;
-  odom_msg.twist.twist.angular.z = w_raw;
+  odom_msg.twist.twist.angular.z = w;
 
   rcl_publish(&odom_publisher, &odom_msg, NULL);
 }
@@ -1458,17 +1550,47 @@ int16_t median3(int16_t a, int16_t b, int16_t c)
 // leaves linear_acceleration/angular_velocity at their last (zero-
 // initialized) values rather than publishing stale/garbage reads.
 // ============================================================
+// IMU publish rate: 50 Hz (was 20 Hz) - halves the sample-and-hold lag
+// (~25 -> ~10 ms) and removes most gyro aliasing (DLPF ~20 Hz vs 10 Hz
+// Nyquist at 20 Hz). DLPF is left at ~20 Hz on purpose: a wider DLPF
+// would alias again at 50 Hz sampling (Nyquist 25 Hz).
+const unsigned long IMU_PUBLISH_PERIOD_MS = 20;
+
+// CPU cost control: bit-banged I2C makes one 14-byte read ~1-1.5 ms
+// (estimate), so the old median-of-3 on EVERY publish would cost ~20% of
+// the main loop at 50 Hz. Instead take ONE read and accept it only if it
+// is close to the previous accepted sample (a real 20 ms change is small;
+// the corruption seen so far were huge single-bit-in-high-byte jumps).
+// If it jumps beyond the gates, fall back to the full median-of-3 (2 more
+// reads), so glitch protection is unchanged for the cases that matter and
+// CPU stays ~at the old 20 Hz level. Residual risk: a low-bit flip below
+// the gate passes for one 20 ms sample (bounded error <= gate, ~7.6 deg/s
+// gyro / 0.25 g accel) - tighten the gates or drop to median-of-3 always
+// if such spikes appear.
+const int16_t IMU_GATE_GYRO_COUNTS  = 500;   // ~7.6 deg/s per 20 ms
+const int16_t IMU_GATE_ACCEL_COUNTS = 1024;  // ~0.25 g per 20 ms
+int16_t imu_prev_raw[6];                     // ax ay az gx gy gz, last accepted
+bool imu_prev_valid = false;
+
 void publish_imu()
 {
   unsigned long now = millis();
-  if (now - last_imu_pub_time < 50) return;
-  last_imu_pub_time = now;
+  if (now - last_imu_pub_time < IMU_PUBLISH_PERIOD_MS) return;
+  // Advance by whole periods (no drift from loop jitter); resync if we
+  // fell more than one period behind (e.g. blocked by a time sync).
+  if (now - last_imu_pub_time >= 2 * IMU_PUBLISH_PERIOD_MS) last_imu_pub_time = now;
+  else last_imu_pub_time += IMU_PUBLISH_PERIOD_MS;
 
   int64_t time_ms = rmw_uros_epoch_millis();
   imu_msg.header.stamp.sec = time_ms / 1000;
   imu_msg.header.stamp.nanosec = (time_ms % 1000) * 1000000;
 
-  if (mpu_ok)
+  // No IMU (init failed): publish nothing rather than an all-zero message -
+  // with vyaw fused in ekf.yaml, zeros would be trusted as "not rotating"
+  // and corrupt heading on every turn. Without /imu/data the EKF falls back
+  // to wheel odometry alone.
+  if (!mpu_ok) return;
+
   {
     // Sanity-check + median-of-3 against bit-bang I2C glitches: an
     // encoder ISR (L_HAL_ISR/R_HAL_ISR) firing mid-transaction can skew
@@ -1495,6 +1617,8 @@ void publish_imu()
     // values instead (with a fresh timestamp).
     int16_t ax3[3], ay3[3], az3[3], gx3[3], gy3[3], gz3[3];
     uint8_t got = 0;
+    int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+    bool have = false;
     for (uint8_t i = 0; i < 3; i++)
     {
       uint8_t raw[14];
@@ -1507,17 +1631,37 @@ void publish_imu()
       gy3[got] = (raw[10] << 8) | raw[11];
       gz3[got] = (raw[12] << 8) | raw[13];
       got++;
+
+      // Fast path: first read close to the previous accepted sample ->
+      // accept it alone (see IMU_GATE_* comment).
+      if (i == 0 && imu_prev_valid &&
+          abs(ax3[0] - imu_prev_raw[0]) < IMU_GATE_ACCEL_COUNTS &&
+          abs(ay3[0] - imu_prev_raw[1]) < IMU_GATE_ACCEL_COUNTS &&
+          abs(az3[0] - imu_prev_raw[2]) < IMU_GATE_ACCEL_COUNTS &&
+          abs(gx3[0] - imu_prev_raw[3]) < IMU_GATE_GYRO_COUNTS &&
+          abs(gy3[0] - imu_prev_raw[4]) < IMU_GATE_GYRO_COUNTS &&
+          abs(gz3[0] - imu_prev_raw[5]) < IMU_GATE_GYRO_COUNTS)
+      {
+        ax = ax3[0]; ay = ay3[0]; az = az3[0];
+        gx = gx3[0]; gy = gy3[0]; gz = gz3[0];
+        have = true;
+        break;
+      }
     }
 
-    if (got == 3)
+    if (!have && got == 3)
     {
-      int16_t ax = median3(ax3[0], ax3[1], ax3[2]);
-      int16_t ay = median3(ay3[0], ay3[1], ay3[2]);
-      int16_t az = median3(az3[0], az3[1], az3[2]);
-      int16_t gx = median3(gx3[0], gx3[1], gx3[2]);
-      int16_t gy = median3(gy3[0], gy3[1], gy3[2]);
-      int16_t gz = median3(gz3[0], gz3[1], gz3[2]);
+      ax = median3(ax3[0], ax3[1], ax3[2]);
+      ay = median3(ay3[0], ay3[1], ay3[2]);
+      az = median3(az3[0], az3[1], az3[2]);
+      gx = median3(gx3[0], gx3[1], gx3[2]);
+      gy = median3(gy3[0], gy3[1], gy3[2]);
+      gz = median3(gz3[0], gz3[1], gz3[2]);
+      have = true;
+    }
 
+    if (have)
+    {
       const int16_t GYRO_RAW_SANITY_MAX = 20000;   // ~305 deg/s - normal operation shouldn't approach this
       const int16_t ACCEL_RAW_SANITY_MAX = 30000;  // ~7.3g - normal operation/vibration shouldn't approach this
       bool sane =
@@ -1526,15 +1670,72 @@ void publish_imu()
 
       if (!sane)
       {
+        imu_prev_valid = false;  // next publish must re-verify with median-of-3
         rcl_publish(&imu_publisher, &imu_msg, NULL);
         return;
       }
+      imu_prev_raw[0] = ax; imu_prev_raw[1] = ay; imu_prev_raw[2] = az;
+      imu_prev_raw[3] = gx; imu_prev_raw[4] = gy; imu_prev_raw[5] = gz;
+      imu_prev_valid = true;
 
       // ZUPT: slowly track thermal drift while genuinely stationary -
       // see robot_stationary's declaration comment. Uses the clean
       // (sanity-checked, median-of-3) raw counts above, not raw byte
       // reads, so a glitched sample can't corrupt the bias estimate.
+      //
+      // Gated on the gyro itself also reading ~zero rate: robot_stationary
+      // only proves the WHEELS aren't turning, but the body can still be
+      // rotating (pushed/turned by hand, wheels skidding or lifted). Without
+      // this gate ZUPT absorbed real rotation into the bias - measured hand
+      // rotation of 5 turns lost 4-15% (more the slower it was turned).
+      // ZUPT_QUIET_SAMPLES consecutive quiet samples are also required so
+      // the start/end of a rotation (rate passing through zero) isn't used.
+      bool gyro_quiet =
+          fabsf(gx - gyro_bias_x) < ZUPT_GYRO_GATE_LSB &&
+          fabsf(gy - gyro_bias_y) < ZUPT_GYRO_GATE_LSB &&
+          fabsf(gz - gyro_bias_z) < ZUPT_GYRO_GATE_LSB;
+      if (robot_stationary && gyro_quiet)
+      {
+        if (zupt_quiet_count < ZUPT_QUIET_SAMPLES) zupt_quiet_count++;
+      }
+      else
+      {
+        zupt_quiet_count = 0;
+      }
+
       if (robot_stationary)
+      {
+        const float g[3] = {(float)gx, (float)gy, (float)gz};
+        bool steady = true;
+        for (uint8_t i = 0; i < 3; i++)
+        {
+          if (zupt_snap_count == 0) { zupt_snap_sum[i] = 0.0f; zupt_snap_min[i] = g[i]; zupt_snap_max[i] = g[i]; }
+          zupt_snap_sum[i] += g[i];
+          if (g[i] < zupt_snap_min[i]) zupt_snap_min[i] = g[i];
+          if (g[i] > zupt_snap_max[i]) zupt_snap_max[i] = g[i];
+          if (zupt_snap_max[i] - zupt_snap_min[i] > ZUPT_SNAP_RANGE_LSB) steady = false;
+        }
+        zupt_snap_count = steady ? zupt_snap_count + 1 : 0;
+        if (zupt_snap_count >= ZUPT_SNAP_SAMPLES)
+        {
+          float mx = zupt_snap_sum[0] / zupt_snap_count;
+          float my = zupt_snap_sum[1] / zupt_snap_count;
+          float mz = zupt_snap_sum[2] / zupt_snap_count;
+          if (fabsf(mx - gyro_bias_x) < ZUPT_SNAP_MAX_LSB &&
+              fabsf(my - gyro_bias_y) < ZUPT_SNAP_MAX_LSB &&
+              fabsf(mz - gyro_bias_z) < ZUPT_SNAP_MAX_LSB)
+          {
+            gyro_bias_x = mx; gyro_bias_y = my; gyro_bias_z = mz;
+          }
+          zupt_snap_count = 0;
+        }
+      }
+      else
+      {
+        zupt_snap_count = 0;
+      }
+
+      if (zupt_quiet_count >= ZUPT_QUIET_SAMPLES)
       {
         gyro_bias_x += ZUPT_ALPHA * (gx - gyro_bias_x);
         gyro_bias_y += ZUPT_ALPHA * (gy - gyro_bias_y);
@@ -1560,7 +1761,7 @@ void publish_imu()
       imu_msg.linear_acceleration.z = ((az - accel_bias_z) / MPU6050_ACCEL_LSB_PER_G) * IMU_G_TO_MS2;
       imu_msg.angular_velocity.x = -(((gx - gyro_bias_x) / MPU6050_GYRO_LSB_PER_DPS) * IMU_DEG_TO_RAD);
       imu_msg.angular_velocity.y = -(((gy - gyro_bias_y) / MPU6050_GYRO_LSB_PER_DPS) * IMU_DEG_TO_RAD);
-      imu_msg.angular_velocity.z = ((gz - gyro_bias_z) / MPU6050_GYRO_LSB_PER_DPS) * IMU_DEG_TO_RAD;
+      imu_msg.angular_velocity.z = ((gz - gyro_bias_z) / MPU6050_GYRO_LSB_PER_DPS) * IMU_DEG_TO_RAD * GYRO_SCALE_Z;
 
       // For wheel-slip detection (see its declaration comment) -
       // update_and_publish_odom() reads this to compare against its own
@@ -1597,8 +1798,15 @@ void setup()
   Serial.begin(115200);
   set_microros_serial_transports(Serial);
 
-  mpu_ok = mpu6050_init();
-  if (mpu_ok) calibrate_imu_bias(300);  // ~1s @ 3ms/sample - robot must be still AND level
+  for (uint8_t attempt = 0; attempt < 5 && !mpu_ok; attempt++)
+  {
+    mpu_ok = mpu6050_init();
+    if (!mpu_ok) delay(50);
+  }
+  // Let the gyro settle after wake (output drifts for the first ~1s) before
+  // averaging, and average longer - a bad boot bias is no longer silently
+  // pulled in by ZUPT's narrow gate (see ZUPT_SNAP_* for the recovery path).
+  if (mpu_ok) { delay(1000); calibrate_imu_bias(600); }  // ~2s @ 3ms/sample - robot must be still AND level
 
   state = WAITING_AGENT;
   last_control_time = millis();
