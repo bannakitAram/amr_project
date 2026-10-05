@@ -112,6 +112,19 @@ def generate_launch_description():
         }.items()
     )
 
+    # 3b) Drop LiDAR returns that hit the robot's own body -> /scan_filtered
+    #     (Nav2 costmaps + collision_monitor use it; SLAM/AMCL keep /scan).
+    #     See config/laser_filter.yaml.
+    laser_filter_node = Node(
+        package='laser_filters',
+        executable='scan_to_scan_filter_chain',
+        name='scan_to_scan_filter_chain',
+        output='screen',
+        parameters=[os.path.join(pkg_bringup, 'config', 'laser_filter.yaml'),
+                    {'use_sim_time': use_sim_time}],
+        remappings=[('scan', 'scan'), ('scan_filtered', 'scan_filtered')],
+    )
+
     # 4) robot_localization EKF (รอ micro-ROS 2 วินาทีเพื่อให้มีข้อมูล /odom/wheel เข้ามาก่อน)
     ekf_config = os.path.join(pkg_bringup, 'config', 'ekf.yaml')
     ekf_node = Node(
@@ -207,6 +220,7 @@ def generate_launch_description():
         micro_ros_agent_node,
         wheel_joint_state_publisher_node,
         rplidar_c1_launch,
+        laser_filter_node,
         delayed_ekf_node,
         delayed_slam_launch,
         delayed_navigation_launch,

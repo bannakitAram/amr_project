@@ -18,14 +18,15 @@
   <exec_depend>foxglove_bridge</exec_depend>
   <exec_depend>ascamera</exec_depend>
   <exec_depend>depth_image_proc</exec_depend>
+  <exec_depend>laser_filters</exec_depend>
   <exec_depend>rclcpp_components</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
-  <exec_depend>python3-numpy</exec_depend>
   <exec_depend>nav2_map_server</exec_depend>
 
   <export>

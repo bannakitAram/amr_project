@@ -374,7 +374,7 @@ local_costmap:
         enabled: True
         observation_sources: scan
         scan:
-          topic: /scan
+          topic: /scan_filtered   # self-hits removed: amr_bringup/config/laser_filter.yaml
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -402,7 +402,7 @@ global_costmap:
         enabled: True
         observation_sources: scan
         scan:
-          topic: /scan
+          topic: /scan_filtered   # self-hits removed: amr_bringup/config/laser_filter.yaml
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -512,20 +512,45 @@ collision_monitor:
     source_timeout: 1.0
     base_shift_correction: True
     stop_pub_timeout: 2.0
-    polygons: ["FootprintApproach"]
+    polygons: ["FrontStop", "FootprintApproach"]
+    # Hard stop zone ahead of the bumper. Needed because the HP60C cannot see
+    # closer than ~0.28 m from the lens (~0.27 m ahead of the footprint):
+    # FootprintApproach alone only starts slowing at v*1.2 s = 0.24 m @0.2 m/s,
+    # i.e. after a depth-only obstacle (below the LiDAR plane) has already
+    # vanished into the blind zone - the robot would drive into it. Stopping
+    # at 0.35 m keeps the obstacle in view, so the robot stays stopped until
+    # it is removed. Braking @0.2 m/s, -0.5 m/s^2 ~4 cm + ~2.5 cm camera
+    # latency -> expect a stop ~0.28-0.30 m short of the object.
+    # Humble applies every observation source to every polygon, so the
+    # LiDAR also triggers this (e.g. walls when docking).
+    FrontStop:
+      type: "polygon"
+      action_type: "stop"
+      # x,y pairs in base_footprint: bumper (0.49) .. +0.35 m, width +-0.29
+      points: [0.84, 0.29, 0.84, -0.29, 0.49, -0.29, 0.49, 0.29]
+      max_points: 5          # Humble: act when MORE than this many points inside
+      visualize: True
+      polygon_pub_topic: "polygon_front_stop"
+      enabled: True
     FootprintApproach:
       type: "polygon"
       action_type: "approach"
       footprint_topic: "/local_costmap/published_footprint"
       time_before_collision: 1.2
       simulation_time_step: 0.1
-      min_points: 6
+      max_points: 3          # Humble name (min_points is Iron+ and was ignored)
       visualize: False
       enabled: True
-    observation_sources: ["scan"]
+    observation_sources: ["scan", "depth"]
     scan:
       type: "scan"
-      topic: "/scan"
+      topic: "/scan_filtered"   # self-hits removed: amr_bringup/config/laser_filter.yaml
       min_height: 0.05
       max_height: 2.0
+      enabled: True
+    depth:
+      type: "pointcloud"
+      topic: "/depth_camera/points"
+      min_height: 0.05
+      max_height: 1.8
       enabled: True

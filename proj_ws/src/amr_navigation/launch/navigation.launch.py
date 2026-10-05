@@ -71,6 +71,12 @@ def generate_launch_description():
         name='controller_server',
         output='screen',
         parameters=common_params,
+        # Raw MPPI output must NOT go straight to "cmd_vel": stm32_motor_node
+        # listens there, so it would bypass velocity_smoother and
+        # collision_monitor (the robot did not stop for a depth-only
+        # obstacle, 2026-10-05). Chain: cmd_vel_nav -> velocity_smoother ->
+        # cmd_vel_smoothed -> collision_monitor -> cmd_vel.
+        remappings=[('cmd_vel', 'cmd_vel_nav')],
     )
     planner_node = Node(
         package='nav2_planner',
@@ -92,6 +98,9 @@ def generate_launch_description():
         name='behavior_server',
         output='screen',
         parameters=common_params,
+        # Spin/backup/drive_on_heading also go through the smoother and
+        # collision_monitor - see controller_server above.
+        remappings=[('cmd_vel', 'cmd_vel_nav')],
     )
     bt_navigator_node = Node(
         package='nav2_bt_navigator',
@@ -120,6 +129,9 @@ def generate_launch_description():
         name='velocity_smoother',
         output='screen',
         parameters=common_params,
+        # Input from controller/behavior servers. Without this it subscribed
+        # to "cmd_vel" itself, i.e. to collision_monitor's output - a loop.
+        remappings=[('cmd_vel', 'cmd_vel_nav')],
     )
     # LiDAR-based independent safety layer, sitting between the smoother and
     # the robot: slows/stops any outgoing cmd_vel if the configured

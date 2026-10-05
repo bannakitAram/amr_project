@@ -1,0 +1,25 @@
+# /scan -> /scan_filtered for Nav2 obstacle sources (costmaps + collision_monitor).
+#
+# The RPLIDAR is mounted facing backwards (lidar_link yaw = 180 deg) and hits
+# the robot's own rear frame/posts: ~20 returns land INSIDE the footprint
+# (e.g. base_footprint (-0.24, +0.22), (-0.49, -0.25), (-0.14, -0.24);
+# measured 2026-10-05). collision_monitor's FootprintApproach then sees a
+# "collision" at t=0 and clamps every cmd_vel to 0 - the robot cannot move.
+#
+# The box is the footprint from nav2_params.yaml (+-0.49 x +-0.26) plus 1 cm,
+# so it only removes points that are physically on the robot. SLAM/AMCL keep
+# using the raw /scan.
+scan_to_scan_filter_chain:
+  ros__parameters:
+    filter1:
+      name: robot_body
+      type: laser_filters/LaserScanBoxFilter
+      params:
+        box_frame: base_footprint
+        min_x: -0.50
+        max_x: 0.50
+        min_y: -0.27
+        max_y: 0.27
+        min_z: -1.0
+        max_z: 2.0
+        invert: false        # false = drop points INSIDE the box
