@@ -23,3 +23,7 @@ proj_ws/src/rosboard/
 
 # LibreOffice lock files
 .~lock.*
+
+# tf2_tools view_frames output (regenerate when needed)
+frames_*.gv
+frames_*.pdf
