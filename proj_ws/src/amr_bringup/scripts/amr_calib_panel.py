@@ -21,6 +21,7 @@ This tool only measures and displays a recommendation. It never edits
 firmware or URDF files itself - the operator applies the change by hand,
 re-flashes, and re-runs the test to confirm.
 """
+import json
 import math
 import os
 import signal
@@ -41,6 +42,9 @@ STRAIGHT_DISTANCE_DEFAULT = 3.0
 STRAIGHT_SPEED_DEFAULT = 0.15
 # Must match wheel_radius_l/_r in the STM32 firmware (nominal 0.128 m dia).
 WHEEL_RADIUS_NOMINAL = 0.064
+# Must match GYRO_SCALE_Z in the STM32 firmware (1.0 = uncalibrated).
+GYRO_SCALE_Z_NOMINAL = 1.0084
+GYRO_MOTOR_TURNS_DEFAULT = 5.0
 
 SAFETY_BANNER = (
     'ตรวจสอบให้พื้นที่รอบหุ่นยนต์โล่ง ไม่มีคน/สิ่งกีดขวางตลอดเส้นทางทดสอบ '
@@ -55,6 +59,8 @@ class CalibPanel(tk.Toplevel):
         self._on_close_extra = on_close
 
         self._proc = None
+        self._gyro_proc = None  # gyro_integrate_node.py, runs alongside the rotate test
+        self._last_gyro_deg = None
         self._poll_job = None
         self._active_test = None  # 'rotate' or 'straight'
         self._last_commanded_deg = None
@@ -116,6 +122,8 @@ class CalibPanel(tk.Toplevel):
         self._build_straight_section()
         ttk.Separator(content, orient='horizontal').pack(fill='x', pady=6)
         self._build_radius_section()
+        ttk.Separator(content, orient='horizontal').pack(fill='x', pady=6)
+        self._build_gyro_section()
 
         self.protocol('WM_DELETE_WINDOW', self._on_close)
 
@@ -166,6 +174,9 @@ class CalibPanel(tk.Toplevel):
         if self._proc is not None and self._proc.poll() is None:
             self._cancel_active()
             return
+        if self._active_test == 'gyro':
+            messagebox.showerror('กำลังบันทึก gyro', 'หยุดบันทึก gyro (หัวข้อ 4) ก่อน')
+            return
 
         try:
             turns = float(self.rotate_turns_var.get())
@@ -185,11 +196,21 @@ class CalibPanel(tk.Toplevel):
         self.btn_rotate_calc.config(state='disabled')
         self.rotate_measured_var.set('')
         self._last_commanded_deg = 360.0 * turns
+        self._last_gyro_deg = None
 
         self.btn_rotate.config(text='ยกเลิก (Cancel)')
         self.rotate_status.config(text='กำลังหมุน...')
         env = os.environ.copy()
         self._active_test = 'rotate'
+        # Integrate /imu/data yaw over the same rotation so the gyro's scale
+        # can be checked against the measured angle too (see
+        # gyro_integrate_node.py). Started first so it is subscribed before
+        # the robot moves; stopped with SIGINT when the rotate node exits.
+        self._gyro_proc = subprocess.Popen(
+            ['ros2', 'run', 'amr_bringup', 'gyro_integrate_node.py'],
+            preexec_fn=os.setsid, env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True)
         self._proc = subprocess.Popen(
             ['ros2', 'run', 'amr_bringup', 'calib_rotate_node.py',
              f'{turns:.4f}', f'{speed:.3f}'],
@@ -211,11 +232,24 @@ class CalibPanel(tk.Toplevel):
         commanded_deg = self._last_commanded_deg
         corrected = WHEEL_SEP_NOMINAL * commanded_deg / measured_deg
 
+        gyro_text = ''
+        gyro_deg = self._last_gyro_deg
+        if gyro_deg is not None and abs(gyro_deg) > 1.0:
+            gyro_err = (abs(gyro_deg) - abs(measured_deg)) / abs(measured_deg) * 100.0
+            gyro_text = (
+                f'\nมุมจาก gyro (/imu/data): {abs(gyro_deg):.1f} deg '
+                f'(error {gyro_err:+.2f}% เทียบมุมจริง)\n'
+                f'gyro_z_scale ที่แนะนำ: {abs(measured_deg) / abs(gyro_deg):.4f}\n'
+                '(error เกิน ±2% ควรแก้ scale ของ gyro z ใน firmware)\n')
+        elif gyro_deg is not None:
+            gyro_text = '\ngyro: ไม่พบการหมุนจาก /imu/data - ตรวจสอบ IMU\n'
+
         text = (
             f'มุมที่สั่ง (raw /wheel/odom): {commanded_deg:.1f} deg\n'
             f'มุมที่วัดได้จริง: {measured_deg:.1f} deg\n\n'
             f'wheel_sep ปัจจุบัน: {WHEEL_SEP_NOMINAL:.4f} m\n'
-            f'wheel_sep ที่แก้ไขแล้ว: {corrected:.4f} m\n\n'
+            f'wheel_sep ที่แก้ไขแล้ว: {corrected:.4f} m\n'
+            f'{gyro_text}\n'
             'ถ้าค่านี้ต่างจากค่าปัจจุบันอย่างมีนัยสำคัญ ให้แก้ไขทั้ง 3 จุดพร้อมกัน:\n'
             '  - stm/src/motor_control_with_pid_optimized.cpp: `wheel_sep`\n'
             '  - amr_description/urdf/amr.urdf.xacro: `wheel_separation`\n'
@@ -277,6 +311,9 @@ class CalibPanel(tk.Toplevel):
     def _on_click_straight(self):
         if self._proc is not None and self._proc.poll() is None:
             self._cancel_active()
+            return
+        if self._active_test == 'gyro':
+            messagebox.showerror('กำลังบันทึก gyro', 'หยุดบันทึก gyro (หัวข้อ 4) ก่อน')
             return
 
         try:
@@ -488,6 +525,320 @@ class CalibPanel(tk.Toplevel):
         self._set_result(self.radius_result, '\n'.join(lines))
 
     # ------------------------------------------------------------------
+    # Gyro scale by hand rotation (independent of wheel slip)
+    # ------------------------------------------------------------------
+    def _build_gyro_section(self):
+        frame = tk.LabelFrame(
+            self._content, text='4) Gyro scale (หมุนด้วยมือ หรือ มอเตอร์หมุนเอง)',
+            padx=10, pady=10)
+        frame.pack(fill='x', padx=10, pady=6)
+
+        mode_row = tk.Frame(frame)
+        mode_row.pack(fill='x', pady=2)
+        tk.Label(mode_row, text='โหมด:').pack(side='left')
+        self.gyro_mode_var = tk.StringVar(value='hand')
+        for value, label in (('hand', 'หมุนด้วยมือ'), ('motor', 'มอเตอร์หมุนเอง')):
+            tk.Radiobutton(
+                mode_row, text=label, value=value, variable=self.gyro_mode_var,
+                command=self._on_gyro_mode_change).pack(side='left', padx=4)
+
+        self.gyro_help = tk.Label(frame, anchor='w', justify='left', wraplength=560)
+        self.gyro_help.pack(fill='x')
+
+        # Motor mode only: commanded via calib_rotate_node.py (stops on
+        # /wheel/odom yaw, so the real angle must still be measured by eye).
+        self.gyro_motor_row = tk.Frame(frame)
+        tk.Label(self.gyro_motor_row, text='จำนวนรอบ:').pack(side='left')
+        self.gyro_turns_var = tk.StringVar(value=str(GYRO_MOTOR_TURNS_DEFAULT))
+        tk.Entry(self.gyro_motor_row, textvariable=self.gyro_turns_var, width=6).pack(side='left', padx=4)
+        tk.Label(self.gyro_motor_row, text='ความเร็ว (rad/s):').pack(side='left', padx=(8, 0))
+        self.gyro_speed_var = tk.StringVar(value=str(ROTATE_SPEED_DEFAULT))
+        tk.Entry(self.gyro_motor_row, textvariable=self.gyro_speed_var, width=6).pack(side='left', padx=4)
+        self.gyro_dir_var = tk.StringVar(value='ccw')
+        for value, label in (('ccw', 'CCW'), ('cw', 'CW')):
+            tk.Radiobutton(
+                self.gyro_motor_row, text=label, value=value,
+                variable=self.gyro_dir_var).pack(side='left', padx=2)
+
+        self.btn_gyro = tk.Button(
+            frame, text='เริ่มบันทึก gyro', bg='#2980b9', fg='white',
+            command=self._on_click_gyro)
+        self.btn_gyro.pack(fill='x', pady=6)
+        self._gyro_btn_anchor = self.btn_gyro
+        self.gyro_status = tk.Label(frame, text='รอเริ่มบันทึก', anchor='w')
+        self.gyro_status.pack(fill='x')
+
+        # Real angle from a wall seen by the LiDAR (scan_lines_node.py):
+        # independent of wheel slip and of the robot drifting off its spot.
+        lidar = tk.LabelFrame(
+            frame, text='วัดมุมจริงด้วย LiDAR (ไม่ต้องวัดด้วยมือ - ไม่ขึ้นกับการไถล)',
+            padx=6, pady=4)
+        lidar.pack(fill='x', pady=4)
+        tk.Label(
+            lidar, anchor='w', justify='left', wraplength=540,
+            text='ต้องเห็นผนังตรงยาว ≥ 0.8 m ห่าง 0.3-6 m  รถต้องนิ่งตอนกดวัด\n'
+                 'ลำดับ: วัดผนัง (ก่อน) -> เริ่มบันทึก/หมุน -> หยุด -> วัดผนัง (หลัง) -> มุมจริงจะเติมให้อัตโนมัติ'
+        ).pack(fill='x')
+        lrow = tk.Frame(lidar)
+        lrow.pack(fill='x', pady=2)
+        self.btn_wall_before = tk.Button(
+            lrow, text='วัดผนัง (ก่อนหมุน)', command=lambda: self._measure_wall('before'))
+        self.btn_wall_before.pack(side='left', expand=True, fill='x', padx=2)
+        self.btn_wall_after = tk.Button(
+            lrow, text='วัดผนัง (หลังหมุน)', command=lambda: self._measure_wall('after'))
+        self.btn_wall_after.pack(side='left', expand=True, fill='x', padx=2)
+        self.wall_status = tk.Label(lidar, text='ยังไม่ได้วัด', anchor='w', justify='left')
+        self.wall_status.pack(fill='x')
+        self._wall_before = None   # list of lines from scan_lines_node.py
+        self._wall_after = None
+        self._wall_proc = None
+
+        row = tk.Frame(frame)
+        row.pack(fill='x', pady=2)
+        tk.Label(row, text='มุมจริง (deg):').pack(side='left')
+        self.gyro_real_var = tk.StringVar(value='1800')
+        tk.Entry(row, textvariable=self.gyro_real_var, width=8).pack(side='left', padx=4)
+        tk.Label(row, text='GYRO_SCALE_Z ปัจจุบัน:').pack(side='left', padx=(12, 0))
+        self.gyro_scale_var = tk.StringVar(value=f'{GYRO_SCALE_Z_NOMINAL:.4f}')
+        tk.Entry(row, textvariable=self.gyro_scale_var, width=8).pack(side='left', padx=4)
+
+        self.btn_gyro_calc = tk.Button(
+            frame, text='คำนวณ gyro scale', state='disabled',
+            command=self._on_calc_gyro)
+        self.btn_gyro_calc.pack(fill='x', pady=4)
+        self.gyro_result = scrolledtext.ScrolledText(frame, height=7, wrap='word')
+        self.gyro_result.pack(fill='x')
+        self.gyro_result.config(state='disabled')
+        self._hand_gyro_deg = None
+        self._wall_after = None  # a new run needs a fresh "after" wall
+        self._on_gyro_mode_change()
+
+    def _on_gyro_mode_change(self):
+        if self._active_test in ('gyro', 'gyro_motor'):
+            return
+        if self.gyro_mode_var.get() == 'motor':
+            self.gyro_help.config(
+                text='1. ทำเครื่องหมายบนพื้นและตัวรถ เคลียร์พื้นที่รอบรถ ให้รถนิ่ง 10 วินาที\n'
+                     '2. กดเริ่ม รถจะหมุนอยู่กับที่ตามจำนวนรอบ (หยุดด้วย wheel odom จึงอาจไม่ตรงเครื่องหมายพอดี)\n'
+                     '3. วัดมุมจริงจากเครื่องหมาย (รอบเต็ม ± มุมที่ขาด/เกิน) กรอกแล้วกดคำนวณ  ทำทั้ง CW และ CCW')
+            self.gyro_motor_row.pack(fill='x', pady=2, before=self._gyro_btn_anchor)
+            self.btn_gyro.config(text='เริ่มหมุนด้วยมอเตอร์ (Start)')
+        else:
+            self.gyro_help.config(
+                text='1. กด E-stop/ปิดมอเตอร์ ทำเครื่องหมายบนพื้นและตัวรถ ให้รถนิ่ง 10 วินาที\n'
+                     '2. กดเริ่มบันทึก แล้วเข็นหมุนรถรอบตัวเองให้ครบหลายรอบ (เช่น 5 รอบ = 1800°) '
+                     'จนเครื่องหมายตรงกันพอดี\n'
+                     '3. กดหยุดบันทึก กรอกมุมจริงแล้วกดคำนวณ  ทำทั้ง CW และ CCW แล้วใช้ค่าเฉลี่ย\n'
+                     'หมายเหตุ: ถ้าล้อไม่หมุนขณะเข็น (ยกล้อ/ล้อไถล) ZUPT ใน firmware อาจกลืนมุม - ใช้โหมดมอเตอร์แทน')
+            self.gyro_motor_row.pack_forget()
+            self.btn_gyro.config(text='เริ่มบันทึก gyro')
+
+    def _start_gyro_proc(self):
+        self._gyro_proc = subprocess.Popen(
+            ['ros2', 'run', 'amr_bringup', 'gyro_integrate_node.py'],
+            preexec_fn=os.setsid, env=os.environ.copy(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True)
+
+    def _finish_gyro(self, deg):
+        self._hand_gyro_deg = deg
+        if deg is None:
+            self.gyro_status.config(text='ไม่ได้รับข้อมูล /imu/data - ตรวจสอบ bringup')
+            return
+        self.gyro_status.config(text=f'บันทึกเสร็จ: gyro วัดได้ {deg:+.1f} deg (CCW = +)')
+        self.btn_gyro_calc.config(state='normal')
+        self._update_wall_real_angle()
+
+    # ------------------------------------------------------------------
+    # Real rotation angle from a LiDAR wall (scan_lines_node.py)
+    # ------------------------------------------------------------------
+    def _measure_wall(self, which):
+        if self._wall_proc is not None:
+            return
+        if self._active_test is not None:
+            messagebox.showerror('กำลังทดสอบอยู่', 'วัดผนังได้เฉพาะตอนรถนิ่ง (ก่อนเริ่ม/หลังหยุดบันทึก)')
+            return
+        if which == 'before':
+            self._wall_before = None
+            self._wall_after = None
+        elif self._wall_before is None:
+            messagebox.showerror('ยังไม่ได้วัดก่อนหมุน', 'กด "วัดผนัง (ก่อนหมุน)" ก่อนเริ่มหมุน')
+            return
+        self.wall_status.config(text='กำลังวัดผนัง... (รถต้องนิ่ง)')
+        self.btn_wall_before.config(state='disabled')
+        self.btn_wall_after.config(state='disabled')
+        self._wall_proc = subprocess.Popen(
+            ['ros2', 'run', 'amr_bringup', 'scan_lines_node.py', '10'],
+            preexec_fn=os.setsid, env=os.environ.copy(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True)
+        self._wall_which = which
+        self.after(200, self._poll_wall)
+
+    def _poll_wall(self):
+        proc = self._wall_proc
+        if proc is None:
+            return
+        if proc.poll() is None:
+            self.after(200, self._poll_wall)
+            return
+        self._wall_proc = None
+        self.btn_wall_before.config(state='normal')
+        self.btn_wall_after.config(state='normal')
+        out = proc.stdout.read() if proc.stdout else ''
+        lines = None
+        for line in out.splitlines():
+            if line.startswith('LINES '):
+                try:
+                    lines = json.loads(line[len('LINES '):])
+                except ValueError:
+                    lines = None
+        if proc.returncode == 2:
+            self.wall_status.config(text='ไม่ได้รับข้อมูล /scan - ตรวจสอบ LiDAR/bringup')
+            return
+        if not lines:
+            self.wall_status.config(text='ไม่พบผนังตรง (ยาว ≥ 0.8 m ห่าง 0.3-6 m) - ย้ายรถให้เห็นผนัง')
+            return
+        if self._wall_which == 'before':
+            self._wall_before = lines
+            w = lines[0]
+            self.wall_status.config(
+                text=f'ก่อนหมุน: ผนังยาว {w["length_m"]:.2f} m ห่าง {w["dist_m"]:.2f} m '
+                     f'มุม {w["angle_deg"]:.2f}° - เริ่มหมุนได้')
+        else:
+            self._wall_after = lines
+            self._update_wall_real_angle()
+
+    @staticmethod
+    def _wrap(deg, half):
+        # wrap into (-half, half]
+        return (deg + half) % (2 * half) - half
+
+    def _update_wall_real_angle(self):
+        # Needs: wall before, wall after, and the gyro's signed total.
+        if not (self._wall_before and self._wall_after) or self._hand_gyro_deg is None:
+            if self._wall_after and self._hand_gyro_deg is None:
+                self.wall_status.config(text='วัดผนังหลังหมุนแล้ว - รอผล gyro (กดหยุดบันทึก)')
+            return
+        gyro = self._hand_gyro_deg
+        ref = self._wall_before[0]
+        # A wall at angle a in the robot frame appears at a - rot after the
+        # robot turns rot (CCW +). A line is only defined mod 180, so pick
+        # the after-wall closest to where the gyro says it should be, then
+        # resolve the full turns from the gyro (valid while the gyro error
+        # is well under 90 deg - it's ~1%).
+        predicted = ref['angle_deg'] - gyro
+        best = min(self._wall_after,
+                   key=lambda w: abs(self._wrap(w['angle_deg'] - predicted, 90.0)))
+        miss = self._wrap(best['angle_deg'] - predicted, 90.0)
+        if abs(miss) > 20.0:
+            self.wall_status.config(
+                text=f'ไม่พบผนังเดิมหลังหมุน (ต่างจากที่คาด {miss:+.1f}°) - '
+                     'ใช้มุมจริงแบบวัดด้วยมือ หรือวัดใหม่')
+            return
+        real = gyro - miss   # signed, CCW +
+        self.gyro_real_var.set(f'{abs(real):.1f}')
+        self.wall_status.config(
+            text=f'มุมจริงจาก LiDAR: {real:+.1f}° (gyro {gyro:+.1f}°, ต่าง {-miss:+.2f}°)\n'
+                 f'ผนังยาว {best["length_m"]:.2f} m  rms {best["rms_m"] * 1000:.0f} mm '
+                 '- เติมในช่องมุมจริงแล้ว กดคำนวณได้เลย')
+
+    def _on_click_gyro(self):
+        if self._active_test == 'gyro_motor':
+            self._cancel_active()
+            return
+        if self.gyro_mode_var.get() == 'motor' and self._active_test != 'gyro':
+            self._start_gyro_motor()
+            return
+        if self._active_test == 'gyro':
+            deg = self._stop_gyro()
+            self._active_test = None
+            self._on_gyro_mode_change()
+            self._finish_gyro(deg)
+            return
+        if self._active_test is not None:
+            messagebox.showerror('กำลังทดสอบอยู่', 'รอให้การทดสอบอื่นเสร็จก่อน')
+            return
+        if not messagebox.askyesno(
+                'ยืนยัน', 'กด E-stop / ปิดมอเตอร์แล้ว และรถนิ่งอย่างน้อย 10 วินาทีใช่หรือไม่?'):
+            return
+        self._reset_result(self.gyro_result)
+        self.btn_gyro_calc.config(state='disabled')
+        self._hand_gyro_deg = None
+        self._wall_after = None  # a new run needs a fresh "after" wall
+        self._active_test = 'gyro'
+        self._start_gyro_proc()
+        self.btn_gyro.config(text='หยุดบันทึก (Stop)')
+        self.gyro_status.config(text='กำลังบันทึก... หมุนรถด้วยมือแล้วกดหยุด')
+
+    def _start_gyro_motor(self):
+        if self._active_test is not None or (self._proc is not None and self._proc.poll() is None):
+            messagebox.showerror('กำลังทดสอบอยู่', 'รอให้การทดสอบอื่นเสร็จก่อน')
+            return
+        try:
+            turns = abs(float(self.gyro_turns_var.get()))
+            speed = abs(float(self.gyro_speed_var.get()))
+        except ValueError:
+            messagebox.showerror('ค่าไม่ถูกต้อง', 'กรอกจำนวนรอบ/ความเร็วเป็นตัวเลข')
+            return
+        if turns <= 0 or not 0.1 <= speed <= 0.6:
+            messagebox.showerror('ค่าไม่ถูกต้อง', 'จำนวนรอบต้อง > 0 และความเร็ว 0.1-0.6 rad/s')
+            return
+        ccw = self.gyro_dir_var.get() == 'ccw'
+        if not messagebox.askyesno(
+                'ยืนยันการทดสอบ',
+                f'ให้หุ่นยนต์หมุนอยู่กับที่ {turns:g} รอบ ({"CCW" if ccw else "CW"}) '
+                f'ด้วยความเร็ว {speed:.2f} rad/s ใช่หรือไม่?\n'
+                'ปล่อย E-stop แล้ว และรถนิ่งอย่างน้อย 10 วินาที\n\n' + SAFETY_BANNER):
+            return
+        self._reset_result(self.gyro_result)
+        self.btn_gyro_calc.config(state='disabled')
+        self._hand_gyro_deg = None
+        self._wall_after = None  # a new run needs a fresh "after" wall
+        self.gyro_real_var.set(f'{360.0 * turns:g}')
+        self._active_test = 'gyro_motor'
+        self._start_gyro_proc()
+        # calib_rotate_node.py: negative turns = CW
+        self._proc = subprocess.Popen(
+            ['ros2', 'run', 'amr_bringup', 'calib_rotate_node.py',
+             f'{turns if ccw else -turns:.4f}', f'{speed:.3f}'],
+            preexec_fn=os.setsid, env=os.environ.copy(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+        self.btn_gyro.config(text='ยกเลิก (Cancel)')
+        self.gyro_status.config(text='กำลังหมุนด้วยมอเตอร์...')
+        self._poll_proc()
+
+    def _on_calc_gyro(self):
+        try:
+            real = abs(float(self.gyro_real_var.get()))
+            old = float(self.gyro_scale_var.get())
+        except ValueError:
+            messagebox.showerror('ค่าไม่ถูกต้อง', 'กรอกมุมจริง/scale เป็นตัวเลข')
+            return
+        deg = self._hand_gyro_deg
+        if deg is None or abs(deg) < 1.0 or real < 1.0 or old <= 0:
+            messagebox.showerror('ค่าไม่ถูกต้อง', 'ไม่มีการหมุนที่บันทึกได้ หรือค่ามุม/scale ไม่ถูกต้อง')
+            return
+        ratio = real / abs(deg)
+        new = old * ratio
+        lines = [
+            f'มุมจริง: {real:.1f} deg   มุมจาก gyro: {abs(deg):.1f} deg '
+            f'({"CCW" if deg > 0 else "CW"})',
+            f'error ของ gyro: {(abs(deg) / real - 1) * 100:+.2f}%',
+            '',
+            f'GYRO_SCALE_Z: {old:.4f} -> {new:.4f}',
+            'แก้ใน stm/src/motor_control_with_pid_optimized.cpp:',
+            f'const float GYRO_SCALE_Z = {new:.4f}f;',
+        ]
+        if real < 720:
+            lines += ['', 'คำเตือน: หมุนน้อยกว่า 2 รอบ ความแม่นต่ำ ควรหมุน >= 5 รอบ']
+        if abs(ratio - 1) > 0.05:
+            lines += ['', 'คำเตือน: ต่างเกิน 5% (เกินสเปก MPU ±3%) - ตรวจ bias/การนับรอบ/การติดตั้ง IMU ก่อนใช้ค่า']
+        lines += ['', 'ทดสอบทั้ง CW และ CCW แล้วใช้ค่าเฉลี่ย  re-flash แล้ววัดซ้ำเพื่อยืนยัน']
+        self._set_result(self.gyro_result, '\n'.join(lines))
+
+    # ------------------------------------------------------------------
     # Shared subprocess plumbing
     # ------------------------------------------------------------------
     def _reset_result(self, widget):
@@ -502,11 +853,41 @@ class CalibPanel(tk.Toplevel):
         widget.config(state='disabled')
 
     def _cancel_active(self):
+        if self._wall_proc is not None and self._wall_proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(self._wall_proc.pid), signal.SIGINT)
+            except Exception:
+                pass
         if self._proc is not None and self._proc.poll() is None:
             try:
                 os.killpg(os.getpgid(self._proc.pid), signal.SIGINT)
             except Exception:
                 pass
+        self._stop_gyro()
+
+    def _stop_gyro(self):
+        """SIGINT gyro_integrate_node.py and parse its final GYRO_DEG line."""
+        proc = self._gyro_proc
+        self._gyro_proc = None
+        if proc is None:
+            return None
+        try:
+            if proc.poll() is None:
+                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            out, _ = proc.communicate(timeout=5)
+        except Exception:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+            return None
+        for line in (out or '').splitlines():
+            if line.startswith('GYRO_DEG='):
+                try:
+                    return float(line.split()[0].split('=')[1])
+                except (IndexError, ValueError):
+                    return None
+        return None
 
     def _poll_proc(self):
         proc = self._proc
@@ -524,6 +905,7 @@ class CalibPanel(tk.Toplevel):
 
         if test == 'rotate':
             self.btn_rotate.config(text='เริ่มหมุน (Start)')
+            self._last_gyro_deg = self._stop_gyro()
             if ret == 0:
                 self.rotate_status.config(text='เสร็จสิ้น - กรอกมุมที่วัดได้จริงแล้วกดคำนวณ')
                 self.rotate_measured_entry.config(state='normal')
@@ -536,6 +918,10 @@ class CalibPanel(tk.Toplevel):
                 messagebox.showwarning('ไม่พบข้อมูล', 'ไม่ได้รับข้อมูลจาก /wheel/odom - ตรวจสอบ bringup')
             else:
                 self.rotate_status.config(text=f'ยกเลิก/หยุด (exit code {ret})')
+        elif test == 'gyro_motor':
+            self._on_gyro_mode_change()
+            # let the robot settle so the gyro captures the full stop
+            self.after(1000, lambda: self._finish_gyro_motor(ret))
         elif test == 'straight':
             self.btn_straight.config(text='เริ่มวิ่งตรง (Start)')
             if ret == 0:
@@ -551,6 +937,20 @@ class CalibPanel(tk.Toplevel):
                 messagebox.showwarning('ไม่พบข้อมูล', 'ไม่ได้รับข้อมูลจาก /wheel/raw_distance - ตรวจสอบ bringup')
             else:
                 self.straight_status.config(text=f'ยกเลิก/หยุด (exit code {ret})')
+
+    def _finish_gyro_motor(self, ret):
+        deg = self._stop_gyro()
+        if ret == 0:
+            self._finish_gyro(deg)
+            if deg is not None:
+                self.gyro_status.config(
+                    text=f'หมุนเสร็จ: gyro วัดได้ {deg:+.1f} deg - วัดมุมจริงจากเครื่องหมาย กรอกแล้วกดคำนวณ')
+        elif ret == 3:
+            self.gyro_status.config(text='หยุดกลางทาง: timeout ระหว่างหมุน')
+        elif ret == 4:
+            self.gyro_status.config(text='ไม่พบข้อมูล /wheel/odom - ตรวจสอบ bringup')
+        else:
+            self.gyro_status.config(text=f'ยกเลิก/หยุด (exit code {ret})')
 
     def _on_close(self):
         self._cancel_active()

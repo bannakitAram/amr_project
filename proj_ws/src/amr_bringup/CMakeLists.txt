@@ -19,6 +19,8 @@ install(PROGRAMS
   scripts/calib_straight_node.py
   scripts/amr_calib_panel.py
   scripts/calc_wheel_radius.py
+  scripts/gyro_integrate_node.py
+  scripts/scan_lines_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

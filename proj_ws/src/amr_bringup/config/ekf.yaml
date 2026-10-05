@@ -27,51 +27,41 @@ ekf_filter_node:
     # EKF's fused yaw is. Fusing vx/vyaw instead lets the EKF integrate
     # position itself using its own IMU-corrected heading, so heading
     # corrections actually propagate into position.
+    #
+    # Yaw rate from the GYRO ONLY (2026-10-02): the floor is slippery enough
+    # that encoder yaw rate is unreliable while turning, so wheel vyaw is
+    # off and wheels supply vx only. With this, the EKF has NO yaw-rate
+    # source if /imu/data stops - imu_watchdog_node (navigation.launch.py)
+    # must stay enabled alongside imu0.
     odom0_config: [false, false, false,
                    false, false, false,
                    true,  false, false,
-                   false, false, true,
+                   false, false, false,
                    false, false, false]
     odom0_differential: false
     odom0_relative: false
     odom0_queue_size: 10
 
     # -------- IMU input --------
-    # TEMPORARILY DISABLED for diagnosis: navigation showed accurate
-    # straight-line driving but badly wrong turning behavior, which is the
-    # signature of either a bad wheel_sep calibration OR a wrong-sign/
-    # scale gyro fusion here (straight driving barely uses vyaw either
-    # way, so a sign bug there wouldn't show up until turning) - the
-    # rotate-90/180-and-compare sanity check that should have been done
-    # before ever enabling this was skipped. Re-enable (uncomment below,
-    # and delete this note) only after that check confirms
-    # angular_velocity.z's sign and scale are correct - see
-    # motor_control_with_pid_optimized.cpp's publish_imu().
-    # imu0: /imu/data
-    # # Fuse vyaw ONLY - same reasoning as odom0_config above: fusing the
-    # # gyro's angular velocity (not an absolute yaw/orientation) is what
-    # # actually corrects wheel odometry's heading drift over time. Not
-    # # fusing x/y/z/roll/pitch/yaw or ax/ay/az:
-    # #   - roll/pitch/yaw: the MPU6500 firmware leaves orientation
-    # #     unfilled with orientation_covariance[0] = -1 (REP 145: "not
-    # #     computed", see motor_control_with_pid_optimized.cpp's
-    # #     publish_imu()) - robot_localization already skips orientation
-    # #     fusion automatically when it sees that, this is just explicit.
-    # #   - ax/ay/az: only bias-calibrated (single-point, at boot), not
-    # #     full 6-point calibrated for scale/cross-axis error. Double-
-    # #     integrating acceleration into position amplifies any remaining
-    # #     error far faster than wheel encoders already do, so it isn't
-    # #     worth it here - wheel odom's vx (see odom0_config) is the more
-    # #     reliable velocity source.
-    # imu0_config: [false, false, false,
-    #               false, false, false,
-    #               false, false, false,
-    #               false, false, true,
-    #               false, false, false]
-    # imu0_differential: false
-    # imu0_relative: false
-    # imu0_queue_size: 10
-    # imu0_remove_gravitational_acceleration: true
+    # Gyro vyaw only. Orientation not fused (firmware sets
+    # orientation_covariance[0] = -1); ax/ay/az not fused (bias-only
+    # calibration, double integration drifts).
+    # NOTE: verify angular_velocity.z sign/scale (CCW must give +z, REP 103;
+    # rotate 90/180 deg and compare /odometry/filtered yaw with the real
+    # angle) - a wrong sign here turns the whole heading the wrong way.
+    # No *_twist_rejection_threshold: each input is the sole source of its
+    # variable, so there's nothing independent to judge an outlier against
+    # (rejecting the gyro would freeze heading mid-turn).
+    imu0: /imu/data
+    imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
+                  false, false, true,
+                  false, false, false]
+    imu0_differential: false
+    imu0_relative: false
+    imu0_queue_size: 10
+    imu0_remove_gravitational_acceleration: true
 
     use_control: false
 
