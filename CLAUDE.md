@@ -30,3 +30,12 @@ Output format:
 
 ***Caution: sim_ws for read only.
 
+
+Versioning (git repo: this directory, remote origin = GitHub private repo, branch main):
+- After finishing one change (tuning, fix, feature), propose a commit + push. One topic per commit; message says what changed and why.
+- STM32 firmware: commit stm/ BEFORE flashing; put the commit hash in the flash notes.
+- When the user reports a passed test on the real robot, ask for the results (speed, stop distance, route) and create an annotated tag vX.Y.Z with them, then push the tag. Never move or rewrite a pushed tag - make a new one.
+  X = architecture change, Y = new feature, Z = tuning / bug fix.
+- Any change to safety-related config (collision_monitor, speed limits, footprint, laser/depth filters, cmd_vel chain) needs a new tag before line use.
+- Do not restart bringup/flash firmware for line use from an uncommitted ("-dirty") tree; bringup logs `git describe --dirty` at start for this check.
+- Never force-push main.

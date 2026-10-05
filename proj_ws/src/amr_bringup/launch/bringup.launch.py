@@ -14,14 +14,32 @@ Usage:
     ros2 launch amr_bringup bringup.launch.py slam:=false navigation:=true map:=/path/to/map.yaml
 """
 import os
+import subprocess
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, TimerAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
 
+
+
+def _software_version():
+    """`git describe --tags --dirty` of the AMR_Project repo, for the launch log.
+
+    Lets you tell from any bringup log which tagged / tested version the
+    robot ran, and whether it had uncommitted changes ("-dirty"), which
+    must not be used on the line (see CLAUDE.md, Versioning). The launch file
+    is symlinked from src/ with --symlink-install, so realpath finds the repo.
+    """
+    here = os.path.dirname(os.path.realpath(__file__))
+    try:
+        return subprocess.run(
+            ['git', '-C', here, 'describe', '--tags', '--always', '--dirty'],
+            capture_output=True, text=True, timeout=5, check=True).stdout.strip()
+    except Exception as e:  # not a git checkout, git missing, ...
+        return 'unknown (%s)' % e.__class__.__name__
 
 def generate_launch_description():
     pkg_description = get_package_share_directory('amr_description')
@@ -207,7 +225,13 @@ def generate_launch_description():
         condition=IfCondition(use_depth_camera),
     )
 
+    version = _software_version()
+    version_log = LogInfo(msg='AMR software version: ' + version + (
+        '  ** UNCOMMITTED CHANGES - not for line use **'
+        if version.endswith('-dirty') or version.startswith('unknown') else ''))
+
     return LaunchDescription([
+        version_log,
         declare_use_sim_time,
         declare_use_rviz,
         declare_use_foxglove,
