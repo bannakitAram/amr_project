@@ -144,6 +144,37 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}],
     )
 
+    # Halves Nav2's speed (via /speed_limit -> MPPI) while the firmware
+    # reports wheel slip - see slip_speed_limiter_node.py's docstring.
+    slip_speed_limiter_node = Node(
+        package='amr_navigation',
+        executable='slip_speed_limiter_node.py',
+        name='slip_speed_limiter',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
+    )
+
+    # Cancels all Nav2 goals if /imu/data stops - ekf.yaml takes yaw rate
+    # from the gyro only, see imu_watchdog_node.py's docstring.
+    imu_watchdog_node = Node(
+        package='amr_navigation',
+        executable='imu_watchdog_node.py',
+        name='imu_watchdog',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
+    )
+
+    # Extracts MPPI's optimal local trajectory from /trajectories (needs
+    # FollowPath.visualize: true) into a small /mppi_local_plan Path for the
+    # goal_picker page - see local_plan_relay_node.py's docstring.
+    local_plan_relay_node = Node(
+        package='amr_navigation',
+        executable='local_plan_relay_node.py',
+        name='local_plan_relay',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
+    )
+
     lifecycle_manager_localization = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
@@ -183,6 +214,9 @@ def generate_launch_description():
         velocity_smoother_node,
         collision_monitor_node,
         nav_goal_executor_node,
+        slip_speed_limiter_node,
+        imu_watchdog_node,
+        local_plan_relay_node,
         lifecycle_manager_localization,
         lifecycle_manager_navigation,
     ])
