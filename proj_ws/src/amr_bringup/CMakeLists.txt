@@ -21,6 +21,7 @@ install(PROGRAMS
   scripts/calc_wheel_radius.py
   scripts/gyro_integrate_node.py
   scripts/scan_lines_node.py
+  scripts/depth_watchdog_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

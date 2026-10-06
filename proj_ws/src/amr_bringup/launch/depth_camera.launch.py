@@ -112,8 +112,22 @@ def generate_launch_description():
         ],
     )
 
+    # Cancels Nav2 goals if the driver or the cloud stops (see the node's
+    # docstring). Lives here so it only runs when the camera is enabled.
+    depth_watchdog = Node(
+        package='amr_bringup',
+        executable='depth_watchdog_node.py',
+        name='depth_watchdog',
+        output='screen',
+        parameters=[{
+            'camera_info_topic': DEPTH_TOPIC_PREFIX + '/camera_info',
+            'points_topic': POINTS_TOPIC,
+        }],
+    )
+
     return LaunchDescription([
         ascamera_node,
         depth_to_points,
         camera_tf_bridge,
+        depth_watchdog,
     ])
