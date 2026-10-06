@@ -124,7 +124,8 @@ def generate_launch_description():
             )
         ),
         launch_arguments={
-            'frame_id': 'lidar_link',          
+            'serial_port': '/dev/ttyLidar',
+            'frame_id': 'lidar_link',
             'inverted': 'false',
             'angle_compensate': 'true',
         }.items()
