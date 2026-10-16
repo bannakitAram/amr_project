@@ -134,6 +134,10 @@ class ROSBoardNode(object):
         self.TELEOP_LINEAR_CAP = 0.30
         self.TELEOP_LINEAR_STEP = 0.05
         self.teleop_user_max_linear = self.TELEOP_MAX_LINEAR
+        # Back to the default once nobody has driven for this long, so the
+        # next operator to pick up a phone never inherits a raised limit.
+        self.TELEOP_IDLE_RESET_S = 300.0
+        self.teleop_last_active = time.time()  # last non-zero drive or -/+ change
         # Forced back to TELEOP_MAX_LINEAR while the AMR Control panel reports
         # mapping "scanning" (fast driving smears SLAM scan-matching). If that
         # state goes stale while it was scanning, keep the lock (fail safe).
@@ -302,6 +306,8 @@ class ROSBoardNode(object):
         twist = Twist()
         twist.linear.x = clamp(linear, self.teleop_effective_max_linear())
         twist.angular.z = clamp(angular, self.TELEOP_MAX_ANGULAR)
+        if twist.linear.x != 0.0 or twist.angular.z != 0.0:
+            self.teleop_last_active = time.time()
         self.teleop_pub.publish(twist)
         self.teleop_last_cmd_time = time.time()
 
@@ -335,6 +341,7 @@ class ROSBoardNode(object):
         v = round(v / self.TELEOP_LINEAR_STEP) * self.TELEOP_LINEAR_STEP
         self.teleop_user_max_linear = round(
             max(self.TELEOP_LINEAR_MIN, min(self.TELEOP_LINEAR_CAP, v)), 2)
+        self.teleop_last_active = time.time()
         self.publish_teleop_state()
 
     def publish_teleop_state(self):
@@ -344,12 +351,21 @@ class ROSBoardNode(object):
             "locked": self.teleop_locked(),
             "min": self.TELEOP_LINEAR_MIN, "cap": self.TELEOP_LINEAR_CAP,
             "step": self.TELEOP_LINEAR_STEP, "max_angular": self.TELEOP_MAX_ANGULAR,
+            "default": self.TELEOP_MAX_LINEAR,
+            "idle_reset_in": (None if self.teleop_user_max_linear == self.TELEOP_MAX_LINEAR
+                              else max(0, round(self.TELEOP_IDLE_RESET_S
+                                                - (time.time() - self.teleop_last_active)))),
         })))
 
     def teleop_state_loop(self):
         while True:
             time.sleep(0.5)
             try:
+                if (self.teleop_user_max_linear != self.TELEOP_MAX_LINEAR and
+                        time.time() - self.teleop_last_active > self.TELEOP_IDLE_RESET_S):
+                    rospy.loginfo("teleop limit reset to %.2f m/s (idle %.0f s)" % (
+                        self.TELEOP_MAX_LINEAR, self.TELEOP_IDLE_RESET_S))
+                    self.teleop_user_max_linear = self.TELEOP_MAX_LINEAR
                 self.publish_teleop_state()
             except Exception:
                 pass

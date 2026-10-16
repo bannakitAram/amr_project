@@ -104,7 +104,10 @@ const JOYSTICK_SEND_INTERVAL_MS = 100; // well under the backend's 500ms deadman
     function renderSpeed() {
       const s = teleopState;
       const eff = s ? s.effective : maxLinear;
-      speedVal.html(eff.toFixed(2) + '<small>' + (s && s.locked ? 'ล็อก' : 'm/s') + '</small>');
+      let unit = 'm/s';
+      if (s && s.locked) unit = 'ล็อก';
+      else if (s && s.idle_reset_in != null && s.idle_reset_in <= 60) unit = 'กลับ 0.10 ใน ' + s.idle_reset_in + 's';
+      speedVal.html(eff.toFixed(2) + '<small>' + unit + '</small>');
       speedVal.toggleClass('locked', !!(s && s.locked));
       speedBtns.each(function () {
         const d = Number(this.dataset.d);
