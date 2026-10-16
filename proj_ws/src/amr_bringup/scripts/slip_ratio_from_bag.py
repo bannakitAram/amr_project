@@ -206,7 +206,7 @@ def main():
         # IMU noise check: dv_imu is unreliable if events are very short
         short = [r for r in ev if r['dur'] < 0.3]
         if short:
-            print(f'    note: {len(short)} events < 0.3 s - IMU at 20 Hz gives '
+            print(f'    note: {len(short)} events < 0.3 s - IMU at ~50 Hz gives '
                   'few samples, treat their slip value as rough')
 
     if args.csv:
