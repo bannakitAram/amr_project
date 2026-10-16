@@ -304,6 +304,87 @@ def load_map_image(yaml_path):
     return meta, Image.fromarray(rgb, 'RGB')
 
 
+# Nav2 parameters editable from Settings > Parameters. Each is edited as
+# text in nav2_params.yaml (comments kept) and every related copy is kept in
+# sync: speed -> MPPI + velocity_smoother (+ behavior_server for w);
+# inflation -> local + global; footprint -> local + global + the
+# collision_monitor FrontStop polygon, which starts at the front bumper.
+# The min/max bounds are hard limits - review ISO 3691-4 before widening:
+# FrontStop (0.35 m deep) and the decel limits were sized for 0.2 m/s.
+NAV_PARAM_SPECS = [
+    # key, label, unit, min, max, step, fmt
+    ('v_max', 'v_max', 'm/s', 0.05, 0.30, 0.01, '{:.2f}'),
+    ('w_max', 'ω_max', 'rad/s', 0.10, 1.00, 0.05, '{:.2f}'),
+    ('inflation', 'Inflation radius', 'm', 0.30, 1.00, 0.05, '{:.2f}'),
+    ('goal_tol', 'xy_goal_tolerance', 'm', 0.10, 0.50, 0.05, '{:.2f}'),
+    # footprint steps are 2 cm so the half-length stays on whole cm
+    ('fp_len', 'Footprint ยาว', 'm', 0.60, 1.40, 0.02, '{:.2f}'),
+    ('fp_wid', 'Footprint กว้าง', 'm', 0.40, 0.90, 0.02, '{:.2f}'),
+]
+FRONT_STOP_DEPTH = 0.35   # m ahead of the bumper (matches nav2_params.yaml)
+FRONT_STOP_MARGIN = 0.03  # m each side beyond the footprint half-width
+
+_NUM = r'(-?\d+(?:\.\d+)?)'
+_PARAM_RES = {
+    'vx_max': re.compile(r'^(\s*vx_max:\s*)' + _NUM, re.M),
+    'wz_max': re.compile(r'^(\s*wz_max:\s*)' + _NUM, re.M),
+    'max_vel': re.compile(r'^(\s*max_velocity:\s*\[)' + _NUM + r',\s*' + _NUM + r',\s*' + _NUM + r'\]', re.M),
+    'min_vel': re.compile(r'^(\s*min_velocity:\s*\[)' + _NUM + r',\s*' + _NUM + r',\s*' + _NUM + r'\]', re.M),
+    'rot_vel': re.compile(r'^(\s*max_rotational_vel:\s*)' + _NUM, re.M),
+    'inflation': re.compile(r'^(\s*inflation_radius:\s*)' + _NUM, re.M),
+    'goal_tol': re.compile(r'^(\s*xy_goal_tolerance:\s*)' + _NUM, re.M),
+    'footprint': re.compile(r'^(\s*footprint:\s*)"\[\[([^"]*)\]\]"', re.M),
+    'front_stop': re.compile(r'^(\s*points:\s*)\[' + ',\\s*'.join([_NUM] * 8) + r'\]', re.M),
+}
+_PARAM_COUNTS = {'inflation': 2, 'footprint': 2}
+
+
+def read_nav_params(text):
+    """Current editable values from nav2_params.yaml text (raises
+    ValueError if the file no longer has the expected layout)."""
+    for k, rx in _PARAM_RES.items():
+        n = len(rx.findall(text))
+        if n != _PARAM_COUNTS.get(k, 1):
+            raise ValueError(f'nav2_params.yaml: expected {_PARAM_COUNTS.get(k, 1)} x {k}, found {n}')
+    pts = [[float(v) for v in p.split(',')]
+           for p in _PARAM_RES['footprint'].search(text).group(2).split('], [')]
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return {
+        'v_max': float(_PARAM_RES['vx_max'].search(text).group(2)),
+        'w_max': float(_PARAM_RES['wz_max'].search(text).group(2)),
+        'inflation': float(_PARAM_RES['inflation'].search(text).group(2)),
+        'goal_tol': float(_PARAM_RES['goal_tol'].search(text).group(2)),
+        'fp_len': round(max(xs) - min(xs), 3),
+        'fp_wid': round(max(ys) - min(ys), 3),
+    }
+
+
+def write_nav_params(text, v):
+    """Returns text with every copy of the edited values replaced.
+    Footprint is written as a centred rectangle (same as today)."""
+    read_nav_params(text)  # layout check before touching anything
+    f2 = lambda x: f'{x:.2f}'  # noqa: E731
+    hl, hw = v['fp_len'] / 2, v['fp_wid'] / 2
+    sw = hw + FRONT_STOP_MARGIN
+    text = _PARAM_RES['vx_max'].sub(lambda m: m.group(1) + f2(v['v_max']), text)
+    text = _PARAM_RES['wz_max'].sub(lambda m: m.group(1) + f2(v['w_max']), text)
+    text = _PARAM_RES['max_vel'].sub(
+        lambda m: f"{m.group(1)}{f2(v['v_max'])}, {m.group(3)}, {f2(v['w_max'])}]", text)
+    text = _PARAM_RES['min_vel'].sub(
+        lambda m: f"{m.group(1)}{f2(-v['v_max'])}, {m.group(3)}, {f2(-v['w_max'])}]", text)
+    text = _PARAM_RES['rot_vel'].sub(lambda m: m.group(1) + f2(v['w_max']), text)
+    text = _PARAM_RES['inflation'].sub(lambda m: m.group(1) + f2(v['inflation']), text)
+    text = _PARAM_RES['goal_tol'].sub(lambda m: m.group(1) + f2(v['goal_tol']), text)
+    fp = (f'[[{hl:.2f}, {hw:.2f}], [{hl:.2f}, {-hw:.2f}], '
+          f'[{-hl:.2f}, {-hw:.2f}], [{-hl:.2f}, {hw:.2f}]]')
+    text = _PARAM_RES['footprint'].sub(lambda m: f'{m.group(1)}"{fp}"', text)
+    fx = hl + FRONT_STOP_DEPTH
+    text = _PARAM_RES['front_stop'].sub(
+        lambda m: (f'{m.group(1)}[{fx:.2f}, {sw:.2f}, {fx:.2f}, {-sw:.2f}, '
+                   f'{hl:.2f}, {-sw:.2f}, {hl:.2f}, {sw:.2f}]'), text)
+    return text
+
+
 def find_key(tree, key):
     """First value of `key` anywhere in a nested dict (nav2_params.yaml)."""
     if isinstance(tree, dict):
@@ -350,6 +431,28 @@ EN = {
     'ยังไม่ได้ตั้ง PIN - ใช้ค่าเริ่มต้น (ตั้งได้ที่ ': 'No PIN set - using default (set in ',
     '4-6 หลัก': '4-6 digits',
     'PIN ไม่ถูกต้อง': 'Wrong PIN',
+    'Footprint ยาว': 'Footprint length',
+    'Footprint กว้าง': 'Footprint width',
+    'บันทึกลงไฟล์': 'Save to file',
+    'คืนค่าจากไฟล์': 'Revert',
+    'อ่านไฟล์ไม่ได้ - แก้ผ่านไฟล์เท่านั้น': 'Cannot parse file - edit the file directly',
+    'รัศมีมุมหุ่น': 'Corner radius',
+    '⚠ inflation น้อยกว่ารัศมีมุมหุ่น - หุ่นอาจวิ่งเฉียดสิ่งกีดขวางตอนหมุน':
+        '⚠ inflation < corner radius - robot may clip obstacles when turning',
+    'FrontStop เริ่มที่หน้ากันชน': 'FrontStop starts at bumper',
+    'ลึก': 'depth',
+    'ค่าที่จะเปลี่ยน:': 'Pending changes:',
+    'มีผลเมื่อเริ่ม Navigation/Mapping ครั้งถัดไป · ': 'Applies at next Navigation/Mapping start · ',
+    'ต้อง commit + ทดสอบ + tag ก่อนใช้บนไลน์': 'commit + test + tag before line use',
+    'บันทึก Parameter': 'Save parameters',
+    'ค่าเหล่านี้เกี่ยวกับ Safety (ISO 3691-4) - หลังบันทึกต้องทดสอบระยะหยุด/':
+        'These are safety-related (ISO 3691-4) - after saving, test stopping distance/',
+    'การหลบสิ่งกีดขวางบนหุ่นจริง แล้ว commit + tag ก่อนใช้บนไลน์':
+        'obstacle avoidance on the real robot, then commit + tag before line use',
+    'บันทึก?': 'Save?',
+    'เขียน nav2_params.yaml แล้ว (git tree เป็น -dirty)\n': 'nav2_params.yaml written (git tree is now -dirty)\n',
+    'ระบบกำลังทำงาน - ต้องปิดแล้วเริ่มใหม่เพื่อใช้ค่าใหม่': 'System running - restart it to apply',
+    'ค่าใหม่มีผลเมื่อเริ่มระบบครั้งถัดไป': 'Applies at next system start',
     'ใส่ PIN ปัจจุบัน': 'Enter current PIN',
     'ค่าเริ่มต้น 1234': 'default 1234',
     'ใส่ PIN ใหม่': 'Enter new PIN',
@@ -1840,32 +1943,128 @@ class AmrControlPanel(tk.Tk):
         row.pack(fill='x', padx=px(16))
         self._btn(row, 'เปลี่ยน PIN โหมดนักพัฒนา', self._on_change_pin).pack(side='left')
 
-        # Parameters are deliberately read-only on the touchscreen: speed
-        # limits / footprint / inflation are safety-related config (see
-        # CLAUDE.md) and must change through a reviewed, tagged commit.
-        self._label(par, 'อ่านอย่างเดียว - ค่าที่เกี่ยวกับ Safety ต้องแก้ผ่านไฟล์ + commit + tag ใหม่',
-                    font=self.f_small, fg=AMBER).pack(anchor='w', padx=px(16), pady=(px(12), px(4)))
+        # Editable, bounded copies of the safety-related Nav2 values (see
+        # NAV_PARAM_SPECS). Save only rewrites nav2_params.yaml - the git
+        # tree goes "-dirty" and the change still needs commit + test + tag
+        # before line use (CLAUDE.md).
+        self._build_param_editor(par)
+
+    def _build_param_editor(self, par):
+        par.columnconfigure(0, weight=3)
+        par.columnconfigure(1, weight=2)
+        left = tk.Frame(par, bg=SURFACE)
+        left.grid(row=0, column=0, sticky='nsew', padx=px(16), pady=px(10))
+        right = tk.Frame(par, bg=SURFACE)
+        right.grid(row=0, column=1, sticky='nsew', padx=(0, px(16)), pady=px(10))
+
+        self._param_file = {}
+        self._param_edit = {}
+        self._param_widgets = {}
+        for r, (key, label, unit, lo, hi, step, fmt) in enumerate(NAV_PARAM_SPECS):
+            self._label(left, label, anchor='w', width=17).grid(row=r, column=0, sticky='w')
+            row, minus, val, plus = self._stepper(
+                left, '', '', lambda k=key, st=step: self._adjust_param(k, -st),
+                lambda k=key, st=step: self._adjust_param(k, st), width=7)
+            row.grid(row=r, column=1, sticky='w', pady=px(3))
+            rng = self._label(left, f'{unit}  ({fmt.format(lo)}–{fmt.format(hi)})',
+                              font=self.f_small, fg=TEXT_MUTED, anchor='w')
+            rng.grid(row=r, column=2, sticky='w', padx=px(8))
+            self._param_widgets[key] = (minus, val, plus)
+
+        self.param_note = self._label(right, '', font=self.f_small, fg=TEXT_MUTED,
+                                      justify='left', anchor='nw', wraplength=px(330))
+        self.param_note.pack(fill='both', expand=True)
+        btns = tk.Frame(right, bg=SURFACE)
+        btns.pack(fill='x', side='bottom')
+        self.btn_param_save = self._btn(btns, 'บันทึกลงไฟล์', self._on_param_save, kind='warn')
+        self.btn_param_save.pack(side='left', fill='x', expand=True, padx=(0, px(4)))
+        self._btn(btns, 'คืนค่าจากไฟล์', self._load_params).pack(side='left')
+        self._load_params()
+
+    def _load_params(self):
         try:
             with open(NAV2_PARAMS) as f:
-                params = yaml.safe_load(f)
-        except Exception:  # noqa: BLE001
-            params = {}
+                self._param_file = read_nav_params(f.read())
+            self._param_error = None
+        except (OSError, ValueError) as e:
+            self._param_file = {}
+            self._param_error = str(e)
+        self._param_edit = dict(self._param_file)
+        self._refresh_params()
 
-        def g(key):
-            v = find_key(params, key)
-            return '—' if v is None else str(v)
-        self._section_title(par, 'Navigation (nav2_params.yaml)').pack(fill='x', padx=px(16), pady=(px(6), px(2)))
-        kv(par, 'v_max (MPPI vx_max)', g('vx_max') + ' m/s')
-        kv(par, 'ω_max (MPPI wz_max)', g('wz_max') + ' rad/s')
-        kv(par, 'velocity_smoother max', g('max_velocity'))
-        kv(par, 'Footprint', g('footprint'))
-        kv(par, 'Inflation radius', g('inflation_radius') + ' m')
-        kv(par, 'xy_goal_tolerance', g('xy_goal_tolerance') + ' m')
-        self._section_title(par, 'Motion test caps (this panel)').pack(fill='x', padx=px(16), pady=(px(10), px(2)))
-        kv(par, 'Move/Square speed max', f'{MOVE_FORWARD_SPEED_MAX:.2f} m/s')
-        kv(par, 'Circle ω', f'{CIRCLE_ANGULAR_SPEED:.2f} rad/s')
-        self._section_title(par, 'Motor PID (STM32)').pack(fill='x', padx=px(16), pady=(px(10), px(2)))
-        kv(par, 'Kp / Ki / Kd', 'อยู่ใน firmware stm/ - แก้ + commit ก่อน flash')
+    def _adjust_param(self, key, delta):
+        spec = next(sp for sp in NAV_PARAM_SPECS if sp[0] == key)
+        _, _, _, lo, hi, _, _ = spec
+        if key in self._param_edit:
+            self._param_edit[key] = round(max(lo, min(hi, self._param_edit[key] + delta)), 3)
+        self._refresh_params()
+
+    def _refresh_params(self):
+        ok = not self._param_error
+        changed = []
+        for key, label, unit, lo, hi, step, fmt in NAV_PARAM_SPECS:
+            minus, val, plus = self._param_widgets[key]
+            v = self._param_edit.get(key)
+            if v is None:
+                val.config(text='—', fg=TEXT_MUTED)
+                self._set_btn_state(minus, False)
+                self._set_btn_state(plus, False)
+                continue
+            diff = abs(v - self._param_file[key]) > 1e-6
+            if diff:
+                changed.append(f'{T(label)}: {fmt.format(self._param_file[key])} → {fmt.format(v)} {unit}')
+            val.config(text=fmt.format(v), fg=AMBER if diff else TEXT_MAIN)
+            self._set_btn_state(minus, v > lo + 1e-9)
+            self._set_btn_state(plus, v < hi - 1e-9)
+        self._set_btn_state(self.btn_param_save, ok and bool(changed))
+        self._param_changes = changed
+
+        lines = []
+        if not ok:
+            lines.append(T('อ่านไฟล์ไม่ได้ - แก้ผ่านไฟล์เท่านั้น') + f'\n{self._param_error}')
+        e = self._param_edit
+        if ok and e:
+            corner = math.hypot(e['fp_len'] / 2, e['fp_wid'] / 2)
+            lines.append(T('รัศมีมุมหุ่น') + f' {corner:.2f} m')
+            if e['inflation'] < corner:
+                lines.append(T('⚠ inflation น้อยกว่ารัศมีมุมหุ่น - หุ่นอาจวิ่งเฉียดสิ่งกีดขวางตอนหมุน'))
+            lines.append(T('FrontStop เริ่มที่หน้ากันชน') + f' {e["fp_len"] / 2:.2f} m '
+                         + T('ลึก') + f' {FRONT_STOP_DEPTH:.2f} m')
+        if changed:
+            lines.append(T('ค่าที่จะเปลี่ยน:') + '\n' + '\n'.join(changed))
+        lines.append(T('มีผลเมื่อเริ่ม Navigation/Mapping ครั้งถัดไป · '
+                       'ต้อง commit + ทดสอบ + tag ก่อนใช้บนไลน์'))
+        self.param_note.config(text='\n\n'.join(lines))
+
+    def _on_param_save(self):
+        if not self._param_changes:
+            return
+        if not messagebox.askyesno(
+                'บันทึก Parameter',
+                'ค่าที่จะเปลี่ยน:\n' + '\n'.join(self._param_changes) + '\n\n'
+                'ค่าเหล่านี้เกี่ยวกับ Safety (ISO 3691-4) - หลังบันทึกต้องทดสอบระยะหยุด/'
+                'การหลบสิ่งกีดขวางบนหุ่นจริง แล้ว commit + tag ก่อนใช้บนไลน์\n\nบันทึก?'):
+            return
+        try:
+            with open(NAV2_PARAMS) as f:
+                text = f.read()
+            new = write_nav_params(text, self._param_edit)
+            if read_nav_params(new) != {k: round(v, 2) for k, v in self._param_edit.items()}:
+                raise ValueError('verify after write failed')
+            tmp = NAV2_PARAMS + '.tmp'
+            with open(tmp, 'w') as f:
+                f.write(new)
+            os.replace(tmp, NAV2_PARAMS)
+        except (OSError, ValueError) as e:
+            messagebox.showerror('บันทึกไม่สำเร็จ', str(e))
+            return
+        self._load_params()
+        self.set_git.config(text=git_describe())
+        messagebox.showinfo(
+            'บันทึกแล้ว',
+            'เขียน nav2_params.yaml แล้ว (git tree เป็น -dirty)\n'
+            + ('ระบบกำลังทำงาน - ต้องปิดแล้วเริ่มใหม่เพื่อใช้ค่าใหม่'
+               if self._proc is not None else 'ค่าใหม่มีผลเมื่อเริ่มระบบครั้งถัดไป'))
 
     # ---------- periodic UI refresh ----------
     def _tick(self):
