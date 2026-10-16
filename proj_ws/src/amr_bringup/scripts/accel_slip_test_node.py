@@ -226,7 +226,9 @@ def main():
                 'accel': accel,
                 'slip_accel': max(acc) if acc else None,
                 'slip_decel': max(dec) if dec else None,
-                'events': len(rows),
+                'events': len([r for r in rows if r['kind'] != 'bounce']),
+                # wheel speed past zero (other direction) right after a stop
+                'stop_overshoot': max([r['overshoot'] for r in rows], default=0.0),
                 'expected_events': 2 * args.reps,
                 'imu_bias': bias,
             }

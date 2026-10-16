@@ -46,7 +46,10 @@ STATIONARY_V = 0.005     # m/s - below this the robot is treated as stopped
 EVENT_A = 0.08           # m/s^2 - default for --event-a
 MIN_EVENT_DV = 0.05      # m/s - ignore tiny speed corrections
 SLIP_LIMIT = 0.05        # 5 %
-SETTLE_S = 0.5           # s - look past the ramp end for the slip peak
+SETTLE_S = 0.1           # s - look just past the ramp end for the slip peak.
+# Kept short: after the ramp the chassis pitches back on its suspension and
+# gravity leaks into IMU ax, so integrating longer invents a fake gap
+# (seen on the real robot: -0.1..-0.26 m/s^2 for ~0.5 s at constant speed).
 _trapz = getattr(np, "trapezoid", None) or np.trapz  # numpy 2 renamed it
 
 
@@ -126,8 +129,22 @@ def analyse_arrays(to, vo, ti, ai, event_a=EVENT_A, label=''):
     ac = ai - bias
 
     rows = []
+    last_cross_t = -1e9
     for s, e in find_events(to, vo, event_a):
+        overshoot = 0.0
+        # Stop that overshoots through zero (wheel briefly turns the other
+        # way - seen on the real robot when stopping from reverse): end the
+        # decel event at the zero crossing and report the overshoot size
+        # instead of mixing the reversal into the slip number.
+        if vo[s] != 0.0 and np.sign(vo[e]) == -np.sign(vo[s]):
+            z = s + int(np.argmax(np.sign(vo[s:e + 1]) != np.sign(vo[s])))
+            after = (to >= to[z]) & (to <= to[z] + 1.0)
+            overshoot = float(np.max(-np.sign(vo[s]) * vo[after]))
+            e = z
+            last_cross_t = to[z]
         t0, t1 = to[s], to[e]
+        if t1 <= t0:
+            continue
         dv_wheel = vo[e] - vo[s]
         m = (ti >= t0) & (ti <= t1)
         if m.sum() < 3:
@@ -143,6 +160,8 @@ def analyse_arrays(to, vo, ti, ai, event_a=EVENT_A, label=''):
             ([0.0], np.cumsum(np.diff(tb) * 0.5 * (ac[mw][1:] + ac[mw][:-1]))))
         gap = (np.interp(tb, to, vo) - v_body) * np.sign(dv_wheel)
         kind = 'accel' if abs(vo[e]) > abs(vo[s]) else 'decel'
+        if t0 - last_cross_t < 1.0 and abs(vo[s]) < 0.1 and overshoot == 0.0:
+            kind = 'bounce'   # wheel settling back after an overshoot
         rows.append({
             'bag': label,
             't': t0 - to[0],
@@ -155,6 +174,7 @@ def analyse_arrays(to, vo, ti, ai, event_a=EVENT_A, label=''):
             'dv_wheel': dv_wheel,
             'dv_imu': dv_imu,
             'slip': float(np.max(gap)) / abs(dv_wheel),
+            'overshoot': overshoot,
         })
     return bias, rows
 

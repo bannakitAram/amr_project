@@ -990,6 +990,8 @@ class CalibPanel(tk.Toplevel):
         for r in self._accel_results:
             bad = r['slip_accel'] is not None and r['slip_accel'] > 0.05
             note = 'ลื่น' if bad else 'ไม่ลื่น'
+            if r.get('stop_overshoot', 0.0) > 0.02:
+                note += f', ล้อหมุนกลับตอนหยุด {r["stop_overshoot"]:.2f} m/s'
             if r['events'] < r['expected_events']:
                 note += f' (จับช่วงเร่ง/เบรกได้ {r["events"]}/{r["expected_events"]})'
             lines.append(f'   {r["accel"]:5.2f}      {pct(r["slip_accel"])}     '
