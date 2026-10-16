@@ -1259,12 +1259,10 @@ class AmrControlPanel(tk.Tk):
         self._make_mode_card(
             cards, 'อัตโนมัติ', 'Auto Mode', 'primary',
             lambda: self._show_page('auto'),
-            'เลือกจุดหมาย (Station) แล้วกด START MISSION'
         ).grid(row=0, column=0, sticky='nsew', padx=(px(4), px(8)), pady=(px(0), px(8)))
         self._make_mode_card(
             cards, 'ควบคุมเอง', 'Manual Mode', 'warn',
             lambda: self._show_page('manual'),
-            'ขับด้วย Joystick ภายนอก / มือถือ (rosboard)'
         ).grid(row=0, column=1, sticky='nsew', padx=(px(8), px(4)), pady=(px(0), px(8)))
 
     # ---------- Auto ----------
@@ -1518,14 +1516,13 @@ class AmrControlPanel(tk.Tk):
         cards = tk.Frame(p, bg=BG)
         cards.pack(fill='both', expand=True, pady=(px(8), px(0)))
         cards.rowconfigure(0, weight=1)
-        for i, (th, en, kind, page, desc) in enumerate((
-                ('สร้างแผนที่', 'Mapping', 'primary', 'mapping', 'SLAM + Joystick'),
-                ('ทดสอบนำทาง', 'Navigation Test', 'info', 'navtest',
-                 '2D Goal · Motion test · Log'),
-                ('ตั้งค่า', 'Settings', 'neutral', 'settings', 'General · Parameters'))):
+        for i, (th, en, kind, page) in enumerate((
+                ('สร้างแผนที่', 'Mapping', 'primary', 'mapping'),
+                ('ทดสอบนำทาง', 'Navigation Test', 'info', 'navtest'),
+                ('ตั้งค่า', 'Settings', 'neutral', 'settings'))):
             cards.columnconfigure(i, weight=1, uniform='d')
             self._make_mode_card(cards, th, en, kind,
-                                 lambda pg=page: self._show_page(pg), desc
+                                 lambda pg=page: self._show_page(pg)
                                  ).grid(row=0, column=i, sticky='nsew', padx=px(4), pady=(px(0), px(8)))
 
     # ---------- Mapping ----------
