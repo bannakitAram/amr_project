@@ -16,6 +16,7 @@ so the IMU bias can be measured):
 
 Run (no ROS nodes needed, just a sourced ROS 2 env for rosbag2_py):
   slip_ratio_from_bag.py slip_a03 [slip_a04 ...] [--csv out.csv]
+  slip_ratio_from_bag.py slip_a01 --event-a 0.04   # 0.1 m/s^2 baseline run
 
 Per event:
   dv_wheel  speed change from encoder odom over the event window
@@ -42,7 +43,7 @@ G = 9.81
 ODOM_TOPIC = '/wheel/odom'
 IMU_TOPIC = '/imu/data'
 STATIONARY_V = 0.005     # m/s - below this the robot is treated as stopped
-EVENT_A = 0.08           # m/s^2 - |a_wheel| above this starts an event
+EVENT_A = 0.08           # m/s^2 - default for --event-a
 MIN_EVENT_DV = 0.05      # m/s - ignore tiny speed corrections
 SLIP_LIMIT = 0.05        # 5 %
 SETTLE_S = 0.5           # s - look past the ramp end for the slip peak
@@ -81,10 +82,10 @@ def smooth(x, n=3):
     return np.convolve(x, np.ones(n) / n, mode='same')
 
 
-def find_events(t, v):
+def find_events(t, v, event_a=EVENT_A):
     """Contiguous windows where the wheel speed is ramping one way."""
     a = np.gradient(smooth(v), t)
-    sign = np.where(a > EVENT_A, 1, np.where(a < -EVENT_A, -1, 0))
+    sign = np.where(a > event_a, 1, np.where(a < -event_a, -1, 0))
     events, i = [], 0
     while i < len(sign):
         if sign[i] == 0:
@@ -101,7 +102,7 @@ def find_events(t, v):
     return events
 
 
-def analyse(path):
+def analyse(path, event_a=EVENT_A):
     odom, imu = read_bag(path)
     to, vo = odom[:, 0], odom[:, 1]
     ti, ai = imu[:, 0], imu[:, 1]
@@ -118,7 +119,7 @@ def analyse(path):
     ac = ai - bias
 
     rows = []
-    for s, e in find_events(to, vo):
+    for s, e in find_events(to, vo, event_a):
         t0, t1 = to[s], to[e]
         dv_wheel = vo[e] - vo[s]
         m = (ti >= t0) & (ti <= t1)
@@ -155,6 +156,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument('bags', nargs='+')
+    ap.add_argument('--event-a', type=float, default=EVENT_A,
+                    help='|a_wheel| [m/s^2] that starts an accel/decel event '
+                         f'(default {EVENT_A}); use ~0.04 for a 0.1 m/s^2 '
+                         'baseline run, keep it below the tested accel')
     ap.add_argument('--csv', help='write per-event table to this file')
     ap.add_argument('--drive-load', type=float, default=None,
                     help='share of robot weight on the drive wheels (0-1); '
@@ -163,7 +168,7 @@ def main():
 
     all_rows = []
     for b in args.bags:
-        bias, rows = analyse(b)
+        bias, rows = analyse(b, args.event_a)
         print(f'\n== {b}  (imu ax bias {bias:+.3f} m/s^2, {len(rows)} events)')
         print(f'  {"t[s]":>6} {"kind":5} {"v0->v1 [m/s]":>14} {"a_wheel":>8} '
               f'{"a_imu_pk":>8} {"dv_wheel":>8} {"dv_imu":>8} {"slip":>7}')
