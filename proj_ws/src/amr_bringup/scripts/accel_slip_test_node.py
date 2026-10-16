@@ -34,6 +34,7 @@ Exit codes:
 import argparse
 import json
 import math
+import os
 import signal
 import sys
 import time
@@ -41,6 +42,7 @@ import time
 import rclpy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+import numpy as np
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu, LaserScan
@@ -54,6 +56,8 @@ STM32_MAX_ACCEL = 0.5        # firmware MAX_ACCEL - higher commands are capped
 OBSTACLE_STOP_M = 0.6        # from the lidar, along the travel direction
 CORRIDOR_HALF_W = 0.32       # m - robot half width + margin
 SUGGEST_FACTOR = 0.55        # same as slip_ratio_from_bag.py summary
+# Raw odom/imu per accel, for re-checking a strange result offline.
+DUMP_DIR = os.path.expanduser('~/.ros/accel_slip_test')
 
 
 class StopTest(Exception):
@@ -74,11 +78,19 @@ class AccelSlipTest(Node):
         self.create_subscription(LaserScan, '/scan_filtered', self.on_scan,
                                  qos_profile_sensor_data)
 
+    # Time base: the message header stamp (both come from the STM32, so they
+    # share one clock and are not distorted by executor/queue delays);
+    # receive time only if a publisher leaves the stamp empty.
+    @staticmethod
+    def _stamp(msg):
+        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        return t if t > 0.0 else time.time()
+
     def on_odom(self, msg):
-        self.odom.append((time.monotonic(), msg.twist.twist.linear.x))
+        self.odom.append((self._stamp(msg), msg.twist.twist.linear.x))
 
     def on_imu(self, msg):
-        self.imu.append((time.monotonic(), msg.linear_acceleration.x))
+        self.imu.append((self._stamp(msg), msg.linear_acceleration.x))
 
     def on_scan(self, msg):
         # Lidar is mounted yawed by pi (amr.urdf.xacro joint_lidar), so a
@@ -102,7 +114,16 @@ class AccelSlipTest(Node):
         self.pub.publish(t)
 
     def tick(self):
-        rclpy.spin_once(self, timeout_sec=1.0 / RATE_HZ)
+        # Drain every pending callback for one control period. A single
+        # spin_once handles only ONE callback, which at 20 Hz could not keep
+        # up with /imu/data (50 Hz) + /wheel/odom (20 Hz): samples were
+        # dropped and timestamped late, giving bogus >100% slip.
+        end = time.monotonic() + 1.0 / RATE_HZ
+        while True:
+            left = end - time.monotonic()
+            if left <= 0.0:
+                break
+            rclpy.spin_once(self, timeout_sec=min(left, 0.005))
         if self.stop_requested:
             raise StopTest('cancel')
 
@@ -188,6 +209,13 @@ def main():
 
             od = list(zip(*node.odom))
             im = list(zip(*node.imu))
+            try:
+                os.makedirs(DUMP_DIR, exist_ok=True)
+                np.savez(os.path.join(
+                    DUMP_DIR, time.strftime('%Y%m%d_%H%M%S') + f'_a{accel:g}.npz'),
+                    odom=np.array(node.odom), imu=np.array(node.imu))
+            except OSError:
+                pass
             # event threshold: half the tested accel (see --event-a note)
             bias, rows = analyse_arrays(od[0], od[1], im[0], im[1],
                                         event_a=min(0.08, accel / 2),
