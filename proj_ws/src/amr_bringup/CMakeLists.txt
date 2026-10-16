@@ -22,6 +22,7 @@ install(PROGRAMS
   scripts/gyro_integrate_node.py
   scripts/scan_lines_node.py
   scripts/depth_watchdog_node.py
+  scripts/slip_ratio_from_bag.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
