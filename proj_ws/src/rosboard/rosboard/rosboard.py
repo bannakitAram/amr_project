@@ -126,7 +126,25 @@ class ROSBoardNode(object):
         # anyone on the local WiFi with no login.
         self.teleop_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
         self.teleop_last_cmd_time = 0.0
-        self.TELEOP_MAX_LINEAR = 0.1     # m/s - walking pace, tune for your floor/ISO 3691-4 review
+        self.TELEOP_MAX_LINEAR = 0.1     # m/s - default and the forced limit while mapping is scanning
+        # Operator-adjustable linear limit (phone -/+). Joystick teleop goes
+        # straight to /cmd_vel - collision_monitor is NOT in this path - so
+        # the cap stays low; ISO 3691-4 review before raising it.
+        self.TELEOP_LINEAR_MIN = 0.05
+        self.TELEOP_LINEAR_CAP = 0.30
+        self.TELEOP_LINEAR_STEP = 0.05
+        self.teleop_user_max_linear = self.TELEOP_MAX_LINEAR
+        # Forced back to TELEOP_MAX_LINEAR while the AMR Control panel reports
+        # mapping "scanning" (fast driving smears SLAM scan-matching). If that
+        # state goes stale while it was scanning, keep the lock (fail safe).
+        self.mapping_scanning = False
+        self.mapping_state_time = 0.0
+        self.sub_mapping_state = rospy.Subscriber(
+            "/amr_mapping_state", String, self.on_mapping_state, qos=QoSProfile(
+                depth=1, history=HistoryPolicy.KEEP_LAST,
+                reliability=QoSReliabilityPolicy.RELIABLE))
+        self.teleop_state_pub = rospy.Publisher("/rosboard_teleop_state", String, queue_size=1)
+        threading.Thread(target=self.teleop_state_loop, daemon=True).start()
         self.TELEOP_MAX_ANGULAR = 0.15   # rad/s - kept low so fast in-place turns during Mapping don't hurt SLAM scan-matching
         self.TELEOP_DEADMAN_TIMEOUT = 0.5  # seconds - stop if no joystick update arrives in time
         threading.Thread(target=self.teleop_watchdog_loop, daemon=True).start()
@@ -282,10 +300,59 @@ class ROSBoardNode(object):
             return max(-limit, min(limit, value))
 
         twist = Twist()
-        twist.linear.x = clamp(linear, self.TELEOP_MAX_LINEAR)
+        twist.linear.x = clamp(linear, self.teleop_effective_max_linear())
         twist.angular.z = clamp(angular, self.TELEOP_MAX_ANGULAR)
         self.teleop_pub.publish(twist)
         self.teleop_last_cmd_time = time.time()
+
+    def on_mapping_state(self, msg):
+        try:
+            state = json.loads(msg.data)
+        except ValueError:
+            return
+        self.mapping_scanning = bool(state.get("mode") == "mapping" and state.get("scanning"))
+        self.mapping_state_time = time.time()
+
+    def teleop_locked(self):
+        # stale state keeps whatever it last said (scanning -> stays locked)
+        return self.mapping_scanning
+
+    def teleop_effective_max_linear(self):
+        if self.teleop_locked():
+            return min(self.teleop_user_max_linear, self.TELEOP_MAX_LINEAR)
+        return self.teleop_user_max_linear
+
+    def on_teleop_cfg(self, max_linear):
+        """Phone -/+ for the joystick's linear limit, clamped to
+        [TELEOP_LINEAR_MIN, TELEOP_LINEAR_CAP] on TELEOP_LINEAR_STEP steps.
+        Applies to every client (one robot, one limit)."""
+        try:
+            v = float(max_linear)
+        except (TypeError, ValueError):
+            return
+        if v != v:
+            return
+        v = round(v / self.TELEOP_LINEAR_STEP) * self.TELEOP_LINEAR_STEP
+        self.teleop_user_max_linear = round(
+            max(self.TELEOP_LINEAR_MIN, min(self.TELEOP_LINEAR_CAP, v)), 2)
+        self.publish_teleop_state()
+
+    def publish_teleop_state(self):
+        self.teleop_state_pub.publish(String(data=json.dumps({
+            "selected": self.teleop_user_max_linear,
+            "effective": round(self.teleop_effective_max_linear(), 2),
+            "locked": self.teleop_locked(),
+            "min": self.TELEOP_LINEAR_MIN, "cap": self.TELEOP_LINEAR_CAP,
+            "step": self.TELEOP_LINEAR_STEP, "max_angular": self.TELEOP_MAX_ANGULAR,
+        })))
+
+    def teleop_state_loop(self):
+        while True:
+            time.sleep(0.5)
+            try:
+                self.publish_teleop_state()
+            except Exception:
+                pass
 
     def teleop_watchdog_loop(self):
         """

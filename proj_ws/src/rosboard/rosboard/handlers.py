@@ -249,6 +249,13 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
                 argv[1].get("theta", 0.0),
             )
 
+        # client changed the joystick's max linear speed (-/+ on the phone)
+        elif argv[0] == ROSBoardSocketHandler.MSG_TELEOP_CFG:
+            if len(argv) != 2 or type(argv[1]) is not dict:
+                print("error: teleop_cfg: bad: %s" % message)
+                return
+            self.node.on_teleop_cfg(argv[1].get("max_linear"))
+
         # client sent a mapping control (start/pause scan, save, finish)
         elif argv[0] == ROSBoardSocketHandler.MSG_MAPPING:
             if len(argv) != 2 or type(argv[1]) is not dict:
@@ -286,6 +293,7 @@ ROSBoardSocketHandler.MSG_NAV_PATH = "w";
 ROSBoardSocketHandler.MSG_NAV_CANCEL = "c";
 ROSBoardSocketHandler.MSG_INITIAL_POSE = "i";
 ROSBoardSocketHandler.MSG_MAPPING = "k";
+ROSBoardSocketHandler.MSG_TELEOP_CFG = "x";
 
 ROSBoardSocketHandler.PING_SEQ = "s";
 ROSBoardSocketHandler.PONG_SEQ = "s";

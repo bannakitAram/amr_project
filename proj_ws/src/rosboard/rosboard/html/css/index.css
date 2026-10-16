@@ -640,3 +640,41 @@ body.mapping-active .joystick-panel { padding-left: 88px; }
   pointer-events: none;
 }
 .mapping-toast[hidden] { display: none; }
+
+/* joystick.js: STOP + max-speed -/+ share the top row of the panel */
+.joystick-top-row {
+  display: flex;
+  gap: 6px;
+  width: 100%;
+  max-width: 360px;
+  align-items: stretch;
+}
+.joystick-top-row .joystick-stop-btn { flex: 1 1 auto; max-width: none; }
+.joystick-speed { display: flex; gap: 4px; align-items: stretch; }
+.joystick-speed-btn {
+  width: 44px;
+  min-height: 44px;
+  border: none;
+  border-radius: 8px;
+  background: #3f51b5;
+  color: #fff;
+  font-size: 22px;
+  font-weight: 700;
+  touch-action: manipulation;
+}
+.joystick-speed-btn:disabled { opacity: 0.35; }
+.joystick-speed-val {
+  min-width: 54px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font: 700 16px sans-serif;
+}
+.joystick-speed-val small { font-size: 9px; font-weight: 400; color: #bbb; }
+.joystick-speed-val.locked { color: #e89a1c; }
+.joystick-speed-val.locked small { color: #e89a1c; }
+.joystick-top-row .joystick-stop-btn { white-space: nowrap; padding: 12px 6px; }
+body.mapping-active .joystick-speed-btn { width: 38px; }
+body.mapping-active .joystick-speed-val { min-width: 42px; }

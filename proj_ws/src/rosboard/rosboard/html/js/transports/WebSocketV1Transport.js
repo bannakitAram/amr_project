@@ -92,6 +92,11 @@ class WebSocketV1Transport {
       this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_NAV_CANCEL, {}]));
     }
 
+    teleopCfg({maxLinear}) {
+      if (!this.isConnected()) return;
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_TELEOP_CFG, {max_linear: maxLinear}]));
+    }
+
     mappingCmd({action, name}) {
       if (!this.isConnected()) return;
       this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_MAPPING, {action: action, name: name || ""}]));
@@ -118,6 +123,7 @@ class WebSocketV1Transport {
   WebSocketV1Transport.MSG_NAV_CANCEL = "c";
   WebSocketV1Transport.MSG_INITIAL_POSE = "i";
   WebSocketV1Transport.MSG_MAPPING = "k";
+  WebSocketV1Transport.MSG_TELEOP_CFG = "x";
 
   WebSocketV1Transport.PING_SEQ= "s";
   WebSocketV1Transport.PONG_SEQ = "s";

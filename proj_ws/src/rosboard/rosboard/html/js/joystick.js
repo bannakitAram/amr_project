@@ -8,11 +8,16 @@
 // Frontend clamps mirror the backend defaults in rosboard.py - the backend
 // re-clamps independently, so a mismatch here is not a safety issue, just
 // a feel/tuning one.
-const JOYSTICK_MAX_LINEAR = 0.1;   // m/s
+const JOYSTICK_MAX_LINEAR = 0.1;   // m/s - until the server's /rosboard_teleop_state arrives
 const JOYSTICK_MAX_ANGULAR = 0.15; // rad/s - kept low so fast in-place turns during Mapping don't hurt SLAM scan-matching
 const JOYSTICK_SEND_INTERVAL_MS = 100; // well under the backend's 500ms deadman timeout
 
 (function () {
+  // Linear limit actually enforced by rosboard.py (operator -/+ setting, or
+  // forced 0.10 while mapping is scanning). The knob scales to it so full
+  // deflection = the current limit; the server clamps again regardless.
+  let maxLinear = JOYSTICK_MAX_LINEAR;
+  let teleopState = null;
   let panelOpen = false;
   let dragging = false;
   let sendTimer = null;
@@ -21,7 +26,7 @@ const JOYSTICK_SEND_INTERVAL_MS = 100; // well under the backend's 500ms deadman
   function sendCurrent() {
     if (!currentTransport || !currentTransport.isConnected()) return;
     currentTransport.teleop({
-      linear: -knobY * JOYSTICK_MAX_LINEAR,
+      linear: -knobY * maxLinear,
       angular: -knobX * JOYSTICK_MAX_ANGULAR,
     });
   }
@@ -76,7 +81,14 @@ const JOYSTICK_SEND_INTERVAL_MS = 100; // well under the backend's 500ms deadman
     const toggleBtn = $('<button class="joystick-toggle-btn" title="เปิด/ปิด ควบคุมขับหุ่น">🕹</button>').appendTo('body');
     const panel = $(`
       <div class="joystick-panel" hidden>
-        <div class="joystick-stop-btn">หยุด (STOP)</div>
+        <div class="joystick-top-row">
+          <div class="joystick-stop-btn">หยุด (STOP)</div>
+          <div class="joystick-speed">
+            <button class="joystick-speed-btn" data-d="-1">−</button>
+            <div class="joystick-speed-val">0.10<small>m/s</small></div>
+            <button class="joystick-speed-btn" data-d="1">+</button>
+          </div>
+        </div>
         <div class="joystick-pad">
           <div class="joystick-knob"></div>
         </div>
@@ -86,6 +98,37 @@ const JOYSTICK_SEND_INTERVAL_MS = 100; // well under the backend's 500ms deadman
     const padEl = panel.find('.joystick-pad')[0];
     const knobEl = panel.find('.joystick-knob')[0];
     const stopBtn = panel.find('.joystick-stop-btn')[0];
+    const speedVal = panel.find('.joystick-speed-val');
+    const speedBtns = panel.find('.joystick-speed-btn');
+
+    function renderSpeed() {
+      const s = teleopState;
+      const eff = s ? s.effective : maxLinear;
+      speedVal.html(eff.toFixed(2) + '<small>' + (s && s.locked ? 'ล็อก' : 'm/s') + '</small>');
+      speedVal.toggleClass('locked', !!(s && s.locked));
+      speedBtns.each(function () {
+        const d = Number(this.dataset.d);
+        this.disabled = !s || s.locked ||
+          (d < 0 ? s.selected <= s.min + 1e-6 : s.selected >= s.cap - 1e-6);
+      });
+    }
+    speedBtns.on('click', function () {
+      if (!teleopState || teleopState.locked) return;
+      const next = teleopState.selected + Number(this.dataset.d) * teleopState.step;
+      currentTransport.teleopCfg({maxLinear: Math.round(next * 100) / 100});
+    });
+    function onTeleopState(msg) {
+      try { teleopState = JSON.parse(msg.data); } catch (e) { return; }
+      maxLinear = teleopState.effective;
+      renderSpeed();
+    }
+    const origOnAuthenticated = onAuthenticated;
+    onAuthenticated = function () {
+      origOnAuthenticated();
+      unsubscribeExtra('/rosboard_teleop_state', onTeleopState);
+      subscribeExtra('/rosboard_teleop_state', 'std_msgs/msg/String', onTeleopState);
+    };
+    renderSpeed();
 
     toggleBtn.on('click', () => {
       panelOpen = !panelOpen;
