@@ -180,9 +180,9 @@ controller_server:
       time_steps: 56
       model_dt: 0.05
       batch_size: 2000
-      vx_std: 0.2
+      vx_std: 0.1    # was 0.2 (= vx_max): smoother launch; Humble MPPI has no ax_max
       vy_std: 0.0
-      wz_std: 0.25   # was 0.4 - scaled down with wz_max
+      wz_std: 0.2    # was 0.25 (0.4 before wz_max cut) - less jerky turn-in
       vx_max: 0.2
       # 0.0, not negative: normal path-following (FollowPath/MPPI) never
       # plans a reversing trajectory. The BackUp recovery behavior (see
