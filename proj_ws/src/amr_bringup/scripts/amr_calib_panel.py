@@ -22,6 +22,8 @@ firmware or URDF files itself - the operator applies the change by hand,
 re-flashes, and re-runs the test to confirm.
 """
 import json
+import queue
+import threading
 import math
 import os
 import signal
@@ -45,6 +47,12 @@ WHEEL_RADIUS_NOMINAL = 0.064
 # Must match GYRO_SCALE_Z in the STM32 firmware (1.0 = uncalibrated).
 GYRO_SCALE_Z_NOMINAL = 1.0084
 GYRO_MOTOR_TURNS_DEFAULT = 5.0
+# Section 5 (accel_slip_test_node.py). Decel stays at the smoother's
+# max_decel so the stop distance during the test is the normal one.
+ACCEL_LIST_DEFAULT = '0.1,0.2,0.3,0.4,0.5'
+ACCEL_VMAX_DEFAULT = 0.2
+ACCEL_DECEL_DEFAULT = 0.5
+ACCEL_REPS_DEFAULT = 2
 
 SAFETY_BANNER = (
     'ตรวจสอบให้พื้นที่รอบหุ่นยนต์โล่ง ไม่มีคน/สิ่งกีดขวางตลอดเส้นทางทดสอบ '
@@ -62,7 +70,7 @@ class CalibPanel(tk.Toplevel):
         self._gyro_proc = None  # gyro_integrate_node.py, runs alongside the rotate test
         self._last_gyro_deg = None
         self._poll_job = None
-        self._active_test = None  # 'rotate' or 'straight'
+        self._active_test = None  # 'rotate', 'straight', 'gyro', 'gyro_motor', 'accel'
         self._last_commanded_deg = None
         self._last_commanded_distance = None
 
@@ -124,6 +132,8 @@ class CalibPanel(tk.Toplevel):
         self._build_radius_section()
         ttk.Separator(content, orient='horizontal').pack(fill='x', pady=6)
         self._build_gyro_section()
+        ttk.Separator(content, orient='horizontal').pack(fill='x', pady=6)
+        self._build_accel_section()
 
         self.protocol('WM_DELETE_WINDOW', self._on_close)
 
@@ -839,6 +849,167 @@ class CalibPanel(tk.Toplevel):
         self._set_result(self.gyro_result, '\n'.join(lines))
 
     # ------------------------------------------------------------------
+    # Accel / wheel-slip step test (accel_slip_test_node.py)
+    # ------------------------------------------------------------------
+    def _build_accel_section(self):
+        self._accel_lines = queue.Queue()
+        frame = tk.LabelFrame(
+            self._content,
+            text='5) ทดสอบความเร่ง / ล้อลื่น - หา max_accel ที่ไม่ทำให้ล้อลื่น',
+            padx=10, pady=10)
+        frame.pack(fill='x', padx=10, pady=6)
+
+        tk.Label(
+            frame, anchor='w', justify='left', wraplength=560,
+            text='หุ่นวิ่งเดินหน้า/ถอยหลังสลับกัน (~0.6 m) ไล่ความเร่งทีละค่า '
+                 'เทียบความเร็วล้อ (encoder) กับความเร็วตัวรถ (IMU) - slip > 5% = ลื่น. '
+                 'ต้องมีทางโล่งหน้า-หลังอย่างน้อย 1.5 m, ใส่ payload เต็ม, '
+                 'ห้ามสั่ง Navigation/teleop ระหว่างทดสอบ'
+        ).pack(fill='x')
+
+        row = tk.Frame(frame)
+        row.pack(fill='x', pady=2)
+        tk.Label(row, text='ความเร่ง (m/s², คั่นด้วย ,):').pack(side='left')
+        self.accel_list_var = tk.StringVar(value=ACCEL_LIST_DEFAULT)
+        tk.Entry(row, textvariable=self.accel_list_var, width=22).pack(side='left', padx=4)
+
+        row2 = tk.Frame(frame)
+        row2.pack(fill='x', pady=2)
+        tk.Label(row2, text='ความเร็วสูงสุด (m/s):').pack(side='left')
+        self.accel_vmax_var = tk.StringVar(value=str(ACCEL_VMAX_DEFAULT))
+        tk.Entry(row2, textvariable=self.accel_vmax_var, width=6).pack(side='left', padx=4)
+        tk.Label(row2, text='รอบต่อค่า:').pack(side='left', padx=(8, 0))
+        self.accel_reps_var = tk.StringVar(value=str(ACCEL_REPS_DEFAULT))
+        tk.Entry(row2, textvariable=self.accel_reps_var, width=4).pack(side='left', padx=4)
+        self.accel_stop_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(row2, text='หยุดเมื่อเจอลื่น',
+                       variable=self.accel_stop_var).pack(side='left', padx=8)
+
+        self.btn_accel = tk.Button(
+            frame, text='เริ่มทดสอบความเร่ง (Start)', bg='#2980b9', fg='white',
+            command=self._on_click_accel)
+        self.btn_accel.pack(fill='x', pady=6)
+
+        self.accel_status = tk.Label(frame, text='รอเริ่มการทดสอบ', anchor='w')
+        self.accel_status.pack(fill='x')
+
+        self.accel_result = scrolledtext.ScrolledText(
+            frame, height=10, wrap='word', font='TkFixedFont')
+        self.accel_result.pack(fill='both', expand=True)
+        self.accel_result.config(state='disabled')
+
+    def _on_click_accel(self):
+        if self._proc is not None and self._proc.poll() is None:
+            self._cancel_active()
+            return
+        if self._active_test == 'gyro':
+            messagebox.showerror('กำลังบันทึก gyro', 'หยุดบันทึก gyro (หัวข้อ 4) ก่อน')
+            return
+        try:
+            accels = sorted(float(a) for a in self.accel_list_var.get().split(',')
+                            if a.strip())
+            vmax = float(self.accel_vmax_var.get())
+            reps = int(self.accel_reps_var.get())
+        except ValueError:
+            messagebox.showerror('ค่าไม่ถูกต้อง', 'กรอกความเร่ง/ความเร็ว/จำนวนรอบเป็นตัวเลข')
+            return
+        if not accels or min(accels) <= 0 or not 0 < vmax <= 0.3 or reps < 1:
+            messagebox.showerror(
+                'ค่าไม่ถูกต้อง',
+                'ความเร่งต้อง > 0, ความเร็วสูงสุด 0 < v <= 0.3 m/s, รอบ >= 1')
+            return
+
+        if not messagebox.askyesno(
+                'ยืนยันการทดสอบ',
+                f'ทดสอบความเร่ง {", ".join(f"{a:g}" for a in accels)} m/s² '
+                f'ที่ความเร็ว {vmax:.2f} m/s ค่าละ {reps} รอบ '
+                '(เดินหน้า/ถอยหลังสลับกัน) ใช่หรือไม่?\n\n'
+                'การทดสอบนี้สั่ง /cmd_vel ตรง ไม่ผ่าน collision_monitor - '
+                'node จะหยุดเองถ้า LiDAR เห็นสิ่งกีดขวางในทางวิ่ง < 0.6 m '
+                'แต่ต้องมีคนคุม E-stop ตลอด\n\n' + SAFETY_BANNER):
+            return
+
+        self._reset_result(self.accel_result)
+        self._accel_results = []
+        self._accel_summary = None
+        self.btn_accel.config(text='ยกเลิก (Cancel)')
+        self.accel_status.config(text='กำลังเริ่ม...')
+        cmd = ['ros2', 'run', 'amr_bringup', 'accel_slip_test_node.py',
+               '--accels', ','.join(f'{a:g}' for a in accels),
+               '--vmax', f'{vmax:.3f}', '--decel', f'{ACCEL_DECEL_DEFAULT:g}',
+               '--reps', str(reps)]
+        if self.accel_stop_var.get():
+            cmd.append('--stop-on-slip')
+        self._active_test = 'accel'
+        self._proc = subprocess.Popen(
+            cmd, preexec_fn=os.setsid, env=os.environ.copy(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True)
+        proc = self._proc
+
+        # Read progress lines on a thread; the Tk side drains the queue in
+        # _poll_accel_lines (Tk widgets must only be touched from mainloop).
+        def reader():
+            for line in proc.stdout:
+                self._accel_lines.put(line.rstrip('\n'))
+        self._accel_reader = threading.Thread(target=reader, daemon=True)
+        self._accel_reader.start()
+        self._poll_accel_lines()
+        self._poll_proc()
+
+    def _poll_accel_lines(self):
+        while True:
+            try:
+                line = self._accel_lines.get_nowait()
+            except queue.Empty:
+                break
+            tag, _, payload = line.partition(' ')
+            if tag == 'PROGRESS':
+                self.accel_status.config(text=payload)
+            elif tag == 'RESULT':
+                try:
+                    self._accel_results.append(json.loads(payload))
+                except ValueError:
+                    continue
+                self._render_accel()
+            elif tag == 'SUMMARY':
+                try:
+                    self._accel_summary = json.loads(payload)
+                except ValueError:
+                    continue
+                self._render_accel()
+        # keep draining until the reader hit EOF - SUMMARY is the last line
+        # and may arrive after _poll_proc has already seen the exit
+        if self._accel_reader.is_alive() or not self._accel_lines.empty():
+            self.after(200, self._poll_accel_lines)
+
+    def _render_accel(self):
+        def pct(v):
+            return '   -  ' if v is None else f'{v * 100:5.1f}%'
+        lines = ['accel [m/s²]   slip เร่ง   slip เบรก   ผล']
+        for r in self._accel_results:
+            bad = r['slip_accel'] is not None and r['slip_accel'] > 0.05
+            note = 'ลื่น' if bad else 'ไม่ลื่น'
+            if r['events'] < r['expected_events']:
+                note += f' (จับช่วงเร่ง/เบรกได้ {r["events"]}/{r["expected_events"]})'
+            lines.append(f'   {r["accel"]:5.2f}      {pct(r["slip_accel"])}     '
+                         f'{pct(r["slip_decel"])}     {note}')
+        s = self._accel_summary
+        if s is not None:
+            lines.append('')
+            if s['a_limit'] is not None:
+                lines.append(f'เริ่มลื่นที่ a_limit = {s["a_limit"]:g} m/s²')
+                lines.append(f'แนะนำ velocity_smoother max_accel ≈ '
+                             f'{s["suggest_accel"]:g} m/s² (55% ของ a_limit)')
+            elif s['max_ok'] is not None:
+                lines.append(f'ไม่ลื่นจนถึง {s["max_ok"]:g} m/s² '
+                             '(a_limit สูงกว่านี้ - เกิน 0.5 ต้องแก้ firmware ramp)')
+            lines.append('')
+            lines.append('ค่านี้เป็นคำแนะนำเท่านั้น - แก้ nav2_params.yaml เอง, '
+                         'commit, วัดระยะหยุดจริง และสร้าง tag ใหม่ก่อนใช้งานในไลน์')
+        self._set_result(self.accel_result, '\n'.join(lines))
+
+    # ------------------------------------------------------------------
     # Shared subprocess plumbing
     # ------------------------------------------------------------------
     def _reset_result(self, widget):
@@ -937,6 +1108,19 @@ class CalibPanel(tk.Toplevel):
                 messagebox.showwarning('ไม่พบข้อมูล', 'ไม่ได้รับข้อมูลจาก /wheel/raw_distance - ตรวจสอบ bringup')
             else:
                 self.straight_status.config(text=f'ยกเลิก/หยุด (exit code {ret})')
+
+        elif test == 'accel':
+            self.btn_accel.config(text='เริ่มทดสอบความเร่ง (Start)')
+            if ret == 0:
+                self.accel_status.config(text='เสร็จสิ้น')
+            elif ret == 2:
+                self.accel_status.config(text='ไม่พบข้อมูล /wheel/odom หรือ /imu/data')
+                messagebox.showwarning('ไม่พบข้อมูล', 'ไม่ได้รับข้อมูล /wheel/odom หรือ /imu/data - ตรวจสอบ bringup')
+            elif ret == 5:
+                self.accel_status.config(text='หยุด: พบสิ่งกีดขวางในทางวิ่ง')
+                messagebox.showwarning('พบสิ่งกีดขวาง', 'LiDAR พบสิ่งกีดขวางในทางวิ่ง < 0.6 m - หยุดทดสอบ')
+            else:
+                self.accel_status.config(text=f'ยกเลิก/หยุด (exit code {ret})')
 
     def _finish_gyro_motor(self, ret):
         deg = self._stop_gyro()

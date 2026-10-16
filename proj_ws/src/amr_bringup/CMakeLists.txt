@@ -23,6 +23,7 @@ install(PROGRAMS
   scripts/scan_lines_node.py
   scripts/depth_watchdog_node.py
   scripts/slip_ratio_from_bag.py
+  scripts/accel_slip_test_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

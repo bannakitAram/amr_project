@@ -104,15 +104,22 @@ def find_events(t, v, event_a=EVENT_A):
 
 def analyse(path, event_a=EVENT_A):
     odom, imu = read_bag(path)
-    to, vo = odom[:, 0], odom[:, 1]
-    ti, ai = imu[:, 0], imu[:, 1]
+    return analyse_arrays(odom[:, 0], odom[:, 1], imu[:, 0], imu[:, 1],
+                          event_a, label=path)
 
+
+def analyse_arrays(to, vo, ti, ai, event_a=EVENT_A, label=''):
+    """Core analysis on plain arrays (also used live by
+    accel_slip_test_node.py): to/vo = odom time [s] / vx [m/s],
+    ti/ai = imu time [s] / ax [m/s^2], same clock."""
+    to, vo, ti, ai = map(np.asarray, (to, vo, ti, ai))
     # IMU bias: mean ax while the wheels report standstill.
     v_at_imu = np.interp(ti, to, vo)
     still = np.abs(v_at_imu) < STATIONARY_V
     if still.sum() < 10:
-        print(f'  WARNING {path}: <10 stationary IMU samples, bias = 0 '
-              '(keep the robot still ~2 s at the start of each recording)')
+        print(f'  WARNING {label}: <10 stationary IMU samples, bias = 0 '
+              '(keep the robot still ~2 s at the start of each recording)',
+              file=sys.stderr)
         bias = 0.0
     else:
         bias = float(np.median(ai[still]))
@@ -137,7 +144,7 @@ def analyse(path, event_a=EVENT_A):
         gap = (np.interp(tb, to, vo) - v_body) * np.sign(dv_wheel)
         kind = 'accel' if abs(vo[e]) > abs(vo[s]) else 'decel'
         rows.append({
-            'bag': path,
+            'bag': label,
             't': t0 - to[0],
             'kind': kind,
             'dur': t1 - t0,
