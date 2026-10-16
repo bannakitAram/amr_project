@@ -193,15 +193,68 @@ def analyse_arrays(to, vo, ti, ai, event_a=EVENT_A, label=''):
     return bias, rows
 
 
-def verdict(slips):
+def analyse_rotation(to, wo, ti, gz, event_a, label=''):
+    """Spin-in-place slip from wheel yaw rate vs gyro z (used by
+    accel_slip_test_node.py --mode rotate). Much less noisy than the linear
+    test: the gyro is compared directly (no integration, no gravity leak).
+    to/wo = odom time / twist.angular.z, ti/gz = imu time / angular_velocity.z.
+
+    Per ramp: slip = peak (w_wheel - w_gyro) in the ramp direction / |dw|.
+    caster_lag_ms (ramps that start from rest): how long the gyro takes to
+    reach 30 % of the step after the wheels did - caster swivel / drag shows
+    up here. Includes the firmware odom window lag, so compare runs with
+    each other rather than reading it as an absolute value."""
+    to, wo, ti, gz = map(np.asarray, (to, wo, ti, gz))
+    w_at_imu = np.interp(ti, to, wo)
+    still = np.abs(w_at_imu) < 0.01
+    bias = float(np.median(gz[still])) if still.sum() >= 10 else 0.0
+    g = smooth(gz - bias, 3)
+    rows = []
+    for s, e in find_events(to, wo, event_a):
+        t0, t1 = to[s], to[e]
+        dw = wo[e] - wo[s]
+        if t1 <= t0:
+            continue
+        m = (ti >= t0) & (ti <= t1 + SETTLE_S)
+        if m.sum() < 3:
+            continue
+        gap = (np.interp(ti[m], to, wo) - g[m]) * np.sign(dw)
+        lag = None
+        if abs(wo[s]) < 0.02:
+            lvl = 0.3 * abs(dw)
+            tw = to[s:e + 1][np.abs(wo[s:e + 1]) >= lvl]
+            mg = (ti >= t0) & (ti <= t1 + 1.0) & (np.abs(g) >= lvl)
+            if len(tw) and mg.any():
+                lag = (ti[mg][0] - tw[0]) * 1000.0
+        rows.append({
+            'bag': label,
+            't': t0 - to[0],
+            'kind': 'accel' if abs(wo[e]) > abs(wo[s]) else 'decel',
+            'dur': t1 - t0,
+            'w0': wo[s], 'w1': wo[e],
+            'alpha_wheel': abs(dw) / (t1 - t0),
+            'slip': float(np.max(gap)) / abs(dw),
+            'caster_lag_ms': lag,
+        })
+    return bias, rows
+
+
+# Rotate mode compares the gyro directly (no integration, no gravity leak),
+# so it can use tighter bands. A fake robot whose body is capped at 1.2
+# rad/s^2 reads ~20 % at 1.5 and ~1-2 % at 0.5-1.0.
+SLIP_OK_ROT = 0.05
+SLIP_LIMIT_ROT = 0.15
+
+
+def verdict(slips, ok=SLIP_OK, limit=SLIP_LIMIT):
     """'ok' / 'unclear' / 'slip' from the MEDIAN of several events' slip,
     so one noisy ramp cannot decide it (see SLIP_OK / SLIP_LIMIT)."""
     if not slips:
         return None, None
     med = float(np.median(slips))
-    if med > SLIP_LIMIT:
+    if med > limit:
         return med, 'slip'
-    if med > SLIP_OK:
+    if med > ok:
         return med, 'unclear'
     return med, 'ok'
 

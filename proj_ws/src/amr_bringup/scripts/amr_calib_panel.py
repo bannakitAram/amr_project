@@ -53,6 +53,11 @@ ACCEL_LIST_DEFAULT = '0.1,0.2,0.3,0.4,0.5'
 ACCEL_VMAX_DEFAULT = 0.2
 ACCEL_DECEL_DEFAULT = 0.5
 ACCEL_REPS_DEFAULT = 2
+# Rotate mode: spin in place; alpha in rad/s^2 (STM32 ramp caps ~2.1),
+# decel = smoother max_decel[2], vmax = MPPI wz_max.
+ROT_LIST_DEFAULT = '0.5,1.0,1.5,2.0'
+ROT_WMAX_DEFAULT = 0.5
+ROT_DECEL_DEFAULT = 1.5
 
 SAFETY_BANNER = (
     'ตรวจสอบให้พื้นที่รอบหุ่นยนต์โล่ง ไม่มีคน/สิ่งกีดขวางตลอดเส้นทางทดสอบ '
@@ -855,27 +860,34 @@ class CalibPanel(tk.Toplevel):
         self._accel_lines = queue.Queue()
         frame = tk.LabelFrame(
             self._content,
-            text='5) ทดสอบความเร่ง / ล้อลื่น - หา max_accel ที่ไม่ทำให้ล้อลื่น',
+            text='5) ทดสอบความเร่ง / ล้อลื่น (เดินตรง และ หมุนอยู่กับที่)',
             padx=10, pady=10)
         frame.pack(fill='x', padx=10, pady=6)
 
-        tk.Label(
-            frame, anchor='w', justify='left', wraplength=560,
-            text='หุ่นวิ่งเดินหน้า/ถอยหลังสลับกัน (~0.6 m) ไล่ความเร่งทีละค่า '
-                 'เทียบความเร็วล้อ (encoder) กับความเร็วตัวรถ (IMU) - slip > 5% = ลื่น. '
-                 'ต้องมีทางโล่งหน้า-หลังอย่างน้อย 1.5 m, ใส่ payload เต็ม, '
-                 'ห้ามสั่ง Navigation/teleop ระหว่างทดสอบ'
-        ).pack(fill='x')
+        mode_row = tk.Frame(frame)
+        mode_row.pack(fill='x', pady=2)
+        tk.Label(mode_row, text='โหมด:').pack(side='left')
+        self.accel_mode_var = tk.StringVar(value='linear')
+        for value, label in (('linear', 'เดินตรง (accel)'),
+                             ('rotate', 'หมุนอยู่กับที่ (angular accel)')):
+            tk.Radiobutton(
+                mode_row, text=label, value=value, variable=self.accel_mode_var,
+                command=self._on_accel_mode_change).pack(side='left', padx=4)
+
+        self.accel_help = tk.Label(frame, anchor='w', justify='left', wraplength=560)
+        self.accel_help.pack(fill='x')
 
         row = tk.Frame(frame)
         row.pack(fill='x', pady=2)
-        tk.Label(row, text='ความเร่ง (m/s², คั่นด้วย ,):').pack(side='left')
+        self.accel_list_label = tk.Label(row)
+        self.accel_list_label.pack(side='left')
         self.accel_list_var = tk.StringVar(value=ACCEL_LIST_DEFAULT)
         tk.Entry(row, textvariable=self.accel_list_var, width=22).pack(side='left', padx=4)
 
         row2 = tk.Frame(frame)
         row2.pack(fill='x', pady=2)
-        tk.Label(row2, text='ความเร็วสูงสุด (m/s):').pack(side='left')
+        self.accel_vmax_label = tk.Label(row2)
+        self.accel_vmax_label.pack(side='left')
         self.accel_vmax_var = tk.StringVar(value=str(ACCEL_VMAX_DEFAULT))
         tk.Entry(row2, textvariable=self.accel_vmax_var, width=6).pack(side='left', padx=4)
         tk.Label(row2, text='รอบต่อค่า:').pack(side='left', padx=(8, 0))
@@ -897,6 +909,31 @@ class CalibPanel(tk.Toplevel):
             frame, height=10, wrap='word', font='TkFixedFont')
         self.accel_result.pack(fill='both', expand=True)
         self.accel_result.config(state='disabled')
+        self._on_accel_mode_change()
+
+    def _on_accel_mode_change(self):
+        rot = self.accel_mode_var.get() == 'rotate'
+        if rot:
+            self.accel_help.config(text=(
+                'หุ่นหมุนอยู่กับที่ สลับ CCW/CW ไล่ angular accel ทีละค่า '
+                'เทียบ yaw rate จากล้อ กับ gyro z (แม่นกว่าโหมดเดินตรง). '
+                'ต้องเคลียร์พื้นที่เป็นวงกลมรัศมี >= 1.1 m รอบหุ่น '
+                '(node หยุดเองถ้า LiDAR เห็นของในรัศมี 0.8 m), ใส่ payload เต็ม, '
+                'ห้ามสั่ง Navigation/teleop ระหว่างทดสอบ'))
+            self.accel_list_label.config(text='angular accel (rad/s², คั่นด้วย ,):')
+            self.accel_vmax_label.config(text='ความเร็วหมุนสูงสุด (rad/s):')
+            self.accel_list_var.set(ROT_LIST_DEFAULT)
+            self.accel_vmax_var.set(str(ROT_WMAX_DEFAULT))
+        else:
+            self.accel_help.config(text=(
+                'หุ่นวิ่งเดินหน้า/ถอยหลังสลับกัน (~0.6 m) ไล่ความเร่งทีละค่า '
+                'เทียบความเร็วล้อ (encoder) กับความเร็วตัวรถ (IMU). '
+                'ต้องมีทางโล่งหน้า-หลังอย่างน้อย 1.5 m, ใส่ payload เต็ม, '
+                'ห้ามสั่ง Navigation/teleop ระหว่างทดสอบ'))
+            self.accel_list_label.config(text='ความเร่ง (m/s², คั่นด้วย ,):')
+            self.accel_vmax_label.config(text='ความเร็วสูงสุด (m/s):')
+            self.accel_list_var.set(ACCEL_LIST_DEFAULT)
+            self.accel_vmax_var.set(str(ACCEL_VMAX_DEFAULT))
 
     def _on_click_accel(self):
         if self._proc is not None and self._proc.poll() is None:
@@ -913,20 +950,30 @@ class CalibPanel(tk.Toplevel):
         except ValueError:
             messagebox.showerror('ค่าไม่ถูกต้อง', 'กรอกความเร่ง/ความเร็ว/จำนวนรอบเป็นตัวเลข')
             return
-        if not accels or min(accels) <= 0 or not 0 < vmax <= 0.3 or reps < 1:
+        rot = self.accel_mode_var.get() == 'rotate'
+        vlim = 0.6 if rot else 0.3
+        if not accels or min(accels) <= 0 or not 0 < vmax <= vlim or reps < 1:
             messagebox.showerror(
                 'ค่าไม่ถูกต้อง',
-                'ความเร่งต้อง > 0, ความเร็วสูงสุด 0 < v <= 0.3 m/s, รอบ >= 1')
+                f'ความเร่งต้อง > 0, ความเร็วสูงสุด 0 < v <= {vlim:g} '
+                f'{"rad/s" if rot else "m/s"}, รอบ >= 1')
             return
 
+        if rot:
+            what = (f'ทดสอบหมุนอยู่กับที่ angular accel '
+                    f'{", ".join(f"{a:g}" for a in accels)} rad/s² '
+                    f'ที่ {vmax:.2f} rad/s ค่าละ {reps} รอบ (CCW/CW สลับกัน)')
+            guard = 'node จะหยุดเองถ้า LiDAR เห็นสิ่งกีดขวางในรัศมี 0.8 m รอบหุ่น'
+        else:
+            what = (f'ทดสอบความเร่ง {", ".join(f"{a:g}" for a in accels)} m/s² '
+                    f'ที่ความเร็ว {vmax:.2f} m/s ค่าละ {reps} รอบ '
+                    '(เดินหน้า/ถอยหลังสลับกัน)')
+            guard = 'node จะหยุดเองถ้า LiDAR เห็นสิ่งกีดขวางในทางวิ่ง < 0.6 m'
         if not messagebox.askyesno(
                 'ยืนยันการทดสอบ',
-                f'ทดสอบความเร่ง {", ".join(f"{a:g}" for a in accels)} m/s² '
-                f'ที่ความเร็ว {vmax:.2f} m/s ค่าละ {reps} รอบ '
-                '(เดินหน้า/ถอยหลังสลับกัน) ใช่หรือไม่?\n\n'
+                what + ' ใช่หรือไม่?\n\n'
                 'การทดสอบนี้สั่ง /cmd_vel ตรง ไม่ผ่าน collision_monitor - '
-                'node จะหยุดเองถ้า LiDAR เห็นสิ่งกีดขวางในทางวิ่ง < 0.6 m '
-                'แต่ต้องมีคนคุม E-stop ตลอด\n\n' + SAFETY_BANNER):
+                + guard + ' แต่ต้องมีคนคุม E-stop ตลอด\n\n' + SAFETY_BANNER):
             return
 
         self._reset_result(self.accel_result)
@@ -936,8 +983,9 @@ class CalibPanel(tk.Toplevel):
         self.accel_status.config(text='กำลังเริ่ม...')
         cmd = ['ros2', 'run', 'amr_bringup', 'accel_slip_test_node.py',
                '--accels', ','.join(f'{a:g}' for a in accels),
-               '--vmax', f'{vmax:.3f}', '--decel', f'{ACCEL_DECEL_DEFAULT:g}',
-               '--reps', str(reps)]
+               '--vmax', f'{vmax:.3f}',
+               '--decel', f'{ROT_DECEL_DEFAULT if rot else ACCEL_DECEL_DEFAULT:g}',
+               '--reps', str(reps), '--mode', 'rotate' if rot else 'linear']
         if self.accel_stop_var.get():
             cmd.append('--stop-on-slip')
         self._active_test = 'accel'
@@ -987,9 +1035,14 @@ class CalibPanel(tk.Toplevel):
         def pct(v):
             return '   -  ' if v is None else f'{v * 100:5.1f}%'
         words = {'ok': 'ไม่ลื่น', 'unclear': 'ไม่แน่ชัด', 'slip': 'ลื่น', None: '-'}
-        lines = ['accel [m/s²]   slip เร่ง   slip เบรก   ผล (ค่ากลางของทุกรอบ)']
+        rot = any(r.get('mode') == 'rotate' for r in self._accel_results)
+        unit = 'rad/s²' if rot else 'm/s²'
+        head = 'alpha [rad/s²]' if rot else 'accel [m/s²]  '
+        lines = [f'{head} slip เร่ง   slip เบรก   ผล (ค่ากลางของทุกรอบ)']
         for r in self._accel_results:
             note = words[r.get('verdict_accel')]
+            if r.get('caster_lag_ms') is not None:
+                note += f', gyro ตามล้อช้า {r["caster_lag_ms"]:.0f} ms'
             if r.get('verdict_decel') in ('unclear', 'slip'):
                 note += f', เบรก{words[r["verdict_decel"]]}'
             if r.get('stop_overshoot', 0.0) > 0.02:
@@ -1001,18 +1054,26 @@ class CalibPanel(tk.Toplevel):
         s = self._accel_summary
         if s is not None:
             lines.append('')
+            target = 'max_accel[2] (angular)' if rot else 'max_accel'
             if s['a_limit'] is not None:
-                lines.append(f'เริ่มลื่นที่ a_limit = {s["a_limit"]:g} m/s²')
-                lines.append(f'แนะนำ velocity_smoother max_accel ≈ '
-                             f'{s["suggest_accel"]:g} m/s² (55% ของ a_limit)')
+                lines.append(f'เริ่มลื่นที่ a_limit = {s["a_limit"]:g} {unit}')
+                lines.append(f'แนะนำ velocity_smoother {target} ≈ '
+                             f'{s["suggest_accel"]:g} {unit} (55% ของ a_limit)')
             elif s['max_ok'] is not None:
-                lines.append(f'ไม่ลื่นจนถึง {s["max_ok"]:g} m/s² '
-                             '(a_limit สูงกว่านี้ - เกิน 0.5 ต้องแก้ firmware ramp)')
+                cap = '~2.1 rad/s²' if rot else '0.5 m/s²'
+                lines.append(f'ไม่ลื่นจนถึง {s["max_ok"]:g} {unit} '
+                             f'(a_limit สูงกว่านี้ - เกิน {cap} ต้องแก้ firmware ramp)')
             if s.get('unclear'):
+                band = ('5-15%' if rot else '10-25%')
+                why = ('ใกล้เกณฑ์ - อาจเริ่มลื่นหรือ caster ลาก' if rot
+                       else 'อยู่ในช่วง noise ของการวัด (IMU/ตัวรถโยก)')
                 lines.append('ไม่แน่ชัดที่ ' + ', '.join(f'{a:g}' for a in s['unclear'])
-                             + ' m/s² - slip 10-25% อยู่ในช่วง noise ของการวัด '
-                             '(IMU/ตัวรถโยก): ทดสอบซ้ำด้วยรอบมากขึ้น และดูล้อด้วยตา '
-                             '- ไม่มีค่าแนะนำจากผลนี้')
+                             + f' {unit} - slip {band} {why}: ทดสอบซ้ำด้วยรอบมากขึ้น '
+                             'และดูล้อด้วยตา - ไม่มีค่าแนะนำจากผลนี้')
+            if rot:
+                lines.append('gyro ตามล้อช้า = เวลาที่ตัวรถเริ่มหมุนตามหลังล้อ '
+                             '(รวม lag ของ odom filter) - ค่าที่เพิ่มขึ้นมาก/ไม่เท่ากัน '
+                             'ระหว่างรอบ = caster กลับตัวไม่ทัน')
             lines.append('')
             lines.append('ค่านี้เป็นคำแนะนำเท่านั้น - แก้ nav2_params.yaml เอง, '
                          'commit, วัดระยะหยุดจริง และสร้าง tag ใหม่ก่อนใช้งานในไลน์')

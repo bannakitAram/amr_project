@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Accel / wheel-slip step test (Calibrate panel section 5).
 
+--mode linear (default) drives straight as described below. --mode rotate
+spins in place instead: --accels are angular accels [rad/s^2] up to --vmax
+[rad/s], alternating CCW / CW, and slip is wheel yaw rate (/wheel/odom
+twist.angular.z) vs gyro z (/imu/data) - see analyse_rotation(). Obstacle
+check for rotate: anything within ROT_CLEAR_R of the robot centre.
+
 Runs as its own OS process (launched via `ros2 run amr_bringup
 accel_slip_test_node.py ...`), same reasoning as calib_straight_node.py.
 
@@ -47,7 +53,8 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu, LaserScan
 
-from slip_ratio_from_bag import analyse_arrays, verdict
+from slip_ratio_from_bag import (SLIP_LIMIT, SLIP_LIMIT_ROT, SLIP_OK, SLIP_OK_ROT,
+                                 analyse_arrays, analyse_rotation, verdict)
 
 RATE_HZ = 20.0
 STILL_S = 2.0
@@ -56,6 +63,14 @@ STM32_MAX_ACCEL = 0.5        # firmware MAX_ACCEL - higher commands are capped
 OBSTACLE_STOP_M = 0.6        # from the lidar, along the travel direction
 CORRIDOR_HALF_W = 0.32       # m - robot half width + margin
 SUGGEST_FACTOR = 0.55        # same as slip_ratio_from_bag.py summary
+# Rotate mode. Per-wheel STM32 ramp 0.5 m/s^2 over half the wheel
+# separation (0.472/2) caps the angular accel the firmware will follow.
+HALF_SEP = 0.236
+STM32_MAX_ALPHA = STM32_MAX_ACCEL / HALF_SEP     # ~2.1 rad/s^2
+# Footprint corner radius (nav2 footprint +-0.49 x +-0.26 -> 0.555 m) plus
+# margin: the sweep circle while spinning in place.
+ROT_CLEAR_R = 0.80
+LIDAR_X = 0.1855             # amr.urdf.xacro lidar_x = base_depth/2 - 0.290
 # Raw odom/imu per accel, for re-checking a strange result offline.
 DUMP_DIR = os.path.expanduser('~/.ros/accel_slip_test')
 
@@ -65,12 +80,13 @@ class StopTest(Exception):
 
 
 class AccelSlipTest(Node):
-    def __init__(self):
+    def __init__(self, axis='linear'):
         super().__init__('amr_accel_slip_test')
+        self.axis = axis
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.odom = []
         self.imu = []
-        self.blocked = {1: False, -1: False}   # per travel direction
+        self.blocked = {1: False, -1: False, 'rot': False}
         self.stop_requested = False
         self.create_subscription(Odometry, '/wheel/odom', self.on_odom, 20)
         self.create_subscription(Imu, '/imu/data', self.on_imu,
@@ -87,20 +103,24 @@ class AccelSlipTest(Node):
         return t if t > 0.0 else time.time()
 
     def on_odom(self, msg):
-        self.odom.append((self._stamp(msg), msg.twist.twist.linear.x))
+        self.odom.append((self._stamp(msg), msg.twist.twist.linear.x,
+                          msg.twist.twist.angular.z))
 
     def on_imu(self, msg):
-        self.imu.append((self._stamp(msg), msg.linear_acceleration.x))
+        self.imu.append((self._stamp(msg), msg.linear_acceleration.x,
+                         msg.angular_velocity.z))
 
     def on_scan(self, msg):
         # Lidar is mounted yawed by pi (amr.urdf.xacro joint_lidar), so a
         # beam at laser angle a points along robot angle a + pi.
-        blocked = {1: False, -1: False}
+        blocked = {1: False, -1: False, 'rot': False}
         a = msg.angle_min
         for r in msg.ranges:
             if msg.range_min < r < msg.range_max:
                 x = -r * math.cos(a)
                 y = -r * math.sin(a)
+                if math.hypot(x + LIDAR_X, y) < ROT_CLEAR_R:
+                    blocked['rot'] = True
                 if abs(y) < CORRIDOR_HALF_W:
                     for d in (1, -1):
                         if 0.0 < d * x < OBSTACLE_STOP_M:
@@ -110,7 +130,10 @@ class AccelSlipTest(Node):
 
     def send(self, vx):
         t = Twist()
-        t.linear.x = vx
+        if self.axis == 'rotate':
+            t.angular.z = vx
+        else:
+            t.linear.x = vx
         self.pub.publish(t)
 
     def tick(self):
@@ -147,7 +170,8 @@ class AccelSlipTest(Node):
             self.tick()
 
     def check_obstacle(self, direction, vx):
-        if vx != 0.0 and self.blocked[direction]:
+        key = 'rot' if self.axis == 'rotate' else direction
+        if vx != 0.0 and self.blocked[key]:
             raise StopTest('obstacle')
 
     def zero(self):
@@ -164,11 +188,15 @@ def main():
     ap.add_argument('--decel', type=float, default=0.5)
     ap.add_argument('--reps', type=int, default=2)
     ap.add_argument('--stop-on-slip', action='store_true')
+    ap.add_argument('--mode', choices=('linear', 'rotate'), default='linear',
+                    help='rotate: accels/vmax/decel are rad/s^2 / rad/s')
     args = ap.parse_args()
+    rot = args.mode == 'rotate'
+    cap = STM32_MAX_ALPHA if rot else STM32_MAX_ACCEL
     accels = sorted(float(a) for a in args.accels.split(',') if a.strip())
 
     rclpy.init()
-    node = AccelSlipTest()
+    node = AccelSlipTest(args.mode)
 
     def on_signal(signum, frame):
         node.stop_requested = True
@@ -191,16 +219,21 @@ def main():
             raise StopTest('nodata')
 
         for accel in accels:
-            if accel > STM32_MAX_ACCEL:
-                say('PROGRESS', f'skip {accel:.2f}: above STM32 MAX_ACCEL '
-                    f'{STM32_MAX_ACCEL} (firmware would cap it)')
+            if accel > cap:
+                say('PROGRESS', f'skip {accel:.2f}: above STM32 ramp limit '
+                    f'{cap:.2f} (firmware would cap it)')
                 continue
             node.odom.clear()
             node.imu.clear()
             for rep in range(args.reps):
                 d = 1 if rep % 2 == 0 else -1
-                say('PROGRESS', f'accel {accel:.2f} m/s^2 - run {rep + 1}/'
-                    f'{args.reps} ({"forward" if d > 0 else "backward"})')
+                if rot:
+                    what = (f'alpha {accel:.2f} rad/s^2 - run {rep + 1}/{args.reps} '
+                            f'({"CCW" if d > 0 else "CW"})')
+                else:
+                    what = (f'accel {accel:.2f} m/s^2 - run {rep + 1}/{args.reps} '
+                            f'({"forward" if d > 0 else "backward"})')
+                say('PROGRESS', what)
                 node.hold(0.0, STILL_S, d)
                 node.ramp(0.0, d * args.vmax, accel, d)
                 node.hold(d * args.vmax, CRUISE_S, d)
@@ -212,18 +245,27 @@ def main():
             try:
                 os.makedirs(DUMP_DIR, exist_ok=True)
                 np.savez(os.path.join(
-                    DUMP_DIR, time.strftime('%Y%m%d_%H%M%S') + f'_a{accel:g}.npz'),
+                    DUMP_DIR, time.strftime('%Y%m%d_%H%M%S')
+                + (f'_rot{accel:g}.npz' if rot else f'_a{accel:g}.npz')),
                     odom=np.array(node.odom), imu=np.array(node.imu))
             except OSError:
                 pass
-            # event threshold: half the tested accel (see --event-a note)
-            bias, rows = analyse_arrays(od[0], od[1], im[0], im[1],
-                                        event_a=min(0.08, accel / 2),
-                                        label=f'a={accel}')
+            if rot:
+                bias, rows = analyse_rotation(od[0], od[2], im[0], im[2],
+                                              event_a=accel / 2,
+                                              label=f'alpha={accel}')
+                for r in rows:
+                    r['overshoot'] = 0.0
+            else:
+                # event threshold: half the tested accel (see --event-a note)
+                bias, rows = analyse_arrays(od[0], od[1], im[0], im[1],
+                                            event_a=min(0.08, accel / 2),
+                                            label=f'a={accel}')
             acc = [r['slip'] for r in rows if r['kind'] == 'accel']
             dec = [r['slip'] for r in rows if r['kind'] == 'decel']
-            slip_acc, verdict_acc = verdict(acc)
-            slip_dec, verdict_dec = verdict(dec)
+            bands = (SLIP_OK_ROT, SLIP_LIMIT_ROT) if rot else (SLIP_OK, SLIP_LIMIT)
+            slip_acc, verdict_acc = verdict(acc, *bands)
+            slip_dec, verdict_dec = verdict(dec, *bands)
             res = {
                 'accel': accel,
                 # median over this accel's ramps, not the single worst one
@@ -236,7 +278,13 @@ def main():
                 'stop_overshoot': max([r['overshoot'] for r in rows], default=0.0),
                 'expected_events': 2 * args.reps,
                 'imu_bias': bias,
+                'mode': args.mode,
+                'bands': bands,
             }
+            if rot:
+                lags = [r['caster_lag_ms'] for r in rows
+                        if r.get('caster_lag_ms') is not None]
+                res['caster_lag_ms'] = float(np.median(lags)) if lags else None
             results.append(res)
             say('RESULT', json.dumps(res))
             if args.stop_on_slip and verdict_acc == 'slip':
