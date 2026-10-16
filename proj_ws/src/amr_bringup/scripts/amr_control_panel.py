@@ -287,6 +287,23 @@ def save_stations(map_name, stations):
         yaml.safe_dump({'stations': stations}, f, sort_keys=False)
 
 
+def load_map_image(yaml_path):
+    """(meta, RGB PIL image) of a saved map_server map, in the panel's map
+    colours (same thresholds as map_server's trinary mode)."""
+    with open(yaml_path) as f:
+        meta = yaml.safe_load(f)
+    img_path = meta['image']
+    if not os.path.isabs(img_path):
+        img_path = os.path.join(os.path.dirname(yaml_path), img_path)
+    g = np.asarray(Image.open(img_path).convert('L'), dtype=np.float32) / 255.0
+    occ = g if meta.get('negate', 0) else 1.0 - g
+    rgb = np.empty(g.shape + (3,), dtype=np.uint8)
+    rgb[:] = MAP_UNKNOWN
+    rgb[occ < meta.get('free_thresh', 0.25)] = MAP_FREE
+    rgb[occ > meta.get('occupied_thresh', 0.65)] = MAP_OCC
+    return meta, Image.fromarray(rgb, 'RGB')
+
+
 def find_key(tree, key):
     """First value of `key` anywhere in a nested dict (nav2_params.yaml)."""
     if isinstance(tree, dict):
@@ -333,6 +350,16 @@ EN = {
     'ยังไม่ได้ตั้ง PIN - ใช้ค่าเริ่มต้น (ตั้งได้ที่ ': 'No PIN set - using default (set in ',
     '4-6 หลัก': '4-6 digits',
     'PIN ไม่ถูกต้อง': 'Wrong PIN',
+    'ใส่ PIN ปัจจุบัน': 'Enter current PIN',
+    'ค่าเริ่มต้น 1234': 'default 1234',
+    'ใส่ PIN ใหม่': 'Enter new PIN',
+    'ยืนยัน PIN ใหม่อีกครั้ง': 'Confirm new PIN',
+    'ต้องเป็นตัวเลข 4-6 หลัก': 'Must be 4-6 digits',
+    'PIN ไม่ตรงกัน': 'PINs do not match',
+    'เปลี่ยน PIN โหมดนักพัฒนา': 'Change Developer PIN',
+    'เปลี่ยน PIN ไม่สำเร็จ': 'PIN change failed',
+    'เปลี่ยน PIN แล้ว': 'PIN changed',
+    'ใช้ PIN ใหม่ตั้งแต่ครั้งถัดไป': 'The new PIN applies from next login',
     # Auto
     'เริ่มระบบนำทาง (เลือกแผนที่)': 'Start navigation (select map)',
     'จุดหมาย (Destination)': 'Destination',
@@ -417,7 +444,7 @@ EN = {
     'แผนที่นี้ยังไม่มี Station': 'This map has no stations',
     'ลบ ': 'Delete ',
     # Settings
-    'ไทย · ปรับที่ OS (ยังไม่รองรับในแอป)': 'Switch on Home page · brightness: set in OS',
+    'เปลี่ยนภาษาที่หน้า Home · ความสว่างปรับที่ OS': 'Switch on Home page · brightness: set in OS',
     'ปรับเทียบ Localization / Wheel (Calibrate)': 'Calibrate localization / wheels',
     'อ่านอย่างเดียว - ค่าที่เกี่ยวกับ Safety ต้องแก้ผ่านไฟล์ + commit + tag ใหม่':
         'Read-only - safety-related values change via file + commit + new tag',
@@ -429,6 +456,11 @@ EN = {
     'บันทึก': 'Save', 'ยกเลิก': 'Cancel', 'เลือก': 'Select', 'ปิด': 'Close',
     '   (ล่าสุด)': '   (latest)',
     'เลือกแผนที่สำหรับนำทาง': 'Select map for navigation',
+    'เลือกแผนที่นี้': 'Use this map',
+    'แก้ไขล่าสุด ': 'Modified ',
+    ' จุด': '',
+    ' ม./px': ' m/px',
+    'ขนาด ': 'Size ',
     'ไม่พบแผนที่': 'No map found',
     'ยังไม่มีไฟล์แผนที่ที่บันทึกไว้ กรุณาสร้างแผนที่ก่อน (โหมด Mapping)':
         'No saved map yet - create one first (Mapping mode)',
@@ -1103,12 +1135,10 @@ class AmrControlPanel(tk.Tk):
         self._make_mode_card(
             cards, 'ใช้งานทั่วไป', 'General Operations', 'primary',
             lambda: self._show_page('general'),
-            'Auto: ส่งหุ่นไปยัง Station · Manual: ขับด้วย Joystick'
         ).grid(row=0, column=0, sticky='nsew', padx=(px(4), px(8)), pady=(px(0), px(8)))
         self._make_mode_card(
-            cards, 'โหมดนักพัฒนา', 'Developer Mode  (PIN)', 'info',
+            cards, 'โหมดนักพัฒนา', 'Developer Mode', 'info',
             self._on_click_dev,
-            'Mapping · Navigation Test · Settings (ต้องใส่ PIN)'
         ).grid(row=0, column=1, sticky='nsew', padx=(px(8), px(4)), pady=(px(0), px(8)))
 
     # ---------- PIN modal ----------
@@ -1119,20 +1149,53 @@ class AmrControlPanel(tk.Tk):
 
     def _ask_pin(self):
         pin, is_default = get_dev_pin()
-        result = {'ok': False}
+        return self._pin_keypad(
+            'ใส่ PIN เพื่อเข้าโหมดนักพัฒนา',
+            (f'ยังไม่ได้ตั้ง PIN - ใช้ค่าเริ่มต้น (ตั้งได้ที่ {DEV_PIN_FILE})'
+             if is_default else '4-6 หลัก'),
+            AMBER if is_default else TEXT_MUTED,
+            lambda code: None if code == pin else 'PIN ไม่ถูกต้อง') is not None
+
+    def _on_change_pin(self):
+        pin, is_default = get_dev_pin()
+        if self._pin_keypad(
+                'ใส่ PIN ปัจจุบัน',
+                'ค่าเริ่มต้น 1234' if is_default else '4-6 หลัก', TEXT_MUTED,
+                lambda code: None if code == pin else 'PIN ไม่ถูกต้อง') is None:
+            return
+        new = self._pin_keypad(
+            'ใส่ PIN ใหม่', '4-6 หลัก', TEXT_MUTED,
+            lambda code: None if re.fullmatch(r'\d{4,6}', code) else 'ต้องเป็นตัวเลข 4-6 หลัก')
+        if new is None:
+            return
+        if self._pin_keypad(
+                'ยืนยัน PIN ใหม่อีกครั้ง', '4-6 หลัก', TEXT_MUTED,
+                lambda code: None if code == new else 'PIN ไม่ตรงกัน') is None:
+            return
+        try:
+            tmp = DEV_PIN_FILE + '.tmp'
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as f:
+                f.write(new + '\n')
+            os.replace(tmp, DEV_PIN_FILE)
+        except OSError as e:
+            messagebox.showerror('เปลี่ยน PIN ไม่สำเร็จ', str(e))
+            return
+        messagebox.showinfo('เปลี่ยน PIN แล้ว', 'ใช้ PIN ใหม่ตั้งแต่ครั้งถัดไป')
+
+    def _pin_keypad(self, title, hint_text, hint_color, check):
+        """Modal touch keypad. check(code) returns None if accepted, else
+        an error message (keypad stays open). Returns the code or None."""
+        result = {'code': None}
         entered = []
         win = tk.Toplevel(self)
-        win.title('Developer PIN')
+        win.title('PIN')
         win.configure(bg=SURFACE)
         win.transient(self)
         win.resizable(False, False)
 
-        self._label(win, 'ใส่ PIN เพื่อเข้าโหมดนักพัฒนา', font=self.f_button
-                    ).pack(pady=(px(16), px(4)))
-        hint = self._label(
-            win, (f'ยังไม่ได้ตั้ง PIN - ใช้ค่าเริ่มต้น (ตั้งได้ที่ {DEV_PIN_FILE})'
-                  if is_default else '4-6 หลัก'), font=self.f_small,
-            fg=(AMBER if is_default else TEXT_MUTED))
+        self._label(win, title, font=self.f_button).pack(pady=(px(16), px(4)))
+        hint = self._label(win, hint_text, font=self.f_small, fg=hint_color)
         hint.pack()
         disp = self._label(win, '', font=self.f_huge, width=10, bg=SURFACE_2)
         disp.pack(pady=px(10), ipady=px(6))
@@ -1151,13 +1214,15 @@ class AmrControlPanel(tk.Tk):
                 refresh()
 
         def verify(_e=None):
-            if ''.join(entered) == pin:
-                result['ok'] = True
+            code = ''.join(entered)
+            err = check(code)
+            if err is None:
+                result['code'] = code
                 win.destroy()
             else:
                 entered.clear()
                 refresh()
-                hint.config(text=T('PIN ไม่ถูกต้อง'), fg=RED)
+                hint.config(text=T(err), fg=RED)
 
         pad = tk.Frame(win, bg=SURFACE)
         pad.pack(padx=px(20))
@@ -1182,7 +1247,7 @@ class AmrControlPanel(tk.Tk):
         win.grab_set()
         win.focus_set()
         win.wait_window()
-        return result['ok']
+        return result['code']
 
     # ---------- General ----------
     def _build_general(self, p):
@@ -1765,13 +1830,18 @@ class AmrControlPanel(tk.Tk):
         kv(gen, 'ROS_DOMAIN_ID', os.environ.get('ROS_DOMAIN_ID', '0 (default)'))
         kv(gen, 'RMW', os.environ.get('RMW_IMPLEMENTATION', 'default'))
         self.set_git = kv(gen, 'Software version (git)', git_describe())
-        kv(gen, 'Language / Brightness', 'ไทย · ปรับที่ OS (ยังไม่รองรับในแอป)')
+        kv(gen, 'Language / Brightness', 'เปลี่ยนภาษาที่หน้า Home · ความสว่างปรับที่ OS')
         self._section_title(gen, 'Calibration').pack(fill='x', padx=px(16), pady=(px(14), px(2)))
         row = tk.Frame(gen, bg=SURFACE)
         row.pack(fill='x', padx=px(16))
         self.btn_calibrate = self._btn(row, 'ปรับเทียบ Localization / Wheel (Calibrate)',
                                        self._on_click_calibrate, kind='info')
         self.btn_calibrate.pack(side='left')
+
+        self._section_title(gen, 'Security').pack(fill='x', padx=px(16), pady=(px(14), px(2)))
+        row = tk.Frame(gen, bg=SURFACE)
+        row.pack(fill='x', padx=px(16))
+        self._btn(row, 'เปลี่ยน PIN โหมดนักพัฒนา', self._on_change_pin).pack(side='left')
 
         # Parameters are deliberately read-only on the touchscreen: speed
         # limits / footprint / inflation are safety-related config (see
@@ -2167,8 +2237,104 @@ class AmrControlPanel(tk.Tk):
                        key=os.path.getmtime, reverse=True)
         yamls = [p for p in yamls if not p.endswith('_stations.yaml')]
         names = [os.path.splitext(os.path.basename(p))[0] for p in yamls]
-        idx = self._show_list_picker('เลือกแผนที่สำหรับนำทาง', names, latest_tag=True)
-        return None if idx is None else yamls[idx]
+
+        result = {'path': None}
+        win = tk.Toplevel(self)
+        win.title('Map')
+        win.configure(bg=SURFACE)
+        win.transient(self)
+        win.resizable(False, False)
+        self._label(win, 'เลือกแผนที่สำหรับนำทาง', font=self.f_button
+                    ).pack(padx=px(20), pady=(px(16), px(8)), anchor='w')
+
+        body = tk.Frame(win, bg=SURFACE)
+        body.pack(padx=px(20), fill='both', expand=True)
+        list_frame = tk.Frame(body, bg=SURFACE)
+        list_frame.pack(side='left', fill='y')
+        scrollbar = tk.Scrollbar(list_frame, width=px(28))
+        scrollbar.pack(side='right', fill='y')
+        lb = tk.Listbox(list_frame, font=self.f_button, height=8, width=28,
+                        activestyle='none', bg=SURFACE_2, fg=TEXT_MAIN,
+                        selectbackground=BLUE, selectforeground='white',
+                        relief='flat', highlightthickness=0,
+                        yscrollcommand=scrollbar.set, exportselection=False)
+        lb.pack(side='left', fill='y')
+        scrollbar.config(command=lb.yview)
+        for i, n in enumerate(names):
+            lb.insert('end', '  ' + n + (T('   (ล่าสุด)') if i == 0 else ''))
+
+        right = tk.Frame(body, bg=SURFACE)
+        right.pack(side='left', fill='both', expand=True, padx=(px(12), 0))
+        pw, ph = px(420), px(300)
+        canvas = tk.Canvas(right, width=pw, height=ph, bg='#1c222a',
+                           highlightthickness=1, highlightbackground=BORDER)
+        canvas.pack()
+        info = self._label(right, '', font=self.f_small, fg=TEXT_MUTED,
+                           justify='left', anchor='w')
+        info.pack(fill='x', pady=(px(6), 0))
+        photo = {}
+
+        def show(_e=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            path = yamls[sel[0]]
+            canvas.delete('all')
+            try:
+                meta, img = load_map_image(path)
+            except Exception as e:  # noqa: BLE001 - corrupt/missing pgm
+                canvas.create_text(pw // 2, ph // 2, text=f'preview error: {e}',
+                                   fill=RED, width=pw - 20)
+                info.config(text='')
+                return
+            w, h = img.size
+            sc = min(pw / w, ph / h)
+            dw, dh = max(int(w * sc), 1), max(int(h * sc), 1)
+            ox, oy = (pw - dw) // 2, (ph - dh) // 2
+            photo['p'] = ImageTk.PhotoImage(img.resize((dw, dh), Image.NEAREST))
+            canvas.create_image(ox, oy, anchor='nw', image=photo['p'])
+            res, (mx, my) = meta['resolution'], meta['origin'][:2]
+            name = os.path.splitext(os.path.basename(path))[0]
+            stations = load_stations(name)
+            r = px(5)
+            for st in stations:
+                cx = ox + (st['x'] - mx) / res * sc
+                cy = oy + (h - (st['y'] - my) / res) * sc
+                canvas.create_rectangle(cx - r, cy - r, cx + r, cy + r,
+                                        fill=BLUE, outline='white')
+                canvas.create_text(cx + r + 3, cy, anchor='w', text=st['name'],
+                                   fill=TEXT_MAIN, font=self.f_small)
+            info.config(text=T(
+                f'ขนาด {w * res:.1f} x {h * res:.1f} ม. · {res:.3f} ม./px · '
+                f'Station {len(stations)} จุด\n'
+                f'แก้ไขล่าสุด {time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path)))}'))
+
+        btn_row = tk.Frame(win, bg=SURFACE)
+        btn_row.pack(fill='x', padx=px(20), pady=px(16))
+
+        def confirm(_e=None):
+            sel = lb.curselection()
+            if sel:
+                result['path'] = yamls[sel[0]]
+            win.destroy()
+
+        self._btn(btn_row, 'ยกเลิก', win.destroy).pack(side='right')
+        self._btn(btn_row, 'เลือกแผนที่นี้', confirm, kind='info', padx=px(24)
+                  ).pack(side='right', padx=(0, px(8)))
+
+        lb.bind('<<ListboxSelect>>', show)
+        lb.bind('<Double-Button-1>', confirm)
+        win.bind('<Return>', confirm)
+        win.bind('<Escape>', lambda _e: win.destroy())
+        lb.selection_set(0)
+        lb.activate(0)
+        show()
+        win.update_idletasks()
+        self._center_toplevel(win, win.winfo_reqwidth() + 10, win.winfo_reqheight() + 10)
+        win.grab_set()
+        lb.focus_set()
+        win.wait_window()
+        return result['path']
 
     def _launch(self, cmd, mode, label):
         self._mode = mode
