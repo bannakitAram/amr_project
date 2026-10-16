@@ -321,7 +321,15 @@ NAV_PARAM_SPECS = [
     # footprint steps are 2 cm so the half-length stays on whole cm
     ('fp_len', 'Footprint ยาว', 'm', 0.60, 1.40, 0.02, '{:.2f}'),
     ('fp_wid', 'Footprint กว้าง', 'm', 0.40, 0.90, 0.02, '{:.2f}'),
+    # velocity_smoother max_accel / max_decel [x, -, theta]. Upper bounds =
+    # STM32 ramp (MAX_ACCEL 0.5 / MAX_DECEL 1.2 m/s^2 per wheel; /0.236 m
+    # half track for theta) - beyond that the firmware caps it anyway.
+    ('acc_lin', 'เร่ง (accel)', 'm/s²', 0.10, 0.50, 0.05, '{:.2f}'),
+    ('dec_lin', 'เบรก (decel)', 'm/s²', 0.30, 1.20, 0.05, '{:.2f}'),
+    ('acc_rot', 'เร่งหมุน (α)', 'rad/s²', 0.30, 2.00, 0.10, '{:.2f}'),
+    ('dec_rot', 'เบรกหมุน', 'rad/s²', 0.50, 2.00, 0.10, '{:.2f}'),
 ]
+STOP_LATENCY_S = 0.2      # cmd -> wheels, used for the stop-distance note
 FRONT_STOP_DEPTH = 0.35   # m ahead of the bumper (matches nav2_params.yaml)
 FRONT_STOP_MARGIN = 0.03  # m each side beyond the footprint half-width
 
@@ -334,6 +342,8 @@ _PARAM_RES = {
     'rot_vel': re.compile(r'^(\s*max_rotational_vel:\s*)' + _NUM, re.M),
     'inflation': re.compile(r'^(\s*inflation_radius:\s*)' + _NUM, re.M),
     'goal_tol': re.compile(r'^(\s*xy_goal_tolerance:\s*)' + _NUM, re.M),
+    'max_acc': re.compile(r'^(\s*max_accel:\s*\[)' + _NUM + r',\s*' + _NUM + r',\s*' + _NUM + r'\]', re.M),
+    'max_dec': re.compile(r'^(\s*max_decel:\s*\[)' + _NUM + r',\s*' + _NUM + r',\s*' + _NUM + r'\]', re.M),
     'footprint': re.compile(r'^(\s*footprint:\s*)"\[\[([^"]*)\]\]"', re.M),
     'front_stop': re.compile(r'^(\s*points:\s*)\[' + ',\\s*'.join([_NUM] * 8) + r'\]', re.M),
 }
@@ -357,6 +367,10 @@ def read_nav_params(text):
         'goal_tol': float(_PARAM_RES['goal_tol'].search(text).group(2)),
         'fp_len': round(max(xs) - min(xs), 3),
         'fp_wid': round(max(ys) - min(ys), 3),
+        'acc_lin': float(_PARAM_RES['max_acc'].search(text).group(2)),
+        'acc_rot': float(_PARAM_RES['max_acc'].search(text).group(4)),
+        'dec_lin': -float(_PARAM_RES['max_dec'].search(text).group(2)),
+        'dec_rot': -float(_PARAM_RES['max_dec'].search(text).group(4)),
     }
 
 
@@ -373,6 +387,10 @@ def write_nav_params(text, v):
         lambda m: f"{m.group(1)}{f2(v['v_max'])}, {m.group(3)}, {f2(v['w_max'])}]", text)
     text = _PARAM_RES['min_vel'].sub(
         lambda m: f"{m.group(1)}{f2(-v['v_max'])}, {m.group(3)}, {f2(-v['w_max'])}]", text)
+    text = _PARAM_RES['max_acc'].sub(
+        lambda m: f"{m.group(1)}{f2(v['acc_lin'])}, {m.group(3)}, {f2(v['acc_rot'])}]", text)
+    text = _PARAM_RES['max_dec'].sub(
+        lambda m: f"{m.group(1)}{f2(-v['dec_lin'])}, {m.group(3)}, {f2(-v['dec_rot'])}]", text)
     text = _PARAM_RES['rot_vel'].sub(lambda m: m.group(1) + f2(v['w_max']), text)
     text = _PARAM_RES['inflation'].sub(lambda m: m.group(1) + f2(v['inflation']), text)
     text = _PARAM_RES['goal_tol'].sub(lambda m: m.group(1) + f2(v['goal_tol']), text)
@@ -2128,6 +2146,15 @@ class AmrControlPanel(tk.Tk):
                 lines.append(T('⚠ inflation น้อยกว่ารัศมีมุมหุ่น - หุ่นอาจวิ่งเฉียดสิ่งกีดขวางตอนหมุน'))
             lines.append(T('FrontStop เริ่มที่หน้ากันชน') + f' {e["fp_len"] / 2:.2f} m '
                          + T('ลึก') + f' {FRONT_STOP_DEPTH:.2f} m')
+            d_stop = e['v_max'] ** 2 / (2 * e['dec_lin']) + e['v_max'] * STOP_LATENCY_S
+            lines.append(T('ระยะหยุดโดยประมาณที่ v_max') + f' {d_stop:.2f} m '
+                         + T('(รวม latency') + f' {STOP_LATENCY_S:.1f} s)')
+            if d_stop > FRONT_STOP_DEPTH * 0.8:
+                lines.append(T('⚠ ระยะหยุดเกิน 80% ของความลึก FrontStop - เพิ่ม decel หรือลด v_max'))
+            if e['acc_lin'] > e['dec_lin']:
+                lines.append(T('⚠ accel มากกว่า decel - ควรให้ decel ≥ accel'))
+            lines.append(T('accel/decel ใช้กับ Navigation (velocity_smoother) เท่านั้น - '
+                           'teleop/joystick ส่ง /cmd_vel ตรง ใช้ ramp ของ STM32 (0.5 / 1.2)'))
         if changed:
             lines.append(T('ค่าที่จะเปลี่ยน:') + '\n' + '\n'.join(changed))
         lines.append(T('มีผลเมื่อเริ่ม Navigation/Mapping ครั้งถัดไป · '
