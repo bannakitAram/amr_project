@@ -1010,6 +1010,15 @@ class AmrControlPanel(tk.Tk):
         super().__init__()
         self.title('AMR Control')
         self.configure(bg=BG)
+        # Same icon as the desktop launcher (icons/ next to scripts/ in src;
+        # this script is symlinked into install/, hence realpath).
+        icon = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                            '..', 'icons', 'amr_control_panel.png')
+        try:
+            self._icon = tk.PhotoImage(file=icon)
+            self.iconphoto(True, self._icon)
+        except tk.TclError:
+            pass
         # Full-screen kiosk on the onboard 7" touchscreen (1920x1080); the
         # 1024x600 design is scaled by px() to whatever the screen is.
         # AMR_PANEL_WINDOWED=1 keeps a normal window (desk testing).
