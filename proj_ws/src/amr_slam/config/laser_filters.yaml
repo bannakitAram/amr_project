@@ -1,8 +1,11 @@
-scan_to_scan_filter_chain:
+# Node scan_operator_filter (amr_slam slam.launch.py): /scan -> /scan_operator_filtered,
+# SLAM input only. Renamed from scan_to_scan_filter_chain / /scan_filtered on
+# 2026-10-16: that name and topic are bringup's self-hit filter for Nav2.
+scan_operator_filter:
   ros__parameters:
     # LaserScanAngularBoundsFilterInPlace blanks (sets to range_max + 1.0)
     # everything INSIDE [lower_angle, upper_angle] - verified empirically via
-    # `ros2 topic echo /scan_filtered --full-length` (2026-09-11): points in
+    # `ros2 topic echo /scan_operator_filtered --full-length` (2026-09-11): points in
     # [-120,120] deg came back as a flat 17.0 = range_max(16.0)+1, while the
     # rear sector outside that window kept real sensor values. This is the
     # opposite of "keep inside / blank outside".
@@ -25,7 +28,7 @@ scan_to_scan_filter_chain:
     # !!! CALIBRATE FOR YOUR ROBOT !!!
     # Confirm lidar_link's 0-angle orientation and the actual angle the
     # operator walks at before trusting these values - verify live with
-    # `ros2 topic echo /scan_filtered --full-length` while someone walks
+    # `ros2 topic echo /scan_operator_filtered --full-length` while someone walks
     # behind the robot. Blanking the wrong sector hides real obstacles from
     # SLAM/nav, which is a safety issue under ISO 3691-4 - re-verify after
     # any change to the lidar mount orientation.

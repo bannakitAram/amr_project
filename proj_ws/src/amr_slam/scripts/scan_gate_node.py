@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan gate in front of slam_toolbox: relays LaserScan `scan_in` ->
+"""Scan gate in front of slam_toolbox: relays LaserScan `scan_in` (/scan_operator_filtered) ->
 `scan_out` only while enabled.
 
 Lets Mapping start with SLAM running but not building a map until the

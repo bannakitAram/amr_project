@@ -48,20 +48,23 @@ def generate_launch_description():
                      'panel passes false so mapping only begins when the operator '
                      'presses Start scan (scan_gate/set_enabled).')
 
-    # scan_to_scan_filter_chain: laser_filters node that subscribes to raw
-    # /scan and republishes the filtered result on /scan_filtered. Only
-    # slam_toolbox (mapping) consumes /scan_filtered - safety/obstacle
-    # avoidance nodes must keep subscribing to raw /scan.
+    # scan_operator_filter: laser_filters node that subscribes to raw /scan
+    # and republishes it with the operator's rear sector blanked on
+    # /scan_operator_filtered. Only SLAM (via scan_gate) consumes it. Must
+    # NOT be named scan_to_scan_filter_chain / publish /scan_filtered:
+    # those are bringup's self-hit filter feeding Nav2 costmaps +
+    # collision_monitor.
     scan_filter_node = Node(
         package='laser_filters',
         executable='scan_to_scan_filter_chain',
-        name='scan_to_scan_filter_chain',
+        name='scan_operator_filter',
         output='screen',
         parameters=[laser_filters_params_file, {'use_sim_time': use_sim_time}],
+        remappings=[('scan', '/scan'), ('scan_filtered', '/scan_operator_filtered')],
         condition=IfCondition(filter_operator_out),
     )
 
-    # Scan gate: /scan_filtered (or raw /scan) -> /scan_slam, passed only
+    # Scan gate: /scan_operator_filtered (or raw /scan) -> /scan_slam, passed only
     # while enabled, so SLAM integrates nothing until scanning is started.
     scan_gate_node = Node(
         package='amr_slam',
@@ -73,7 +76,7 @@ def generate_launch_description():
                          ["'", scan_gate_start_enabled, "' == 'true'"])}],
         remappings=[
             ('scan_in', PythonExpression(
-                ["'/scan_filtered' if '", filter_operator_out, "' == 'true' else '/scan'"])),
+                ["'/scan_operator_filtered' if '", filter_operator_out, "' == 'true' else '/scan'"])),
             ('scan_out', '/scan_slam'),
         ],
     )
