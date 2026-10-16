@@ -226,6 +226,28 @@ bool startup_balance_active = false;
 bool startup_balance_had_command = false;
 
 // ============================================================
+// WHEEL DIRECTION LATCH (2026-10-16)
+// ============================================================
+// The Hall encoders are single-channel (no direction), and both the
+// encoder sign and the FR (direction) pin used to follow the sign of
+// current_target with 0 counted as FORWARD. Stopping from REVERSE therefore
+// flipped FR to forward while the DAC was still slewing down and the wheel
+// still rolling backwards: the driver drove against the motion (plug
+// braking -> visible wheel slip, measured wheel decel ~0.6 vs body ~0.25
+// m/s^2) and the remaining backward pulses were counted as forward
+// (fake +0.05..0.07 m/s "overshoot", wrong odom). Forward stops were fine
+// because 0 already meant forward.
+// Now each wheel keeps its last direction until its DAC has slewed to 0
+// AND the wheel has (nearly) stopped, or DIR_CHANGE_TIMEOUT_MS after the
+// DAC reached 0; while a new command disagrees with the latched direction
+// the DAC is driven to 0 first.
+const unsigned long DIR_CHANGE_TIMEOUT_MS = 300;
+int dir_l = 1;
+int dir_r = 1;
+unsigned long dac_zero_since_l = 0;
+unsigned long dac_zero_since_r = 0;
+
+// ============================================================
 // INDIVIDUAL WHEEL DAC CALIBRATION TABLE
 //
 // V9.15 shared-table experiment (2026-09-11): right_dac_table forced
@@ -736,6 +758,7 @@ float compute_right_dac(float target_speed, float measured_speed, float dt);
 int apply_dac_slew(float desired, int current, float max_step);
 void update_left_launch();
 void update_right_launch();
+void update_wheel_dir();
 void update_startup_balance();
 float get_startup_left_correction();
 float get_startup_right_correction();
@@ -964,6 +987,8 @@ void reset_speed_controller()
   desired_dac_l = 0.0f; desired_dac_r = 0.0f;
   dac_output_l = 0; dac_output_r = 0;
   current_target_l = 0.0f; current_target_r = 0.0f;
+  dir_l = 1; dir_r = 1;
+  dac_zero_since_l = 0; dac_zero_since_r = 0;
 
   startup_speed_diff = 0.0f;
   startup_left_correction = 0.0f;
@@ -1018,6 +1043,28 @@ void update_ramped_targets(float dt)
 }
 
 // ============================================================
+// WHEEL DIRECTION LATCH - see the declaration comment above
+// ============================================================
+static int next_wheel_dir(int dir, float target, int dac_output, float raw_speed,
+                          unsigned long &dac_zero_since, unsigned long now)
+{
+  if (dac_output != 0) { dac_zero_since = 0; return dir; }
+  if (dac_zero_since == 0) dac_zero_since = now;
+  int want = (target > 0.001f) ? 1 : (target < -0.001f) ? -1 : dir;
+  if (want == dir) return dir;
+  bool stopped = fabs(raw_speed) < STOP_SPEED_THRESHOLD;
+  bool waited = (now - dac_zero_since) > DIR_CHANGE_TIMEOUT_MS;
+  return (stopped || waited) ? want : dir;
+}
+
+void update_wheel_dir()
+{
+  unsigned long now = millis();
+  dir_l = next_wheel_dir(dir_l, current_target_l, dac_output_l, raw_speed_l, dac_zero_since_l, now);
+  dir_r = next_wheel_dir(dir_r, current_target_r, dac_output_r, raw_speed_r, dac_zero_since_r, now);
+}
+
+// ============================================================
 // READ ENCODER
 // ============================================================
 void read_encoder_counts(long &count_l, long &count_r)
@@ -1033,8 +1080,8 @@ void read_encoder_counts(long &count_l, long &count_r)
 // ============================================================
 void update_velocity_estimator(long count_l, long count_r, unsigned long now)
 {
-  bool left_forward = current_target_l >= 0.0f;
-  bool right_forward = current_target_r >= 0.0f;
+  bool left_forward = dir_l > 0;
+  bool right_forward = dir_r > 0;
 
   long signed_l = left_forward ? count_l : -count_l;
   long signed_r = right_forward ? count_r : -count_r;
@@ -1362,8 +1409,8 @@ void motor_control_process()
   digitalWrite(L_RUN_PIN, (dac_output_l == 0) ? HIGH : LOW);
   digitalWrite(R_RUN_PIN, (dac_output_r == 0) ? HIGH : LOW);
 
-  digitalWrite(L_FR_PIN, (current_target_l >= 0.0f) ? HIGH : LOW);
-  digitalWrite(R_FR_PIN, (current_target_r >= 0.0f) ? LOW : HIGH);
+  digitalWrite(L_FR_PIN, (dir_l > 0) ? HIGH : LOW);
+  digitalWrite(R_FR_PIN, (dir_r > 0) ? LOW : HIGH);
   analogWrite(L_SP_PIN, dac_output_l);
   analogWrite(R_SP_PIN, dac_output_r);
 }
@@ -1383,6 +1430,7 @@ void update_and_publish_odom()
   last_control_time = now;
 
   update_ramped_targets(dt);
+  update_wheel_dir();
 
   long count_l = 0, count_r = 0;
   read_encoder_counts(count_l, count_r);
@@ -1409,17 +1457,25 @@ void update_and_publish_odom()
   desired_dac_l = compute_left_dac(current_target_l, control_speed_l, dt);
   desired_dac_r = compute_right_dac(current_target_r, control_speed_r, dt);
 
+  // Command points the other way than the latched direction: bring this
+  // wheel's DAC to 0 first (STOP slew below); update_wheel_dir() flips the
+  // direction once it is at 0 and the wheel has stopped.
+  bool reversing_l = (current_target_l * (float)dir_l) < 0.0f;
+  bool reversing_r = (current_target_r * (float)dir_r) < 0.0f;
+  if (reversing_l) { desired_dac_l = 0.0f; integral_l = 0.0f; }
+  if (reversing_r) { desired_dac_r = 0.0f; integral_r = 0.0f; }
+
   // V9.8: speed-proportional normal slew
   float slew_l = SLEW_BASE + (SLEW_MAX - SLEW_BASE) * constrain(fabs(current_target_l) / SLEW_FULL_SPEED, 0.0f, 1.0f);
   float slew_r = SLEW_BASE + (SLEW_MAX - SLEW_BASE) * constrain(fabs(current_target_r) / SLEW_FULL_SPEED, 0.0f, 1.0f);
 
   // LEFT SLEW
-  float dac_step_l = (fabs(target_speed_l) < STOP_TARGET_THRESHOLD) ? STOP_DAC_STEP_L :
+  float dac_step_l = (fabs(target_speed_l) < STOP_TARGET_THRESHOLD || reversing_l) ? STOP_DAC_STEP_L :
                      (left_launch_active) ? LAUNCH_DAC_STEP_L : slew_l;
   dac_output_l = apply_dac_slew(desired_dac_l, dac_output_l, dac_step_l);
 
   // RIGHT SLEW
-  float dac_step_r = (fabs(target_speed_r) < STOP_TARGET_THRESHOLD) ? STOP_DAC_STEP_R :
+  float dac_step_r = (fabs(target_speed_r) < STOP_TARGET_THRESHOLD || reversing_r) ? STOP_DAC_STEP_R :
                      (right_launch_active) ? RIGHT_LAUNCH_DAC_STEP : slew_r;
   dac_output_r = apply_dac_slew(desired_dac_r, dac_output_r, dac_step_r);
 
