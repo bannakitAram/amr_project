@@ -192,6 +192,11 @@ controller_server:
       vx_min: 0.0
       vy_max: 0.0
       wz_max: 0.5    # was 1.0 - wheels slip badly when turning fast
+      # Match velocity_smoother max_accel/max_decel (defaults ~3.0 m/s^2
+      # let MPPI plan motion the smoother then clips -> plan/track mismatch).
+      ax_max: 0.3
+      ax_min: -0.5
+      az_max: 1.0
       iteration_count: 1
       prune_distance: 1.7
       transform_tolerance: 0.2
