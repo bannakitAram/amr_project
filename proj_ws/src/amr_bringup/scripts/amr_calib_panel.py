@@ -986,10 +986,12 @@ class CalibPanel(tk.Toplevel):
     def _render_accel(self):
         def pct(v):
             return '   -  ' if v is None else f'{v * 100:5.1f}%'
-        lines = ['accel [m/s²]   slip เร่ง   slip เบรก   ผล']
+        words = {'ok': 'ไม่ลื่น', 'unclear': 'ไม่แน่ชัด', 'slip': 'ลื่น', None: '-'}
+        lines = ['accel [m/s²]   slip เร่ง   slip เบรก   ผล (ค่ากลางของทุกรอบ)']
         for r in self._accel_results:
-            bad = r['slip_accel'] is not None and r['slip_accel'] > 0.05
-            note = 'ลื่น' if bad else 'ไม่ลื่น'
+            note = words[r.get('verdict_accel')]
+            if r.get('verdict_decel') in ('unclear', 'slip'):
+                note += f', เบรก{words[r["verdict_decel"]]}'
             if r.get('stop_overshoot', 0.0) > 0.02:
                 note += f', ล้อหมุนกลับตอนหยุด {r["stop_overshoot"]:.2f} m/s'
             if r['events'] < r['expected_events']:
@@ -1006,6 +1008,11 @@ class CalibPanel(tk.Toplevel):
             elif s['max_ok'] is not None:
                 lines.append(f'ไม่ลื่นจนถึง {s["max_ok"]:g} m/s² '
                              '(a_limit สูงกว่านี้ - เกิน 0.5 ต้องแก้ firmware ramp)')
+            if s.get('unclear'):
+                lines.append('ไม่แน่ชัดที่ ' + ', '.join(f'{a:g}' for a in s['unclear'])
+                             + ' m/s² - slip 10-25% อยู่ในช่วง noise ของการวัด '
+                             '(IMU/ตัวรถโยก): ทดสอบซ้ำด้วยรอบมากขึ้น และดูล้อด้วยตา '
+                             '- ไม่มีค่าแนะนำจากผลนี้')
             lines.append('')
             lines.append('ค่านี้เป็นคำแนะนำเท่านั้น - แก้ nav2_params.yaml เอง, '
                          'commit, วัดระยะหยุดจริง และสร้าง tag ใหม่ก่อนใช้งานในไลน์')

@@ -47,7 +47,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu, LaserScan
 
-from slip_ratio_from_bag import SLIP_LIMIT, analyse_arrays
+from slip_ratio_from_bag import analyse_arrays, verdict
 
 RATE_HZ = 20.0
 STILL_S = 2.0
@@ -222,10 +222,15 @@ def main():
                                         label=f'a={accel}')
             acc = [r['slip'] for r in rows if r['kind'] == 'accel']
             dec = [r['slip'] for r in rows if r['kind'] == 'decel']
+            slip_acc, verdict_acc = verdict(acc)
+            slip_dec, verdict_dec = verdict(dec)
             res = {
                 'accel': accel,
-                'slip_accel': max(acc) if acc else None,
-                'slip_decel': max(dec) if dec else None,
+                # median over this accel's ramps, not the single worst one
+                'slip_accel': slip_acc,
+                'slip_decel': slip_dec,
+                'verdict_accel': verdict_acc,
+                'verdict_decel': verdict_dec,
                 'events': len([r for r in rows if r['kind'] != 'bounce']),
                 # wheel speed past zero (other direction) right after a stop
                 'stop_overshoot': max([r['overshoot'] for r in rows], default=0.0),
@@ -234,8 +239,7 @@ def main():
             }
             results.append(res)
             say('RESULT', json.dumps(res))
-            if (args.stop_on_slip and res['slip_accel'] is not None
-                    and res['slip_accel'] > SLIP_LIMIT):
+            if args.stop_on_slip and verdict_acc == 'slip':
                 say('PROGRESS', f'slip at {accel:.2f} - stopping')
                 break
     except StopTest as e:
@@ -247,14 +251,14 @@ def main():
         node.destroy_node()
         rclpy.shutdown()
 
-    slipping = [r['accel'] for r in results
-                if r['slip_accel'] is not None and r['slip_accel'] > SLIP_LIMIT]
-    clean = [r['accel'] for r in results
-             if r['slip_accel'] is not None and r['slip_accel'] <= SLIP_LIMIT]
+    slipping = [r['accel'] for r in results if r['verdict_accel'] == 'slip']
+    clean = [r['accel'] for r in results if r['verdict_accel'] == 'ok']
+    unclear = [r['accel'] for r in results if r['verdict_accel'] == 'unclear']
     a_limit = min(slipping) if slipping else None
     say('SUMMARY', json.dumps({
         'a_limit': a_limit,
         'max_ok': max(clean) if clean else None,
+        'unclear': unclear,
         'suggest_accel': round(a_limit * SUGGEST_FACTOR, 2) if a_limit else None,
     }))
     sys.exit(exit_code)

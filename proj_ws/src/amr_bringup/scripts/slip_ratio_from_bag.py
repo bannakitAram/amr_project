@@ -45,7 +45,18 @@ IMU_TOPIC = '/imu/data'
 STATIONARY_V = 0.005     # m/s - below this the robot is treated as stopped
 EVENT_A = 0.08           # m/s^2 - default for --event-a
 MIN_EVENT_DV = 0.05      # m/s - ignore tiny speed corrections
-SLIP_LIMIT = 0.05        # 5 %
+# Verdict bands, from real-robot runs: with IMU ax (chassis pitch leaks
+# gravity in) and the firmware zeroing odom below STOP_SPEED_THRESHOLD, a
+# no-slip ramp still reads up to ~10-15 %. So:
+#   median slip < SLIP_OK              -> no slip
+#   SLIP_OK .. SLIP_LIMIT              -> unclear (inside noise; re-test/look)
+#   > SLIP_LIMIT                       -> slip
+SLIP_OK = 0.10
+SLIP_LIMIT = 0.25
+# Firmware forces odom to 0 below this when the command is stop
+# (STOP_SPEED_THRESHOLD in stm/src/motor_control_with_pid_optimized.cpp);
+# decel events are cut there so that jump is not read as a skid.
+ODOM_ZERO_V = 0.035
 SETTLE_S = 0.1           # s - look just past the ramp end for the slip peak.
 # Kept short: after the ramp the chassis pitches back on its suspension and
 # gravity leaks into IMU ax, so integrating longer invents a fake gap
@@ -142,6 +153,9 @@ def analyse_arrays(to, vo, ti, ai, event_a=EVENT_A, label=''):
             overshoot = float(np.max(-np.sign(vo[s]) * vo[after]))
             e = z
             last_cross_t = to[z]
+        if abs(vo[e]) < abs(vo[s]):
+            while e > s + 1 and abs(vo[e - 1]) < ODOM_ZERO_V:
+                e -= 1
         t0, t1 = to[s], to[e]
         if t1 <= t0:
             continue
@@ -179,6 +193,19 @@ def analyse_arrays(to, vo, ti, ai, event_a=EVENT_A, label=''):
     return bias, rows
 
 
+def verdict(slips):
+    """'ok' / 'unclear' / 'slip' from the MEDIAN of several events' slip,
+    so one noisy ramp cannot decide it (see SLIP_OK / SLIP_LIMIT)."""
+    if not slips:
+        return None, None
+    med = float(np.median(slips))
+    if med > SLIP_LIMIT:
+        return med, 'slip'
+    if med > SLIP_OK:
+        return med, 'unclear'
+    return med, 'ok'
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawTextHelpFormatter)
@@ -200,7 +227,8 @@ def main():
         print(f'  {"t[s]":>6} {"kind":5} {"v0->v1 [m/s]":>14} {"a_wheel":>8} '
               f'{"a_imu_pk":>8} {"dv_wheel":>8} {"dv_imu":>8} {"slip":>7}')
         for r in rows:
-            flag = '  <-- SLIP' if abs(r['slip']) > SLIP_LIMIT else ''
+            flag = ('  <-- SLIP' if r['slip'] > SLIP_LIMIT else
+                    '  (unclear)' if r['slip'] > SLIP_OK else '')
             print(f'  {r["t"]:6.1f} {r["kind"]:5} {r["v0"]:+6.3f}->{r["v1"]:+6.3f} '
                   f'{r["a_wheel"]:8.3f} {r["a_imu_peak"]:8.3f} '
                   f'{r["dv_wheel"]:+8.3f} {r["dv_imu"]:+8.3f} '
@@ -219,8 +247,11 @@ def main():
         slipping = [r for r in ev if abs(r['slip']) > SLIP_LIMIT]
         clean = [r for r in ev if abs(r['slip']) <= SLIP_LIMIT]
         med = np.median([r['slip'] for r in ev]) * 100
+        unclear = [r for r in ev if SLIP_OK < r['slip'] <= SLIP_LIMIT]
         print(f'  {kind}: {len(ev)} events, median slip {med:.1f}%, '
-              f'{len(slipping)} over {SLIP_LIMIT * 100:.0f}%')
+              f'{len(slipping)} over {SLIP_LIMIT * 100:.0f}%, '
+              f'{len(unclear)} unclear ({SLIP_OK * 100:.0f}-'
+              f'{SLIP_LIMIT * 100:.0f}%, inside measurement noise)')
         if slipping:
             a_lim = min(r['a_wheel'] for r in slipping)
             print(f'    a_limit (lowest a_wheel that slipped) = {a_lim:.2f} m/s^2')
