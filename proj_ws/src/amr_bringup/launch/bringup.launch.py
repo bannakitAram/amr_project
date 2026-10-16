@@ -56,6 +56,7 @@ def generate_launch_description():
     use_slam = LaunchConfiguration('slam')
     use_navigation = LaunchConfiguration('navigation')
     nav_map = LaunchConfiguration('map')
+    slam_start_scanning = LaunchConfiguration('slam_start_scanning')
 
     declare_use_sim_time = DeclareLaunchArgument('use_sim_time', default_value='false')
     declare_use_rviz = DeclareLaunchArgument(
@@ -83,6 +84,11 @@ def generate_launch_description():
         'navigation', default_value='false',
         description='Launch Nav2 (amr_navigation) for autonomous navigation on a saved '
                      'map. Requires map:=<path to map.yaml>. Set slam:=false when using this.')
+    declare_slam_start_scanning = DeclareLaunchArgument(
+        'slam_start_scanning', default_value='true',
+        description='slam:=true only - false starts SLAM with its scan input gated '
+                     'off until scan_gate/set_enabled is called (AMR Control panel '
+                     '"Start scan")')
     declare_nav_map = DeclareLaunchArgument(
         'map', default_value='',
         description='Path to the map yaml file - required when navigation:=true')
@@ -163,7 +169,8 @@ def generate_launch_description():
     slam_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_slam, 'launch', 'slam.launch.py')),
-        launch_arguments={'use_sim_time': use_sim_time}.items(),
+        launch_arguments={'use_sim_time': use_sim_time,
+                          'scan_gate_start_enabled': slam_start_scanning}.items(),
         condition=IfCondition(use_slam),
     )
     delayed_slam_launch = TimerAction(
@@ -241,6 +248,7 @@ def generate_launch_description():
         declare_use_slam,
         declare_use_navigation,
         declare_nav_map,
+        declare_slam_start_scanning,
         description_launch,
         micro_ros_agent_node,
         wheel_joint_state_publisher_node,

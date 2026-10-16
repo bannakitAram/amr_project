@@ -24,6 +24,7 @@ def generate_launch_description():
     slam_params_file = LaunchConfiguration('slam_params_file')
     laser_filters_params_file = LaunchConfiguration('laser_filters_params_file')
     filter_operator_out = LaunchConfiguration('filter_operator_out')
+    scan_gate_start_enabled = LaunchConfiguration('scan_gate_start_enabled')
 
     declare_use_sim_time = DeclareLaunchArgument(
         'use_sim_time', default_value='false')
@@ -41,6 +42,12 @@ def generate_launch_description():
                      'the map. Does NOT touch /scan itself - only /scan is '
                      'used for safety/obstacle avoidance and stays raw.')
 
+    declare_scan_gate_start_enabled = DeclareLaunchArgument(
+        'scan_gate_start_enabled', default_value='true',
+        description='Feed scans to slam_toolbox from the start. The AMR Control '
+                     'panel passes false so mapping only begins when the operator '
+                     'presses Start scan (scan_gate/set_enabled).')
+
     # scan_to_scan_filter_chain: laser_filters node that subscribes to raw
     # /scan and republishes the filtered result on /scan_filtered. Only
     # slam_toolbox (mapping) consumes /scan_filtered - safety/obstacle
@@ -54,15 +61,30 @@ def generate_launch_description():
         condition=IfCondition(filter_operator_out),
     )
 
+    # Scan gate: /scan_filtered (or raw /scan) -> /scan_slam, passed only
+    # while enabled, so SLAM integrates nothing until scanning is started.
+    scan_gate_node = Node(
+        package='amr_slam',
+        executable='scan_gate_node.py',
+        name='scan_gate',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time,
+                     'start_enabled': PythonExpression(
+                         ["'", scan_gate_start_enabled, "' == 'true'"])}],
+        remappings=[
+            ('scan_in', PythonExpression(
+                ["'/scan_filtered' if '", filter_operator_out, "' == 'true' else '/scan'"])),
+            ('scan_out', '/scan_slam'),
+        ],
+    )
+
     start_async_slam_toolbox_node = LifecycleNode(
         parameters=[
             slam_params_file,
             {'use_sim_time': use_sim_time},
-            # Overrides scan_topic from slam_params_file: /scan_filtered when
-            # laser_filters is enabled (default), raw /scan otherwise.
-            {'scan_topic': PythonExpression(
-                ["'/scan_filtered' if '", filter_operator_out, "' == 'true' else '/scan'"]
-            )},
+            # Overrides scan_topic from slam_params_file: always the gated
+            # copy (scan_gate_node above).
+            {'scan_topic': '/scan_slam'},
         ],
         package='slam_toolbox',
         executable='async_slam_toolbox_node',
@@ -99,7 +121,9 @@ def generate_launch_description():
         declare_params_file,
         declare_laser_filters_params_file,
         declare_filter_operator_out,
+        declare_scan_gate_start_enabled,
         scan_filter_node,
+        scan_gate_node,
         start_async_slam_toolbox_node,
         configure_event,
         activate_event,

@@ -21,6 +21,7 @@ preset, publish zero /cmd_vel). It is NOT a safety-rated emergency stop -
 the hardware E-stop circuit remains the ISO 3691-4 / ISO 13850 stop.
 """
 import collections
+import json
 import glob
 import math
 import os
@@ -431,6 +432,20 @@ EN = {
     'ยังไม่ได้ตั้ง PIN - ใช้ค่าเริ่มต้น (ตั้งได้ที่ ': 'No PIN set - using default (set in ',
     '4-6 หลัก': '4-6 digits',
     'PIN ไม่ถูกต้อง': 'Wrong PIN',
+    'เริ่มสแกน': 'Start scan',
+    'หยุดสแกนชั่วคราว': 'Pause scan',
+    'กำลังเริ่ม SLAM...': 'Starting SLAM...',
+    'พร้อม - กดเริ่มสแกน': 'Ready - press Start scan',
+    'ไม่พบ scan gate - เริ่มสแกนไม่ได้': 'scan gate not found - cannot scan',
+    'กำลังสแกน': 'Scanning',
+    'สั่ง scan gate ไม่สำเร็จ': 'scan gate call failed',
+    'ปิด Mapping จากมือถือ': 'Mapping closed from phone',
+    '● กำลังสแกน · ': '● SCANNING · ',
+    '❚❚ ไม่ได้สแกน · ': '❚❚ NOT SCANNING · ',
+    'กำลังบันทึก ': 'Saving ',
+    'บันทึกแล้ว: ': 'Saved: ',
+    'บันทึกแผนที่ไม่สำเร็จ': 'Map save failed',
+    ' อยู่แล้ว - ใช้ชื่ออื่น': ' exists - use another name',
     'Footprint ยาว': 'Footprint length',
     'Footprint กว้าง': 'Footprint width',
     'บันทึกลงไฟล์': 'Save to file',
@@ -690,7 +705,8 @@ class RosBridge:
         self.map_seq = 0
         self.watchdog = {}      # name -> (bool, t)
         self.rates = {'scan': collections.deque(maxlen=60),
-                      'odom': collections.deque(maxlen=120)}
+                      'odom': collections.deque(maxlen=120),
+                      'imu': collections.deque(maxlen=400)}
         self.log = collections.deque(maxlen=300)
         self.log_seq = 0
         try:
@@ -707,8 +723,9 @@ class RosBridge:
         from geometry_msgs.msg import PoseStamped, Twist
         from nav_msgs.msg import Odometry, OccupancyGrid
         from rcl_interfaces.msg import Log
-        from sensor_msgs.msg import LaserScan
-        from std_msgs.msg import Bool, Empty
+        from sensor_msgs.msg import Imu, LaserScan
+        from std_msgs.msg import Bool, Empty, String
+        from std_srvs.srv import SetBool
         import tf2_ros
 
         self._PoseStamped, self._Twist, self._Empty = PoseStamped, Twist, Empty
@@ -751,6 +768,11 @@ class RosBridge:
         node.create_subscription(Twist, '/cmd_vel', on_cmd, 10)
         node.create_subscription(OccupancyGrid, '/map', on_map, map_qos)
         node.create_subscription(LaserScan, '/scan', on_scan, qos_profile_sensor_data)
+        # EKF takes yaw rate from the gyro only, so /imu/data matters in every
+        # mode (imu_watchdog_node only runs with Navigation).
+        node.create_subscription(
+            Imu, '/imu/data', lambda _m: self.rates['imu'].append(time.monotonic()),
+            qos_profile_sensor_data)
         node.create_subscription(Log, '/rosout', on_log, 50)
         node.create_subscription(Bool, '/depth_watchdog/ok', wd('depth'), 10)
         node.create_subscription(Bool, '/imu_watchdog/ok', wd('imu'), 10)
@@ -758,6 +780,26 @@ class RosBridge:
         self.goal_pub = node.create_publisher(PoseStamped, '/rosboard_nav_goal', 10)
         self.cancel_pub = node.create_publisher(Empty, '/rosboard_nav_cancel', 10)
         self.cmd_pub = node.create_publisher(Twist, '/cmd_vel', 10)
+
+        # Phone-side mapping controls (rosboard -> /rosboard_mapping_cmd,
+        # validated JSON {action, name}); the panel owns SLAM pause and map
+        # saving and reports back on /amr_mapping_state for the phone UI.
+        self._String = String
+        self.mapping_cmds = collections.deque(maxlen=10)
+        node.create_subscription(
+            String, '/rosboard_mapping_cmd',
+            lambda m: self.mapping_cmds.append(m.data), 10)
+        self.mapping_state_pub = node.create_publisher(String, '/amr_mapping_state', 10)
+        # amr_slam scan_gate_node: SLAM only receives scans while open.
+        self._SetBool = SetBool
+        self.gate_client = node.create_client(SetBool, '/scan_gate/set_enabled')
+        self.gate_open = None  # latest /scan_gate/enabled, None = no gate seen
+
+        def on_gate(m):
+            self.gate_open = bool(m.data)
+        gate_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                              reliability=ReliabilityPolicy.RELIABLE)
+        node.create_subscription(Bool, '/scan_gate/enabled', on_gate, gate_qos)
 
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(node)
@@ -819,6 +861,24 @@ class RosBridge:
                 self.cmd_pub.publish(z)
                 time.sleep(0.03)
         threading.Thread(target=burst, daemon=True).start()
+
+    def publish_mapping_state(self, state):
+        if self.ok:
+            self.mapping_state_pub.publish(self._String(data=json.dumps(state)))
+
+    def wait_scan_gate(self, timeout):
+        return self.ok and self.gate_client.wait_for_service(timeout_sec=timeout)
+
+    def set_scan_gate(self, enabled, timeout=5.0):
+        """Open/close the SLAM scan gate (idempotent). Blocking - call from
+        a worker thread. Returns True on success."""
+        if not self.wait_scan_gate(timeout):
+            return False
+        fut = self.gate_client.call_async(self._SetBool.Request(data=bool(enabled)))
+        t0 = time.monotonic()
+        while not fut.done() and time.monotonic() - t0 < timeout:
+            time.sleep(0.05)
+        return fut.done() and fut.result() is not None and fut.result().success
 
     def shutdown(self):
         if self.ok:
@@ -989,6 +1049,14 @@ class AmrControlPanel(tk.Tk):
         self._mission = None  # {'station', 'state': active|paused|arrived, 'd0'}
         self._nav_goal = None  # last goal sent from the Nav-test map (x, y, th)
 
+        # Mapping scan state. SLAM starts paused; the operator starts/pauses
+        # scanning from the phone (or the panel) - see _mapping_*.
+        self._slam_ready = False
+        self._scanning = False
+        self._map_saving = False
+        self._mapping_msg = ''
+        self._mapping_state_t = 0.0
+
         self._dev_unlocked = False
         self._pages = {}
         self._page = None
@@ -1001,6 +1069,7 @@ class AmrControlPanel(tk.Tk):
         self._build_ui()
         self._set_status('idle', 'พร้อมใช้งาน')
         self._show_page('home')
+        self._refresh_mapping_ui()
         self._i18n_walk()
         self.protocol('WM_DELETE_WINDOW', self._on_close)
         self.after(300, self._tick)
@@ -1633,9 +1702,10 @@ class AmrControlPanel(tk.Tk):
         p.columnconfigure(0, weight=3)
         p.columnconfigure(1, weight=2)
         p.rowconfigure(1, weight=1)
-        tk.Label(p, text='ใช้ Joystick (ฮาร์ดแวร์/มือถือ) ขับหุ่นยนต์ช้าๆ ให้ทั่วพื้นที่',
-                 font=self.f_button_sub, bg=AMBER, fg='#1a1a1a', pady=px(8)
-                 ).grid(row=0, column=0, columnspan=2, sticky='ew', pady=(px(0), px(8)))
+        self.mapping_banner = tk.Label(
+            p, text='ใช้ Joystick (ฮาร์ดแวร์/มือถือ) ขับหุ่นยนต์ช้าๆ ให้ทั่วพื้นที่',
+            font=self.f_button_sub, bg=AMBER, fg='#1a1a1a', pady=px(8))
+        self.mapping_banner.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(px(0), px(8)))
 
         self.mapping_map = MapView(p)
         self.mapping_map.grid(row=1, column=0, sticky='nsew', padx=(px(0), px(8)))
@@ -1649,6 +1719,8 @@ class AmrControlPanel(tk.Tk):
                                      kind='primary', font=self.f_button)
         self.btn_mapping.pack(fill='x', padx=px(10), pady=(px(10), px(6)))
         self._start_buttons.append(self.btn_mapping)
+        self.btn_scan = self._btn(ctl, 'เริ่มสแกน', self._on_click_scan, kind='warn')
+        self.btn_scan.pack(fill='x', padx=px(10), pady=px(6))
         self.btn_save_map = self._btn(ctl, 'SAVE MAP (บันทึกแผนที่)', self._on_save_map,
                                       kind='info')
         self.btn_save_map.pack(fill='x', padx=px(10), pady=px(6))
@@ -1664,7 +1736,7 @@ class AmrControlPanel(tk.Tk):
         self._section_title(diag, 'Sensor Diagnostics').pack(fill='x', padx=px(10), pady=(px(8), px(2)))
         self.diag_labels = {}
         for key, text in (('scan', 'LiDAR /scan'), ('odom', 'Odometry'),
-                          ('imu', 'IMU watchdog'), ('depth', 'Depth watchdog')):
+                          ('imu_hz', 'IMU /imu/data'), ('depth', 'Depth watchdog')):
             row = tk.Frame(diag, bg=SURFACE)
             row.pack(fill='x', padx=px(10), pady=px(2))
             self._label(row, text, anchor='w').pack(side='left')
@@ -1685,13 +1757,19 @@ class AmrControlPanel(tk.Tk):
                                         fg=GREEN if hz_s > 3 else RED)
         self.diag_labels['odom'].config(text=f'{hz_o:.1f} Hz',
                                         fg=GREEN if hz_o > 5 else RED)
-        for k in ('imu', 'depth'):
+        hz_i = self.ros.rate('imu')
+        self.diag_labels['imu_hz'].config(text=f'{hz_i:.1f} Hz',
+                                          fg=GREEN if hz_i > 5 else RED)
+        self._show_watchdogs(self.diag_labels, ('depth',))
+
+    def _show_watchdogs(self, labels, keys):
+        for k in keys:
             wd = self.ros.watchdog.get(k)
             if wd is None or time.monotonic() - wd[1] > 3:
-                self.diag_labels[k].config(text=T('ไม่มีข้อมูล'), fg=TEXT_MUTED)
+                labels[k].config(text=T('ไม่มีข้อมูล'), fg=TEXT_MUTED)
             else:
-                self.diag_labels[k].config(text='OK' if wd[0] else 'FAULT',
-                                           fg=GREEN if wd[0] else RED)
+                labels[k].config(text='OK' if wd[0] else 'FAULT',
+                                 fg=GREEN if wd[0] else RED)
 
     # ---------- Navigation test ----------
     def _build_navtest(self, p):
@@ -1755,6 +1833,17 @@ class AmrControlPanel(tk.Tk):
                             ).pack(fill='x', padx=px(10), pady=(px(10), px(0)))
         self._label(t_goal, 'Global: NavFn   ·   Local: MPPI', font=self.f_small
                     ).pack(anchor='w', padx=px(10))
+        # imu_watchdog_node runs only with Navigation, so it is shown here
+        # rather than on the Mapping page.
+        self._section_title(t_goal, 'Watchdogs').pack(fill='x', padx=px(10), pady=(px(10), 0))
+        self.nav_wd_labels = {}
+        for key, text in (('imu', 'IMU watchdog'), ('depth', 'Depth watchdog')):
+            row = tk.Frame(t_goal, bg=SURFACE)
+            row.pack(fill='x', padx=px(10))
+            self._label(row, text, font=self.f_small, anchor='w').pack(side='left')
+            v = self._label(row, '—', font=self.f_small, fg=TEXT_MUTED)
+            v.pack(side='right')
+            self.nav_wd_labels[key] = v
 
         # --- motion test tab (presets kept from the previous layout) ---
         sub = ttk.Notebook(t_motion, style='Dark.TNotebook')
@@ -2076,6 +2165,10 @@ class AmrControlPanel(tk.Tk):
             self.after(250, self._tick)
 
     def _tick_inner(self):
+        self._handle_mapping_cmds()
+        if self._mode == 'mapping' and time.monotonic() - self._mapping_state_t > 1.0:
+            self.ros.publish_mapping_state(self._mapping_state())
+            self._mapping_state_t = time.monotonic()
         ip = get_local_ip() if int(time.time()) % 5 == 0 or self.pill_net.cget('text') == 'Net —' else None
         if ip:
             online = ip != '127.0.0.1'
@@ -2104,6 +2197,7 @@ class AmrControlPanel(tk.Tk):
             self.mapping_map.set_overlay(pose)
             self._update_diag()
         elif page == 'navtest':
+            self._show_watchdogs(self.nav_wd_labels, ('imu', 'depth'))
             self.nav_map.set_map(self.ros.map_msg, self.ros.map_seq)
             self.nav_map.set_overlay(pose, load_stations(self._nav_map_name)
                                      if self._nav_map_name else (), self._nav_goal)
@@ -2169,9 +2263,110 @@ class AmrControlPanel(tk.Tk):
         self._launch([
             'ros2', 'launch', 'amr_bringup', 'bringup.launch.py',
             'rviz:=false', 'foxglove:=true', 'slam:=true', 'navigation:=false',
+            'slam_start_scanning:=false',
         ], mode='mapping', label='โหมดสร้างแผนที่ (Mapping)')
+        self._slam_ready = False
+        self._scanning = False
+        self._mapping_msg = 'กำลังเริ่ม SLAM...'
+        self.ros.gate_open = None  # ignore the previous run's latched state
         threading.Thread(target=self._ensure_monitors_then_show_qr,
                          daemon=True).start()
+        threading.Thread(target=self._wait_scan_gate, daemon=True).start()
+
+    def _wait_scan_gate(self):
+        """Mapping is launched with slam_start_scanning:=false, so SLAM gets
+        no scans until the operator presses Start. Close the gate again
+        explicitly once it is up (idempotent) and mark the UI ready."""
+        proc = self._proc
+        t0 = time.monotonic()
+        while self._proc is proc and proc is not None and time.monotonic() - t0 < 90:
+            if self.ros.set_scan_gate(False, timeout=2.0):
+                def done():
+                    if self._proc is proc:
+                        self._slam_ready = True
+                        self._scanning = False
+                        self._mapping_msg = 'พร้อม - กดเริ่มสแกน'
+                        self._refresh_mapping_ui()
+                self.after(0, done)
+                return
+        def fail():
+            if self._proc is proc:
+                self._mapping_msg = 'ไม่พบ scan gate - เริ่มสแกนไม่ได้'
+                self._refresh_mapping_ui()
+        self.after(0, fail)
+
+    # ---------- scan start / pause / save / finish (panel + phone) ----------
+    def _set_scanning(self, want):
+        if self._mode != 'mapping' or not self._slam_ready or want == self._scanning:
+            return
+        self._slam_ready = False  # block re-entry until the call returns
+        self._refresh_mapping_ui()
+
+        def work():
+            ok = self.ros.set_scan_gate(want)
+
+            def done():
+                self._slam_ready = self._mode == 'mapping'
+                if ok:
+                    self._scanning = want
+                    self._mapping_msg = 'กำลังสแกน' if want else 'หยุดสแกนชั่วคราว'
+                else:
+                    self._mapping_msg = 'สั่ง scan gate ไม่สำเร็จ'
+                self._refresh_mapping_ui()
+            self.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_click_scan(self):
+        self._set_scanning(not self._scanning)
+
+    def _handle_mapping_cmds(self):
+        while self.ros.ok and self.ros.mapping_cmds:
+            try:
+                cmd = json.loads(self.ros.mapping_cmds.popleft())
+            except ValueError:
+                continue
+            action = cmd.get('action')
+            if self._mode != 'mapping':
+                continue
+            if action == 'start':
+                self._set_scanning(True)
+            elif action == 'pause':
+                self._set_scanning(False)
+            elif action == 'save':
+                name = sanitize_map_name(str(cmd.get('name') or '')) or \
+                    time.strftime('map_%Y%m%d_%H%M%S')
+                if os.path.exists(os.path.join(MAPS_DIR, name + '.yaml')):
+                    self._mapping_msg = f'มีแผนที่ชื่อ "{name}" อยู่แล้ว - ใช้ชื่ออื่น'
+                else:
+                    self._start_map_save(name, from_phone=True)
+            elif action == 'finish':
+                self._mapping_msg = 'ปิด Mapping จากมือถือ'
+                self._on_stop()
+            self._refresh_mapping_ui()
+
+    def _mapping_state(self):
+        if self._mode == 'mapping' and self._slam_ready and self.ros.gate_open is not None:
+            self._scanning = self.ros.gate_open
+        return {'mode': self._mode or 'idle', 'ready': self._slam_ready,
+                'scanning': self._scanning, 'saving': self._map_saving,
+                'msg': self._mapping_msg}
+
+    def _refresh_mapping_ui(self):
+        mapping = self._mode == 'mapping'
+        self._set_btn_state(self.btn_scan, mapping and self._slam_ready)
+        self.btn_scan.config(text=T('หยุดสแกนชั่วคราว' if self._scanning else 'เริ่มสแกน'))
+        if mapping:
+            self.mapping_banner.config(
+                text=T(('● กำลังสแกน · ' if self._scanning else '❚❚ ไม่ได้สแกน · ')
+                       + self._mapping_msg),
+                bg=GREEN if self._scanning else AMBER,
+                fg='white' if self._scanning else '#1a1a1a')
+        else:
+            self.mapping_banner.config(
+                text=T('ใช้ Joystick (ฮาร์ดแวร์/มือถือ) ขับหุ่นยนต์ช้าๆ ให้ทั่วพื้นที่'),
+                bg=AMBER, fg='#1a1a1a')
+        self.ros.publish_mapping_state(self._mapping_state())
+        self._mapping_state_t = time.monotonic()
 
     # ---------- rosboard / Lichtblick / mobile monitor QR ----------
     def _ensure_monitors_then_show_qr(self):
@@ -2564,7 +2759,11 @@ class AmrControlPanel(tk.Tk):
         self._mode = None
         self._mission = None
         self._nav_goal = None
+        self._slam_ready = False
+        self._scanning = False
+        self._map_saving = False
         self._set_running_ui(False)
+        self._refresh_mapping_ui()  # also tells the phone mode=idle
         if was_running and returncode not in (0, -2, -15):
             self._set_status('error', 'ระบบหยุดทำงานผิดปกติ',
                              f'exit code: {returncode}')
@@ -2884,21 +3083,41 @@ class AmrControlPanel(tk.Tk):
             if not messagebox.askyesno(
                     'ชื่อซ้ำ', f'มีแผนที่ชื่อ "{name}" อยู่แล้ว ต้องการเขียนทับหรือไม่?'):
                 return
+        self._start_map_save(name)
+
+    def _start_map_save(self, name, from_phone=False):
+        if self._map_saving:
+            return
+        os.makedirs(MAPS_DIR, exist_ok=True)
+        map_path = os.path.join(MAPS_DIR, name)
+        self._map_saving = True
+        self._mapping_msg = f'กำลังบันทึก {name}...'
+        self._refresh_mapping_ui()
         self._set_btn_state(self.btn_save_map, False)
         self.btn_save_map.config(text=T('กำลังบันทึก...'))
 
         def do_save():
-            result = subprocess.run(
-                ['ros2', 'run', 'nav2_map_server', 'map_saver_cli',
-                 '-f', map_path, '--ros-args', '-p', 'save_map_timeout:=10.0'],
-                capture_output=True, text=True, timeout=20)
-            ok = result.returncode == 0 and os.path.exists(map_path + '.yaml')
-            self.after(0, lambda: self._after_save(ok, name))
+            try:
+                result = subprocess.run(
+                    ['ros2', 'run', 'nav2_map_server', 'map_saver_cli',
+                     '-f', map_path, '--ros-args', '-p', 'save_map_timeout:=10.0'],
+                    capture_output=True, text=True, timeout=20)
+                ok = result.returncode == 0 and os.path.exists(map_path + '.yaml')
+            except subprocess.TimeoutExpired:
+                ok = False
+            self.after(0, lambda: self._after_save(ok, name, from_phone))
         threading.Thread(target=do_save, daemon=True).start()
 
-    def _after_save(self, ok, name):
+    def _after_save(self, ok, name, from_phone=False):
+        self._map_saving = False
+        self._mapping_msg = (f'บันทึกแล้ว: {name}' if ok else 'บันทึกแผนที่ไม่สำเร็จ')
+        self._refresh_mapping_ui()
         self._set_btn_state(self.btn_save_map, self._mode == 'mapping')
         self.btn_save_map.config(text=T('SAVE MAP (บันทึกแผนที่)'))
+        if from_phone:
+            # no modal on the panel - the operator is at the phone
+            self._set_status('running', T(self._mapping_msg))
+            return
         if ok:
             messagebox.showinfo('บันทึกสำเร็จ', f'บันทึกแผนที่แล้ว: {name}.yaml')
         else:
