@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import os
+import random
 import socket
 import threading
 import time
@@ -18,7 +19,14 @@ else:
     print("ROS not detected. Please source your ROS environment\n(e.g. 'source /opt/ros/DISTRO/setup.bash')")
     exit(1)
 
+import math
+
 from rosgraph_msgs.msg import Log
+from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
+from nav_msgs.msg import Path
+from std_msgs.msg import Empty, String
+import json
+import re
 
 from rosboard.serialization import ros2dict
 from rosboard.subscribers.dmesg_subscriber import DMesgSubscriber
@@ -96,7 +104,203 @@ class ROSBoardNode(object):
 
         self.lock = threading.Lock()
 
+        # --- access PIN gate ---
+        # Freshly random each time rosboard (re)starts. Anyone on the LAN
+        # can reach this port with no login, so this is a basic "you have
+        # to be standing at the robot and read the screen" gate, not
+        # cryptographic security - see handlers.py for enforcement.
+        self.access_pin = "%06d" % random.randint(0, 999999)
+        pin_file = os.path.expanduser("~/.rosboard_pin")
+        try:
+            with open(pin_file, "w") as f:
+                f.write(self.access_pin)
+            os.chmod(pin_file, 0o600)
+        except OSError as e:
+            rospy.logwarn("Could not write PIN file %s: %s" % (pin_file, str(e)))
+        rospy.loginfo("ROSboard access PIN: %s" % self.access_pin)
+
+        # --- mobile-web teleop (virtual joystick) ---
+        # Deliberately hardcoded to /cmd_vel (geometry_msgs/Twist) only - NOT a
+        # generic "publish any message to any topic" bridge, to keep the
+        # attack/mistake surface small on a channel that's reachable by
+        # anyone on the local WiFi with no login.
+        self.teleop_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
+        self.teleop_last_cmd_time = 0.0
+        self.TELEOP_MAX_LINEAR = 0.1     # m/s - walking pace, tune for your floor/ISO 3691-4 review
+        self.TELEOP_MAX_ANGULAR = 0.15   # rad/s - kept low so fast in-place turns during Mapping don't hurt SLAM scan-matching
+        self.TELEOP_DEADMAN_TIMEOUT = 0.5  # seconds - stop if no joystick update arrives in time
+        threading.Thread(target=self.teleop_watchdog_loop, daemon=True).start()
+
+        # --- goal_picker page: navigation goal / path / cancel ---
+        # Same "narrow, validated, dedicated topic" approach as teleop above
+        # - NOT a generic publish bridge. These are one-shot commands (the
+        # goal_picker page requires an explicit confirm tap before sending),
+        # consumed by amr_navigation's nav_goal_executor_node, which is the
+        # only thing that actually talks to the Nav2 action servers. rosboard
+        # itself never calls into Nav2 - it just republishes a validated
+        # PoseStamped/Path, same as it republishes a validated Twist for
+        # teleop.
+        self.nav_goal_pub = rospy.Publisher("/rosboard_nav_goal", PoseStamped, queue_size=1)
+        self.nav_path_pub = rospy.Publisher("/rosboard_nav_path", Path, queue_size=1)
+        self.nav_cancel_pub = rospy.Publisher("/rosboard_nav_cancel", Empty, queue_size=1)
+        # Mapping controls (start/pause scan, save, finish) from the phone.
+        # Same narrow approach: only these four actions and a sanitized map
+        # name are forwarded; the AMR Control panel is the only consumer and
+        # owns the actual slam_toolbox pause and map_saver calls.
+        self.mapping_cmd_pub = rospy.Publisher("/rosboard_mapping_cmd", String, queue_size=5)
+        self.MAPPING_ACTIONS = ("start", "pause", "save", "finish")
+
+        self.NAV_COORD_LIMIT = 1000.0    # m - reject obviously-bogus coordinates; Nav2's own costmap bounds are the real gate
+        self.NAV_PATH_MAX_POINTS = 200   # cap a drawn path's waypoint count
+
+        # Published straight to /initialpose (not through a bridge/executor
+        # topic like the goal/path above) because nav2_amcl already
+        # subscribes to that exact topic natively - there's no Nav2 action
+        # to go through, so no reason for nav_goal_executor_node to be
+        # involved.
+        self.initial_pose_pub = rospy.Publisher(
+            "/initialpose", PoseWithCovarianceStamped, queue_size=1)
+
         rospy.loginfo("ROSboard listening on :%d" % self.port)
+
+    def _nav_pose(self, x, y, theta):
+        """Builds a validated PoseStamped in the map frame, or None if x/y/
+        theta aren't finite numbers or fall outside NAV_COORD_LIMIT."""
+        try:
+            x, y, theta = float(x), float(y), float(theta)
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(theta)):
+            return None
+        if abs(x) > self.NAV_COORD_LIMIT or abs(y) > self.NAV_COORD_LIMIT:
+            return None
+
+        pose = PoseStamped()
+        pose.header.frame_id = "map"
+        pose.header.stamp = rospy.Time.now()
+        pose.pose.position.x = x
+        pose.pose.position.y = y
+        pose.pose.orientation.z = math.sin(theta / 2.0)
+        pose.pose.orientation.w = math.cos(theta / 2.0)
+        return pose
+
+    def on_nav_goal(self, x, y, theta):
+        """Handle a single navigation goal tapped on the goal_picker page's
+        map. Publishes a validated PoseStamped on /rosboard_nav_goal for
+        nav_goal_executor_node to send to Nav2's navigate_to_pose action."""
+        pose = self._nav_pose(x, y, theta)
+        if pose is None:
+            print("error: nav_goal: bad coordinates: x=%r y=%r theta=%r" % (x, y, theta))
+            return
+        self.nav_goal_pub.publish(pose)
+
+    def on_nav_path(self, points):
+        """Handle a drawn path from the goal_picker page: a list of
+        {x, y, theta} waypoints in the map frame. Publishes a validated
+        nav_msgs/Path on /rosboard_nav_path for nav_goal_executor_node to
+        send to Nav2's navigate_through_poses action. Malformed individual
+        points are skipped rather than rejecting the whole path."""
+        if not isinstance(points, list) or not points:
+            print("error: nav_path: empty or bad points list")
+            return
+
+        poses = []
+        for point in points[:self.NAV_PATH_MAX_POINTS]:
+            if not isinstance(point, dict):
+                continue
+            pose = self._nav_pose(
+                point.get("x", 0.0), point.get("y", 0.0), point.get("theta", 0.0))
+            if pose is not None:
+                poses.append(pose)
+
+        if not poses:
+            print("error: nav_path: no valid points")
+            return
+
+        path = Path()
+        path.header.frame_id = "map"
+        path.header.stamp = rospy.Time.now()
+        path.poses = poses
+        self.nav_path_pub.publish(path)
+
+    def on_nav_cancel(self):
+        """Handle a cancel request from the goal_picker page - published as
+        a signal for nav_goal_executor_node to cancel whatever Nav2 task
+        (goal or path) is currently in progress."""
+        self.nav_cancel_pub.publish(Empty())
+
+    def on_mapping_cmd(self, action, name):
+        """Forward a validated mapping command from the phone as JSON on
+        /rosboard_mapping_cmd. Map names are limited to [A-Za-z0-9_-]{0,40},
+        same character set the panel's own save dialog allows."""
+        if action not in self.MAPPING_ACTIONS:
+            print("error: mapping: bad action %r" % (action,))
+            return
+        name = re.sub(r"[^A-Za-z0-9_\-]", "", str(name or "").strip().replace(" ", "_"))[:40]
+        self.mapping_cmd_pub.publish(String(data=json.dumps({"action": action, "name": name})))
+
+    def on_initial_pose(self, x, y, theta):
+        """Handle a "set initial pose" tap from the goal_picker page - where
+        the operator indicates the robot's real current position/heading on
+        the map, e.g. right after Nav2 starts (AMCL has no idea where the
+        robot is until told) or if localization has drifted/gotten lost.
+        Publishes directly to /initialpose with the same covariance RViz2's
+        own "2D Pose Estimate" tool uses by default, since there's no
+        principled way to guess a tighter one from a single tap."""
+        pose = self._nav_pose(x, y, theta)
+        if pose is None:
+            print("error: initial_pose: bad coordinates: x=%r y=%r theta=%r" % (x, y, theta))
+            return
+
+        msg = PoseWithCovarianceStamped()
+        msg.header = pose.header
+        msg.pose.pose = pose.pose
+        # RViz2 Displays > Tool Properties > 2D Pose Estimate defaults:
+        # 0.25 m^2 variance in x/y (~0.5m std dev), ~0.0685 rad^2 in yaw
+        # (~15 degree std dev). AMCL's particle filter uses this as its
+        # initial spread to resample around, so it doesn't need to be exact.
+        msg.pose.covariance[0] = 0.25   # x
+        msg.pose.covariance[7] = 0.25   # y
+        msg.pose.covariance[35] = 0.06853892326654787  # yaw
+        self.initial_pose_pub.publish(msg)
+
+    def on_teleop_cmd(self, linear, angular):
+        """
+        Handle a teleop command from a rosboard web client's on-screen
+        joystick. Clamps to safe limits and publishes geometry_msgs/Twist
+        on /cmd_vel. Values outside the clamp range (or non-finite) are
+        capped/rejected rather than trusted as-is, since this comes
+        straight from a browser on the network.
+        """
+        def clamp(value, limit):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return 0.0
+            if value != value:  # NaN
+                return 0.0
+            return max(-limit, min(limit, value))
+
+        twist = Twist()
+        twist.linear.x = clamp(linear, self.TELEOP_MAX_LINEAR)
+        twist.angular.z = clamp(angular, self.TELEOP_MAX_ANGULAR)
+        self.teleop_pub.publish(twist)
+        self.teleop_last_cmd_time = time.time()
+
+    def teleop_watchdog_loop(self):
+        """
+        Deadman switch: if no joystick update has arrived recently (finger
+        lifted but the 'stop' message got lost, browser tab closed, WiFi
+        drop, etc), force-publish a zero Twist. Defense in depth alongside
+        the STM32 firmware's own /cmd_vel receive-timeout.
+        """
+        while True:
+            time.sleep(0.1)
+            if self.teleop_last_cmd_time == 0.0:
+                continue
+            if time.time() - self.teleop_last_cmd_time > self.TELEOP_DEADMAN_TIMEOUT:
+                self.teleop_pub.publish(Twist())
+                self.teleop_last_cmd_time = 0.0  # don't keep re-publishing zero every 100ms
 
     def start(self):
         try:
@@ -137,10 +341,41 @@ class ROSBoardNode(object):
             for the given topic, it returns the sensor data QoS. returns None in case ROS1 is being used
             """
             if rospy.__name__ == "rospy2":
+                # /map (nav2_map_server) and /tf_static are always published
+                # exactly once, latched (RELIABLE + TRANSIENT_LOCAL by
+                # design in Nav2/tf2) - hardcode that instead of trusting
+                # get_publishers_info_by_topic() below for them. That call
+                # can return a non-empty result whose qos_profile is still a
+                # provisional BEST_EFFORT/VOLATILE placeholder for a brief
+                # window right after the publisher's endpoint is first
+                # discovered, before DDS has finished propagating its real
+                # QoS announcement - hitting that window locks in a
+                # subscription that can never receive the one-shot latched
+                # publish, and the client is then stuck waiting forever
+                # (observed as the goal_picker page never leaving "waiting
+                # for /map data" after a fresh Navigation-mode launch).
+                latched_topics = ("/map", "/tf_static")
+                if topic_name in latched_topics:
+                    return QoSProfile(
+                            depth=10,
+                            reliability=QoSReliabilityPolicy.RELIABLE,
+                            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                        )
+
                 topic_info = rospy._node.get_publishers_info_by_topic(topic_name=topic_name)
                 if len(topic_info):
                     if topic_info[0].qos_profile.history == HistoryPolicy.UNKNOWN:
                         topic_info[0].qos_profile.history = HistoryPolicy.KEEP_LAST
+                    # DDS doesn't propagate history depth across nodes, so a
+                    # remote publisher's depth always reads back as 0. Copying
+                    # that gave a RELIABLE, near-zero-depth reader, which on
+                    # /tf (3 publishers, ~60 msg/s) intermittently stalled for
+                    # 1-8s in DDS - the goal_picker "ตำแหน่งล่าสุด" badge
+                    # jumping to several seconds while every other /tf
+                    # subscriber (depth 100, like tf2's own listener) kept
+                    # receiving normally.
+                    if topic_info[0].qos_profile.depth < 10:
+                        topic_info[0].qos_profile.depth = 100 if topic_name == "/tf" else 10
                     return topic_info[0].qos_profile
                 else:
                     rospy.logwarn(f"No publishers available for topic {topic_name}. Returning sensor data QoS")

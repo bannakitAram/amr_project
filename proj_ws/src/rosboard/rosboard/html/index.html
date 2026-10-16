@@ -1,6 +1,7 @@
 <!doctype html>
 <html>
     <head>
+      <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
         <link href="css/material-icons.css" media="all" rel="stylesheet" type="text/css">
         <script type="text/javascript" src="js/jquery-3.1.0.min.js" integrity="sha256-cCueBR6CsyA4/9szpPfrX3s49M9vUU5BgtiJj06wt/s="></script>
@@ -19,7 +20,10 @@
         <script type="text/javascript" src="js/leaflet.js"></script>        
 	      <script type="text/javascript" src="js/gl-matrix.js"></script>
 	      <script type="text/javascript" src="js/litegl.min.js"></script>
+        <script type="text/javascript" src="js/auth.js" defer></script>
         <script type="text/javascript" src="js/index.js" defer></script>
+        <script type="text/javascript" src="js/joystick.js" defer></script>
+        <script type="text/javascript" src="js/mapping.js" defer></script>
 
         <title>ROSboard</title>
     </head>
@@ -53,6 +57,17 @@
   <div id="demo-toast-example" class="mdl-js-snackbar mdl-snackbar">
     <div class="mdl-snackbar__text"></div>
     <button class="mdl-snackbar__action" type="button"></button>
+  </div>
+
+  <div id="auth-gate" hidden>
+    <form id="auth-gate-form">
+      <div class="auth-gate-title">กรอกรหัสเข้าใช้งาน</div>
+      <div class="auth-gate-subtitle">ดูรหัสได้ที่หน้าจอ AMR Control ข้าง QR code</div>
+      <input id="auth-gate-input" type="tel" inputmode="numeric" autocomplete="off"
+             maxlength="6" placeholder="000000" autofocus>
+      <button type="submit">เข้าใช้งาน</button>
+      <div id="auth-gate-error" class="auth-gate-error"></div>
+    </form>
   </div>
 
     </body>

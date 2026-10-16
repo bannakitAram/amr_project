@@ -1,11 +1,12 @@
 class WebSocketV1Transport {
-    constructor({path, onOpen, onClose, onRosMsg, onTopics, onSystem}) {
+    constructor({path, onOpen, onClose, onRosMsg, onTopics, onSystem, onAuthResult}) {
       this.path = path;
       this.onOpen = onOpen ? onOpen.bind(this) : null;
       this.onClose = onClose ? onClose.bind(this) : null;
-      this.onMsg = onMsg ? onMsg.bind(this) : null;
+      this.onMsg = onRosMsg ? onRosMsg.bind(this) : null;
       this.onTopics = onTopics ? onTopics.bind(this) : null;
       this.onSystem = onSystem ? onSystem.bind(this) : null;
+      this.onAuthResult = onAuthResult ? onAuthResult.bind(this) : null;
       this.ws = null;
     }
   
@@ -49,6 +50,7 @@ class WebSocketV1Transport {
         else if(wsMsgType === WebSocketV1Transport.MSG_MSG && that.onMsg) that.onMsg(data[1]);
         else if(wsMsgType === WebSocketV1Transport.MSG_TOPICS && that.onTopics) that.onTopics(data[1]);
         else if(wsMsgType === WebSocketV1Transport.MSG_SYSTEM && that.onSystem) that.onSystem(data[1]);
+        else if(wsMsgType === WebSocketV1Transport.MSG_AUTH_RESULT && that.onAuthResult) that.onAuthResult(data[1]);
         else console.log("received unknown message: " + wsmsg.data);
       }
     }
@@ -64,8 +66,43 @@ class WebSocketV1Transport {
     unsubscribe({topicName}) {
       this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_UNSUB, {topicName: topicName}]));
     }
+
+    teleop({linear, angular}) {
+      if (!this.isConnected()) return;
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_TELEOP, {linear: linear, angular: angular}]));
+    }
+
+    authenticate({code}) {
+      if (!this.isConnected()) return;
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_AUTH, {code: code}]));
+    }
+
+    navGoal({x, y, theta}) {
+      if (!this.isConnected()) return;
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_NAV_GOAL, {x: x, y: y, theta: theta}]));
+    }
+
+    navPath({points}) {
+      if (!this.isConnected()) return;
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_NAV_PATH, {points: points}]));
+    }
+
+    navCancel() {
+      if (!this.isConnected()) return;
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_NAV_CANCEL, {}]));
+    }
+
+    mappingCmd({action, name}) {
+      if (!this.isConnected()) return;
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_MAPPING, {action: action, name: name || ""}]));
+    }
+
+    initialPose({x, y, theta}) {
+      if (!this.isConnected()) return;
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_INITIAL_POSE, {x: x, y: y, theta: theta}]));
+    }
   }
-  
+
   WebSocketV1Transport.MSG_PING = "p";
   WebSocketV1Transport.MSG_PONG = "q";
   WebSocketV1Transport.MSG_MSG = "m";
@@ -73,6 +110,14 @@ class WebSocketV1Transport {
   WebSocketV1Transport.MSG_SUB = "s";
   WebSocketV1Transport.MSG_SYSTEM = "y";
   WebSocketV1Transport.MSG_UNSUB = "u";
+  WebSocketV1Transport.MSG_TELEOP = "v";
+  WebSocketV1Transport.MSG_AUTH = "a";
+  WebSocketV1Transport.MSG_AUTH_RESULT = "r";
+  WebSocketV1Transport.MSG_NAV_GOAL = "g";
+  WebSocketV1Transport.MSG_NAV_PATH = "w";
+  WebSocketV1Transport.MSG_NAV_CANCEL = "c";
+  WebSocketV1Transport.MSG_INITIAL_POSE = "i";
+  WebSocketV1Transport.MSG_MAPPING = "k";
 
   WebSocketV1Transport.PING_SEQ= "s";
   WebSocketV1Transport.PONG_SEQ = "s";

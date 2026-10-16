@@ -27,7 +27,8 @@ setup(
             'html/js/*',
             'html/js/viewers/*',
             'html/js/viewers/meta/*',
-            'html/js/transports/*'
+            'html/js/transports/*',
+            'html/goal_picker/*'
         ]
     },
     #zip_safe=True,

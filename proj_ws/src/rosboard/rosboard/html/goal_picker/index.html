@@ -1,0 +1,1175 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>AMR เลือกจุดหมาย</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #263238; overflow: hidden;
+               font-family: -apple-system, "Segoe UI", Sans-serif; touch-action: none; }
+  #app { position: relative; width: 100%; height: 100vh; height: 100dvh; }
+  /* #263238 matches RViz2's default background (Displays > Background Color). */
+  #map-canvas { position: absolute; inset: 0; width: 100%; height: 100%; background: #263238; display: block; }
+
+  #status-bar {
+    position: absolute; top: 0; left: 0; right: 0;
+    padding: env(safe-area-inset-top, 8px) 10px 6px;
+    background: rgba(0,0,0,0.55); color: #eee; font-size: 13px;
+    text-align: center; z-index: 20; pointer-events: none;
+  }
+
+  #scale-badge {
+    position: absolute; right: 10px; top: 42px;
+    padding: 4px 10px; border-radius: 6px;
+    background: rgba(0,0,0,0.55); color: #eee; font-size: 12px;
+    z-index: 20; pointer-events: none;
+  }
+
+  /* Shows how long ago the last /tf update actually arrived in THIS
+     browser, refreshed continuously (see freshnessBadge's JS) - so a
+     laggy/stuck connection is visible as a growing number instead of an
+     operator just guessing whether the robot icon on screen is current. */
+  #freshness-badge {
+    position: absolute; left: 10px; top: 42px;
+    padding: 4px 10px; border-radius: 6px;
+    background: rgba(0,0,0,0.55); color: #8bc34a; font-size: 12px;
+    z-index: 20; pointer-events: none;
+  }
+  #freshness-badge.stale { color: #ff6b6b; }
+
+  /* Current robot speed from /odometry/filtered (EKF), plus a slip tag
+     from the firmware's /wheel/slip_detected - see updateSpeedBadge(). */
+  #speed-badge {
+    position: absolute; left: 10px; top: 72px;
+    padding: 4px 10px; border-radius: 6px;
+    background: rgba(0,0,0,0.55); color: #eee; font-size: 12px;
+    z-index: 20; pointer-events: none;
+  }
+  #speed-badge.stale { color: #ff6b6b; }
+  #speed-badge .slip { color: #ffb300; font-weight: bold; }
+
+  /* IMU fault banner, driven by imu_watchdog_node's /imu_watchdog/ok -
+     see updateImuBanner(). Prominent on purpose: with yaw from the gyro
+     only, a lost IMU means navigation is cancelled and heading is wrong. */
+  #imu-banner {
+    position: absolute; left: 50%; top: 102px; transform: translateX(-50%);
+    max-width: calc(100% - 32px);
+    padding: 8px 14px; border-radius: 8px;
+    background: #c62828; color: #fff; font-size: 14px; font-weight: bold;
+    text-align: center; z-index: 25; pointer-events: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+  }
+
+  #mode-bar {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 8px 8px calc(10px + env(safe-area-inset-bottom, 0px));
+    display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;
+    background: rgba(0,0,0,0.55); z-index: 20;
+  }
+  .btn {
+    border: none; border-radius: 8px; padding: 10px 14px; font-size: 14px;
+    background: #444; color: #eee; cursor: pointer;
+  }
+  .btn.active { background: #2e7d32; color: white; }
+  .btn.danger { background: #b71c1c; color: white; }
+  .btn.primary { background: #1565c0; color: white; }
+  .btn:disabled { opacity: 0.4; }
+
+  #confirm-panel {
+    position: absolute; left: 10px; right: 10px; bottom: 66px;
+    background: rgba(20,20,20,0.92); color: #eee; border-radius: 10px;
+    padding: 10px 14px; font-size: 13px; z-index: 21;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  #confirm-panel[hidden] { display: none; }
+  #confirm-panel .warn { color: #ffb300; }
+
+  #pin-gate {
+    position: absolute; inset: 0; background: rgba(0,0,0,0.85);
+    display: flex; align-items: center; justify-content: center; z-index: 50;
+  }
+  #pin-gate[hidden] { display: none; }
+  #pin-gate form {
+    background: #222; padding: 22px; border-radius: 12px; text-align: center;
+    color: #eee; width: 260px;
+  }
+  #pin-gate input {
+    font-size: 22px; text-align: center; letter-spacing: 4px; width: 100%;
+    padding: 8px; margin: 12px 0; border-radius: 6px; border: none;
+  }
+  #pin-gate .error { color: #ff6b6b; font-size: 12px; min-height: 16px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <canvas id="map-canvas"></canvas>
+  <div id="status-bar">กำลังเชื่อมต่อ...</div>
+  <div id="scale-badge" hidden></div>
+  <div id="freshness-badge" hidden></div>
+  <div id="speed-badge" hidden></div>
+  <div id="imu-banner" hidden></div>
+
+  <div id="confirm-panel" hidden>
+    <span id="confirm-text"></span>
+    <button class="btn primary" id="btn-send">ส่ง</button>
+    <button class="btn" id="btn-discard">ยกเลิก</button>
+  </div>
+
+  <div id="mode-bar">
+    <button class="btn active" id="mode-view">ดูแผนที่</button>
+    <button class="btn" id="mode-goal">ตั้งจุดหมาย</button>
+    <button class="btn" id="mode-path">ลากเส้นทาง</button>
+    <button class="btn" id="mode-initpose">ตั้งตำแหน่งเริ่มต้น</button>
+    <button class="btn" id="btn-refit">พอดีจอ</button>
+    <button class="btn danger" id="btn-cancel-nav">หยุดนำทาง</button>
+  </div>
+
+  <div id="pin-gate">
+    <form id="pin-form">
+      <div>รหัสเข้าใช้งาน (PIN)</div>
+      <input id="pin-input" inputmode="numeric" maxlength="6" autofocus>
+      <div class="error" id="pin-error"></div>
+      <button class="btn primary" type="submit">เข้าใช้งาน</button>
+    </form>
+  </div>
+</div>
+
+<script src="../js/transports/WebSocketV1Transport.js"></script>
+<script>
+"use strict";
+
+// Lets an operator scan a QR code from the AMR control panel's Navigation
+// mode, tap a point on the live map to send the robot there, or drag out a
+// path for it to follow - both go through Nav2 (see amr_navigation's
+// nav_goal_executor_node.py), NOT a direct cmd_vel like the rosboard
+// joystick. Reuses rosboard's existing safety-reviewed websocket channel
+// (same PIN gate, same "narrow validated command" pattern as teleop) rather
+// than adding a new service - see rosboard.py's on_nav_goal/on_nav_path/
+// on_nav_cancel.
+//
+// Map rendering: subscribes to /map (nav_msgs/msg/OccupancyGrid) the same
+// way rosboard's own MapScanViewer does, and reads the same _data_jpeg the
+// server renders (see compression.py's compress_occupancy_grid) rather
+// than decoding the raw occupancy array client-side. That server-side
+// compression can downsample the image (repeated /2 stride if >800px), so
+// the true meters-per-pixel is derived from the *decoded* image's
+// naturalWidth vs. info.width, not from info.resolution directly.
+
+const PATH_POINT_MIN_SPACING = 0.15;   // m - drop recorded points closer than this while dragging
+const PATH_RESAMPLE_SPACING = 0.35;    // m - final waypoint spacing sent to Nav2
+const PATH_MAX_WAYPOINTS = 80;         // client-side sanity cap (server also caps at 200)
+const TAP_VS_DRAG_THRESHOLD = 0.08;    // m - below this, a goal drag counts as "just a tap" (theta = 0)
+
+const canvas = document.getElementById('map-canvas');
+const ctx = canvas.getContext('2d');
+const statusBar = document.getElementById('status-bar');
+const scaleBadge = document.getElementById('scale-badge');
+const freshnessBadge = document.getElementById('freshness-badge');
+const confirmPanel = document.getElementById('confirm-panel');
+const confirmText = document.getElementById('confirm-text');
+const btnSend = document.getElementById('btn-send');
+const btnDiscard = document.getElementById('btn-discard');
+const pinGate = document.getElementById('pin-gate');
+const pinForm = document.getElementById('pin-form');
+const pinInput = document.getElementById('pin-input');
+const pinError = document.getElementById('pin-error');
+
+function setStatus(text) { statusBar.textContent = text; }
+
+// ---------- websocket / auth ----------
+let authenticated = false;
+let pendingCode = null;
+
+const transport = new WebSocketV1Transport({
+  path: '/rosboard/v1',
+  onOpen: () => { setStatus('เชื่อมต่อแล้ว กำลังยืนยันตัวตน...'); tryAuth(); },
+  onClose: () => { authenticated = false; setStatus('ขาดการเชื่อมต่อ กำลังลองใหม่...'); setTimeout(() => transport.connect(), 3000); },
+  onRosMsg: onRosMsg,
+  onTopics: () => {},
+  onSystem: () => {},
+  onAuthResult: onAuthResult,
+});
+transport.connect();
+
+function tryAuth() {
+  const stored = localStorage.getItem('rosboard_pin');
+  if (stored) {
+    pendingCode = stored;
+    transport.authenticate({code: stored});
+  } else {
+    showPinGate();
+  }
+}
+
+function onAuthResult(result) {
+  if (result && result.ok) {
+    if (pendingCode) localStorage.setItem('rosboard_pin', pendingCode);
+    pinGate.hidden = true;
+    authenticated = true;
+    setStatus('กำลังรอข้อมูลแผนที่ (/map)...');
+    transport.subscribe({topicName: '/map', maxUpdateRate: 1.0});
+    transport.subscribe({topicName: '/tf', maxUpdateRate: 20.0});
+    transport.subscribe({topicName: '/tf_static', maxUpdateRate: 1.0});
+    transport.subscribe({topicName: '/scan', maxUpdateRate: 8.0});
+    transport.subscribe({topicName: '/odometry/filtered', maxUpdateRate: 5.0});
+    transport.subscribe({topicName: '/wheel/slip_detected', maxUpdateRate: 5.0});
+    transport.subscribe({topicName: '/imu_watchdog/ok', maxUpdateRate: 2.0});
+    transport.subscribe({topicName: '/plan', maxUpdateRate: 2.0});
+    transport.subscribe({topicName: '/mppi_local_plan', maxUpdateRate: 5.0});
+  } else {
+    localStorage.removeItem('rosboard_pin');
+    showPinGate('รหัสไม่ถูกต้อง กรุณาลองใหม่');
+  }
+}
+
+function showPinGate(errorText) {
+  pinError.textContent = errorText || '';
+  pinGate.hidden = false;
+  pinInput.value = '';
+  pinInput.focus();
+}
+
+pinForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const code = pinInput.value.trim();
+  if (!code) return;
+  pendingCode = code;
+  transport.authenticate({code: code});
+});
+
+function onRosMsg(msg) {
+  if (msg._topic_name === '/map') handleMap(msg);
+  else if (msg._topic_name === '/tf' || msg._topic_name === '/tf_static') handleTF(msg);
+  else if (msg._topic_name === '/scan') handleScan(msg);
+  else if (msg._topic_name === '/odometry/filtered') handleOdom(msg);
+  else if (msg._topic_name === '/wheel/slip_detected') handleSlip(msg);
+  else if (msg._topic_name === '/imu_watchdog/ok') handleImuOk(msg);
+  else if (msg._topic_name === '/plan') handlePlan(msg);
+  else if (msg._topic_name === '/mppi_local_plan') handleLocalPlan(msg);
+}
+
+// ---------- map state ----------
+let mapInfo = null;   // {resolution, widthCells, heightCells, originX, originY, originTheta}
+let mapImage = null;  // decoded <img>, natural size may be downsampled vs widthCells/heightCells
+let metersPerPixel = 0;
+let haveFitView = false;
+
+function quatYaw(q) {
+  return Math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z));
+}
+
+// ---------- TF (robot pose + laser scan placement in the map frame) ----------
+// Minimal from-scratch 2D (x, y, yaw-only) transform tree, ported from
+// rosboard's own MapScanViewer.js (same technique it uses for its Map+Scan
+// card) - not a full tf2 port, but sufficient for a ground AMR where the
+// EKF runs in two_d_mode. Walks whatever /tf and /tf_static edges have
+// been seen so far to compose a path between two frames; if none exists
+// yet (e.g. right after connecting) that layer is just skipped until one
+// arrives.
+const tf = {}; // "parentFrame>childFrame" -> {x, y, theta}
+
+function tfCompose(a, b) {
+  const cos = Math.cos(a.theta), sin = Math.sin(a.theta);
+  return {
+    x: a.x + cos * b.x - sin * b.y,
+    y: a.y + sin * b.x + cos * b.y,
+    theta: a.theta + b.theta,
+  };
+}
+
+function tfInverse(t) {
+  const cos = Math.cos(t.theta), sin = Math.sin(t.theta);
+  return {
+    x: -(cos * t.x + sin * t.y),
+    y: -(-sin * t.x + cos * t.y),
+    theta: -t.theta,
+  };
+}
+
+// Returns the pose of sourceFrame expressed in targetFrame, or null if no
+// chain of known transforms connects them yet.
+function tfLookup(targetFrame, sourceFrame) {
+  if (targetFrame === sourceFrame) return {x: 0, y: 0, theta: 0};
+
+  const adjacency = {};
+  for (const key in tf) {
+    const sep = key.indexOf('>');
+    const parent = key.slice(0, sep), child = key.slice(sep + 1);
+    const t = tf[key];
+    (adjacency[parent] = adjacency[parent] || []).push({to: child, t: t});
+    (adjacency[child] = adjacency[child] || []).push({to: parent, t: tfInverse(t)});
+  }
+
+  const visited = {[targetFrame]: {x: 0, y: 0, theta: 0}};
+  const queue = [targetFrame];
+  while (queue.length) {
+    const cur = queue.shift();
+    if (cur === sourceFrame) return visited[cur];
+    for (const edge of (adjacency[cur] || [])) {
+      if (edge.to in visited) continue;
+      visited[edge.to] = tfCompose(visited[cur], edge.t);
+      queue.push(edge.to);
+    }
+  }
+  return visited[sourceFrame] || null;
+}
+
+function handleTF(msg) {
+  for (const t of msg.transforms) {
+    tf[t.header.frame_id + '>' + t.child_frame_id] = {
+      x: t.transform.translation.x,
+      y: t.transform.translation.y,
+      theta: quatYaw(t.transform.rotation),
+    };
+  }
+  lastTfReceivedAt = Date.now();
+  redraw();
+}
+
+// ---------- data-freshness indicator ----------
+// Time since THIS BROWSER last actually received a /tf message, not the
+// message's own header.stamp (which would need the viewing device's clock
+// in sync with the robot's - not guaranteed, e.g. a phone over WiFi).
+// Ticks continuously (not just on message arrival) so a stalled
+// connection shows a growing number instead of silently freezing on the
+// last good value - added because a laggy display was making it hard to
+// tell "is this current" from "is this stuck" just by eyeballing the map.
+let lastTfReceivedAt = null;
+
+function updateFreshnessBadge() {
+  if (lastTfReceivedAt === null) { freshnessBadge.hidden = true; return; }
+  const ageS = (Date.now() - lastTfReceivedAt) / 1000;
+  freshnessBadge.hidden = false;
+  freshnessBadge.textContent = 'ตำแหน่งล่าสุด: ' + ageS.toFixed(1) + ' วิที่แล้ว';
+  freshnessBadge.classList.toggle('stale', ageS > 1.0);
+}
+setInterval(updateFreshnessBadge, 200);
+
+// ---------- speed badge ----------
+// Linear speed (m/s) and turn rate (deg/s) from the EKF's
+// /odometry/filtered twist (base frame). Shows "--" once no update has
+// arrived for >1s so a stuck value is never mistaken for a live one.
+const speedBadge = document.getElementById('speed-badge');
+let lastOdom = null;            // {v, w, at}
+let lastSlip = {value: false, at: null};
+
+function handleOdom(msg) {
+  const t = msg.twist && msg.twist.twist;
+  if (!t) return;
+  lastOdom = {v: t.linear.x, w: t.angular.z, at: Date.now()};
+}
+
+function handleSlip(msg) {
+  lastSlip = {value: !!msg.data, at: Date.now()};
+}
+
+function updateSpeedBadge() {
+  if (lastOdom === null) { speedBadge.hidden = true; return; }
+  speedBadge.hidden = false;
+  const stale = (Date.now() - lastOdom.at) > 1000;
+  speedBadge.classList.toggle('stale', stale);
+  let text = stale
+    ? 'ความเร็ว: -- (ไม่มีข้อมูล)'
+    : 'ความเร็ว: ' + lastOdom.v.toFixed(2) + ' m/s  หมุน: ' +
+      (lastOdom.w * 180 / Math.PI).toFixed(0) + ' °/s';
+  speedBadge.textContent = text;
+  const slipFresh = lastSlip.at !== null && (Date.now() - lastSlip.at) < 1000;
+  if (!stale && slipFresh && lastSlip.value) {
+    const tag = document.createElement('span');
+    tag.className = 'slip';
+    tag.textContent = '  ⚠ ล้อ slip';
+    speedBadge.appendChild(tag);
+  }
+}
+setInterval(updateSpeedBadge, 200);
+
+// ---------- IMU fault banner ----------
+// Hidden until the watchdog has been heard from at least once (navigation
+// not launched yet = nothing to warn about). After that: red banner when
+// it reports false, or when the watchdog itself goes silent >2s (it
+// publishes at 2 Hz) - silence is shown as "unknown", never as OK.
+const imuBanner = document.getElementById('imu-banner');
+let lastImuOk = null;  // {ok, at}
+
+function handleImuOk(msg) {
+  lastImuOk = {ok: !!msg.data, at: Date.now()};
+}
+
+function updateImuBanner() {
+  if (lastImuOk === null) { imuBanner.hidden = true; return; }
+  const stale = (Date.now() - lastImuOk.at) > 2000;
+  if (stale) {
+    imuBanner.textContent = '⚠ ไม่ทราบสถานะ IMU (imu_watchdog ไม่ตอบสนอง)';
+    imuBanner.hidden = false;
+  } else if (!lastImuOk.ok) {
+    imuBanner.textContent = '⚠ IMU ขาดการเชื่อมต่อ - ยกเลิกการนำทางแล้ว ห้ามส่งจุดหมาย';
+    imuBanner.hidden = false;
+  } else {
+    imuBanner.hidden = true;
+  }
+}
+setInterval(updateImuBanner, 250);
+
+// ---------- laser scan ----------
+let scanPoints = null;  // Float32Array of [x0,y0,x1,y1,...] in the scan's own frame
+let scanFrameId = null;
+
+function base64Decode(base64) {
+  const binary = window.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+// Mirrors MapScanViewer.js's _decodeScan - rosboard compresses LaserScan
+// ranges to a base64 uint16 buffer (see compression.py's compress_laser_scan)
+// when the scan is large, and sends the plain float ranges array otherwise.
+function decodeScan(msg) {
+  if (msg.__comp) {
+    const bounds = msg._ranges_uint16.bounds;
+    const view = new DataView(base64Decode(msg._ranges_uint16.points));
+    const n = view.byteLength / 2;
+    const points = new Float32Array(n * 2);
+    const angleIncr = (msg.angle_max - msg.angle_min) / n;
+    const range = bounds[1] - bounds[0], rmin = bounds[0];
+    for (let i = 0; i < n; i++) {
+      const r16 = view.getUint16(i * 2, true);
+      if (r16 === 65535) { points[2 * i] = NaN; points[2 * i + 1] = NaN; continue; }
+      const r = r16 / 65534 * range + rmin;
+      const angle = msg.angle_min + i * angleIncr;
+      points[2 * i] = r * Math.cos(angle);
+      points[2 * i + 1] = r * Math.sin(angle);
+    }
+    return points;
+  }
+  const n = msg.ranges.length;
+  const points = new Float32Array(n * 2);
+  const angleIncr = (msg.angle_max - msg.angle_min) / n;
+  for (let i = 0; i < n; i++) {
+    const angle = msg.angle_min + i * angleIncr;
+    if (msg.ranges[i] > -10000.0 && msg.ranges[i] < 10000.0) {
+      points[2 * i] = msg.ranges[i] * Math.cos(angle);
+      points[2 * i + 1] = msg.ranges[i] * Math.sin(angle);
+    } else {
+      points[2 * i] = NaN; points[2 * i + 1] = NaN;
+    }
+  }
+  return points;
+}
+
+function handleScan(msg) {
+  scanFrameId = msg.header.frame_id;
+  scanPoints = decodeScan(msg);
+  redraw();
+}
+
+function handleMap(msg) {
+  mapInfo = {
+    resolution: msg.info.resolution,
+    widthCells: msg.info.width,
+    heightCells: msg.info.height,
+    originX: msg.info.origin.position.x,
+    originY: msg.info.origin.position.y,
+    originTheta: quatYaw(msg.info.origin.orientation),
+  };
+  if (!msg._data_jpeg) return;
+  const img = new Image();
+  img.onload = () => {
+    mapImage = img;
+    metersPerPixel = mapInfo.resolution * mapInfo.widthCells / img.naturalWidth;
+    if (!haveFitView) { fitView(); haveFitView = true; }
+    setStatus('พร้อมใช้งาน - แตะแผนที่เพื่อตั้งจุดหมาย หรือลากเพื่อวาดเส้นทาง');
+    redraw();
+  };
+  img.src = 'data:image/jpeg;base64,' + msg._data_jpeg;
+}
+
+// ---------- view (pan/zoom) transform: world (map frame meters) <-> canvas device pixels ----------
+const view = {scale: 50, panX: 0, panY: 0};
+
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.round(rect.width * dpr);
+  canvas.height = Math.round(rect.height * dpr);
+  redraw();
+}
+window.addEventListener('resize', resizeCanvas);
+
+function screenMatrix() {
+  return new DOMMatrix()
+    .translate(canvas.width / 2 + view.panX, canvas.height / 2 + view.panY)
+    .scale(view.scale, -view.scale);
+}
+
+function worldFromImageMatrix() {
+  return new DOMMatrix()
+    .translate(mapInfo.originX, mapInfo.originY)
+    .rotate(mapInfo.originTheta * 180 / Math.PI)
+    .scale(metersPerPixel, -metersPerPixel)
+    .translate(0, -mapImage.naturalHeight);
+}
+
+function toCanvasPixel(clientX, clientY) {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  return {x: (clientX - rect.left) * dpr, y: (clientY - rect.top) * dpr};
+}
+
+function screenToWorld(clientX, clientY) {
+  const p = toCanvasPixel(clientX, clientY);
+  const inv = screenMatrix().inverse();
+  const w = inv.transformPoint({x: p.x, y: p.y});
+  return {x: w.x, y: w.y};
+}
+
+function worldToScreen(wx, wy) {
+  return screenMatrix().transformPoint({x: wx, y: wy});
+}
+
+function fitView() {
+  if (!mapInfo || !mapImage) return;
+  const corners = [[0, 0], [mapImage.naturalWidth, 0], [0, mapImage.naturalHeight]]
+    .map(([ix, iy]) => worldFromImageMatrix().transformPoint({x: ix, y: iy}));
+  const xs = corners.map(c => c.x), ys = corners.map(c => c.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const w = Math.max(maxX - minX, 0.5), h = Math.max(maxY - minY, 0.5);
+  view.scale = 0.92 * Math.min(canvas.width / w, canvas.height / h);
+  const cwx = (minX + maxX) / 2, cwy = (minY + maxY) / 2;
+  view.panX = -cwx * view.scale;
+  view.panY = cwy * view.scale;
+  redraw();
+}
+document.getElementById('btn-refit').addEventListener('click', fitView);
+
+// Offscreen snapshot of the map-only render (no robot/goal/path overlays),
+// used by classifyScreenPoint() below - sampling the live, overlay-drawn
+// canvas would just read back the marker/line color the operator just drew
+// instead of the map underneath it.
+const mapOnlyCanvas = document.createElement('canvas');
+const mapOnlyCtx = mapOnlyCanvas.getContext('2d');
+
+// ---------- rendering ----------
+// Color scheme follows RViz2's own defaults: #263238 background, a grey
+// ground-plane Grid display (0.482,0.482,0.482 @ ~30% alpha for the minor
+// lines, brighter for the major/origin lines), and the classic red/green
+// X/Y axes convention for TF frames.
+const RVIZ_BG = '#263238';
+const GRID_MINOR = 'rgba(160, 176, 180, 0.18)';
+const GRID_MAJOR = 'rgba(160, 176, 180, 0.38)';
+const AXIS_X_COLOR = '#f44336'; // RViz convention: X = red
+const AXIS_Y_COLOR = '#4caf50'; // RViz convention: Y = green
+
+function redraw() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = RVIZ_BG;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (mapInfo && mapImage) {
+    const m = screenMatrix().multiply(worldFromImageMatrix());
+    ctx.save();
+    ctx.setTransform(m);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(mapImage, 0, 0);
+    ctx.restore();
+  }
+
+  // Snapshot the map BEFORE the grid overlay - classifyScreenPoint() below
+  // needs the map's actual pixel color, not a grid line drawn on top of it.
+  mapOnlyCanvas.width = canvas.width;
+  mapOnlyCanvas.height = canvas.height;
+  mapOnlyCtx.drawImage(canvas, 0, 0);
+
+  // Grid drawn on top of the map (semi-transparent) rather than under it,
+  // so it reads as a distance reference over the whole visible area
+  // instead of only showing in the empty space outside the map's extent.
+  drawGrid();
+
+  if (scanPoints && scanFrameId) {
+    const scanPose = tfLookup('map', scanFrameId);
+    if (scanPose) drawScan(scanPose, scanPoints);
+  }
+
+  drawPlan();
+  drawLocalPlan();
+
+  const robotPose = tfLookup('map', 'base_footprint');
+  if (robotPose) drawRobot(robotPose);
+
+  if (activeGoal) drawGoalPin(activeGoal);
+  if ((mode === 'goal' || mode === 'initpose') && goalDraft) drawGoalDraft(goalDraft, mode === 'initpose');
+  if (mode === 'path' && pathDraft) drawPathDraft(pathDraft.points);
+}
+
+// RViz-style ground-plane grid: an unbounded 1m grid (5m major lines),
+// semi-transparent so it reads as a distance reference over the map
+// itself (not just in the empty space outside its extent) - plus a short
+// red/green tripod at the map-frame origin, same as RViz's default Grid +
+// Axes displays.
+function formatMeters(m) {
+  return m < 1 ? Math.round(m * 100) + ' ซม.' : (Number.isInteger(m) ? m : m.toFixed(1)) + ' ม.';
+}
+
+function drawGrid() {
+  const topLeft = screenToWorldPixel(0, 0);
+  const bottomRight = screenToWorldPixel(canvas.width, canvas.height);
+  const minX = Math.min(topLeft.x, bottomRight.x), maxX = Math.max(topLeft.x, bottomRight.x);
+  const minY = Math.min(topLeft.y, bottomRight.y), maxY = Math.max(topLeft.y, bottomRight.y);
+
+  // Pick a cell size so grid lines land roughly 40-100 screen px apart.
+  const targetPx = 60;
+  const candidates = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500];
+  let cell = candidates[candidates.length - 1];
+  for (const c of candidates) {
+    if (c * view.scale >= targetPx) { cell = c; break; }
+  }
+  const major = cell * 5;
+
+  scaleBadge.hidden = false;
+  scaleBadge.textContent = 'ตาราง: ' + formatMeters(cell) + ' (เส้นหนา ' + formatMeters(major) + ')';
+
+  ctx.lineWidth = 1;
+  const startX = Math.floor(minX / cell) * cell;
+  for (let x = startX; x <= maxX; x += cell) {
+    const isMajor = Math.abs(x % major) < cell / 2;
+    ctx.strokeStyle = isMajor ? GRID_MAJOR : GRID_MINOR;
+    const a = worldToScreen(x, minY), b = worldToScreen(x, maxY);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+  const startY = Math.floor(minY / cell) * cell;
+  for (let y = startY; y <= maxY; y += cell) {
+    const isMajor = Math.abs(y % major) < cell / 2;
+    ctx.strokeStyle = isMajor ? GRID_MAJOR : GRID_MINOR;
+    const a = worldToScreen(minX, y), b = worldToScreen(maxX, y);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+
+  drawAxes({x: 0, y: 0, theta: 0}, 0.6, 3);
+}
+
+function screenToWorldPixel(px, py) {
+  return screenMatrix().inverse().transformPoint({x: px, y: py});
+}
+
+// Short X (red) / Y (green) tripod for a frame's pose - RViz's standard
+// Axes display convention, used for both the map-frame origin and the
+// robot's own base_footprint frame.
+function drawAxes(pose, length, lineWidth) {
+  const cos = Math.cos(pose.theta), sin = Math.sin(pose.theta);
+  const origin = worldToScreen(pose.x, pose.y);
+  const xEnd = worldToScreen(pose.x + cos * length, pose.y + sin * length);
+  const yEnd = worldToScreen(pose.x - sin * length, pose.y + cos * length);
+
+  ctx.lineWidth = lineWidth;
+  ctx.strokeStyle = AXIS_X_COLOR;
+  ctx.beginPath(); ctx.moveTo(origin.x, origin.y); ctx.lineTo(xEnd.x, xEnd.y); ctx.stroke();
+  ctx.strokeStyle = AXIS_Y_COLOR;
+  ctx.beginPath(); ctx.moveTo(origin.x, origin.y); ctx.lineTo(yEnd.x, yEnd.y); ctx.stroke();
+}
+
+function drawScan(scanPose, points) {
+  const cos = Math.cos(scanPose.theta), sin = Math.sin(scanPose.theta);
+  // RViz's default LaserScan style (Flat Squares, flat red) rather than the
+  // yellow dots a generic "highlight" color would suggest.
+  ctx.fillStyle = '#f44336';
+  for (let i = 0; i < points.length / 2; i++) {
+    const lx = points[2 * i], ly = points[2 * i + 1];
+    if (Number.isNaN(lx) || Number.isNaN(ly)) continue;
+    const wx = scanPose.x + cos * lx - sin * ly;
+    const wy = scanPose.y + sin * lx + cos * ly;
+    const s = worldToScreen(wx, wy);
+    ctx.fillRect(s.x - 1.5, s.y - 1.5, 3, 3);
+  }
+}
+
+// Real chassis footprint (see amr_navigation/config/nav2_params.yaml's
+// costmap "footprint" - kept in sync with amr_description/urdf/amr.urdf.xacro),
+// drawn as a rotated rectangle instead of a generic circle so the operator
+// can judge actual clearance around the robot, not just its center point.
+const ROBOT_FOOTPRINT = [[0.49, 0.26], [0.49, -0.26], [-0.49, -0.26], [-0.49, 0.26]];
+
+function drawRobot(pose) {
+  const cos = Math.cos(pose.theta), sin = Math.sin(pose.theta);
+  const corners = ROBOT_FOOTPRINT.map(([lx, ly]) =>
+    worldToScreen(pose.x + cos * lx - sin * ly, pose.y + sin * lx + cos * ly));
+
+  ctx.beginPath();
+  ctx.moveTo(corners[0].x, corners[0].y);
+  for (let i = 1; i < corners.length; i++) ctx.lineTo(corners[i].x, corners[i].y);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(158, 158, 158, 0.35)';
+  ctx.fill();
+  ctx.strokeStyle = '#cfd8dc';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Robot's own TF frame (base_footprint), same red/green convention as
+  // the map-frame origin drawn in drawGrid() - this is what tells the
+  // operator "front" without relying on the fill color alone.
+  drawAxes(pose, 0.35, 3);
+}
+
+// ---------- planned path (/plan) ----------
+// Nav2 planner_server's global path (nav_msgs/Path). The BT replans at
+// 1 Hz (navigate_to_pose) / ~0.33 Hz (navigate_through_poses), so a plan
+// with no update for PLAN_STALE_MS means navigation ended - hide it then,
+// rather than leaving an old route on screen. Cleared immediately on
+// "หยุดนำทาง" too.
+const PLAN_STALE_MS = 6000;
+let planPoints = null;  // [{x, y}, ...] in the path's own frame
+let planFrameId = null;
+let planReceivedAt = 0;
+
+function handlePlan(msg) {
+  planPoints = pathPoints(msg);
+  planFrameId = (msg.header && msg.header.frame_id) || 'map';
+  planReceivedAt = Date.now();
+  redraw();
+}
+
+function clearPlan() { planPoints = null; localPlanPoints = null; }
+
+function pathPoints(msg) {
+  return (msg.poses || []).map(ps => ({x: ps.pose.position.x, y: ps.pose.position.y}));
+}
+
+// Polyline of points given in `frameId`, transformed into the map frame,
+// with a dark outline so it reads on any map color.
+function drawPolyline(points, frameId, color, width) {
+  if (!points || points.length < 2) return;
+  const f = frameId === 'map' ? {x: 0, y: 0, theta: 0} : tfLookup('map', frameId);
+  if (!f) return;
+  const c = Math.cos(f.theta), sn = Math.sin(f.theta);
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    const s = worldToScreen(f.x + c * p.x - sn * p.y, f.y + sn * p.x + c * p.y);
+    if (i === 0) ctx.moveTo(s.x, s.y); else ctx.lineTo(s.x, s.y);
+  });
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
+  ctx.lineWidth = width + 3;
+  ctx.stroke();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.stroke();
+}
+
+function drawPlan() {
+  if (Date.now() - planReceivedAt > PLAN_STALE_MS) return;
+  drawPolyline(planPoints, planFrameId, '#00e5ff', 3);
+}
+
+// ---------- MPPI local trajectory (/mppi_local_plan) ----------
+// The ~2.8 s trajectory MPPI actually chose this cycle (relayed by
+// local_plan_relay_node.py from MPPI's /trajectories). Published at the
+// controller rate (20 Hz) only while following a path, so it's hidden
+// after LOCAL_PLAN_STALE_MS without an update.
+const LOCAL_PLAN_STALE_MS = 1000;
+let localPlanPoints = null;
+let localPlanFrameId = null;
+let localPlanReceivedAt = 0;
+
+function handleLocalPlan(msg) {
+  localPlanPoints = pathPoints(msg);
+  localPlanFrameId = (msg.header && msg.header.frame_id) || 'odom';
+  localPlanReceivedAt = Date.now();
+  redraw();
+}
+
+function drawLocalPlan() {
+  if (Date.now() - localPlanReceivedAt > LOCAL_PLAN_STALE_MS) return;
+  drawPolyline(localPlanPoints, localPlanFrameId, '#76ff03', 4);
+}
+setInterval(() => {
+  if (localPlanPoints && Date.now() - localPlanReceivedAt > LOCAL_PLAN_STALE_MS) {
+    localPlanPoints = null;
+    redraw();
+  }
+}, 500);
+setInterval(() => {
+  if (planPoints && Date.now() - planReceivedAt > PLAN_STALE_MS) { clearPlan(); redraw(); }
+}, 1000);
+
+// ---------- active goal pin ----------
+// The last goal sent stays on the map as a pin until the robot reaches it
+// (within GOAL_PIN_CLEAR_DIST), a new goal/path is sent, or the operator
+// presses "หยุดนำทาง". Kept in localStorage so a page reload keeps it.
+const GOAL_PIN_CLEAR_DIST = 0.35;  // m - a bit looser than Nav2's xy_goal_tolerance (0.30)
+let activeGoal = null;  // {x, y, theta}
+try {
+  const saved = JSON.parse(localStorage.getItem('goal_picker_active_goal'));
+  if (saved && isFinite(saved.x) && isFinite(saved.y)) activeGoal = saved;
+} catch (e) {}
+
+function setActiveGoal(goal) {
+  activeGoal = goal;
+  try {
+    if (goal) localStorage.setItem('goal_picker_active_goal', JSON.stringify(goal));
+    else localStorage.removeItem('goal_picker_active_goal');
+  } catch (e) {}
+}
+
+function checkGoalReached() {
+  if (!activeGoal) return;
+  const pose = tfLookup('map', 'base_footprint');
+  if (!pose) return;
+  if (Math.hypot(pose.x - activeGoal.x, pose.y - activeGoal.y) < GOAL_PIN_CLEAR_DIST) {
+    setActiveGoal(null);
+    setStatus('ถึงจุดหมายแล้ว');
+    redraw();
+  }
+}
+setInterval(checkGoalReached, 500);
+
+function drawGoalPin(goal) {
+  const p = worldToScreen(goal.x, goal.y);
+  const color = '#e53935';
+  // heading arrow from the pin's tip
+  // (projected through worldToScreen so any view flip/rotation is honored)
+  const ahead = worldToScreen(goal.x + Math.cos(goal.theta), goal.y + Math.sin(goal.theta));
+  const dl = Math.hypot(ahead.x - p.x, ahead.y - p.y) || 1;
+  const len = 28;
+  const hx = p.x + (ahead.x - p.x) / dl * len;
+  const hy = p.y + (ahead.y - p.y) / dl * len;
+  ctx.beginPath();
+  ctx.moveTo(p.x, p.y);
+  ctx.lineTo(hx, hy);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  // map-pin (teardrop) with its tip exactly on the goal point
+  const r = 11, h = 30;
+  const cy = p.y - h + r;
+  ctx.beginPath();
+  ctx.moveTo(p.x, p.y);
+  ctx.bezierCurveTo(p.x - r * 0.6, p.y - h * 0.45, p.x - r, cy + r * 0.4, p.x - r, cy);
+  ctx.arc(p.x, cy, r, Math.PI, 0);
+  ctx.bezierCurveTo(p.x + r, cy + r * 0.4, p.x + r * 0.6, p.y - h * 0.45, p.x, p.y);
+  ctx.closePath();
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#ffffff';
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(p.x, cy, r * 0.4, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+}
+
+function drawGoalDraft(draft, isInitPose) {
+  // Purple for "set initial pose" vs. orange for a navigation goal, so the
+  // two tap-and-drag modes are visually distinguishable at a glance.
+  const color = isInitPose ? '#ab47bc' : '#ff9800';
+  const a = worldToScreen(draft.ax, draft.ay);
+  const b = worldToScreen(draft.tx, draft.ty);
+  ctx.beginPath();
+  ctx.arc(a.x, a.y, 9, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 3;
+  ctx.stroke();
+}
+
+function drawPathDraft(points) {
+  if (points.length < 1) return;
+  ctx.beginPath();
+  const p0 = worldToScreen(points[0].x, points[0].y);
+  ctx.moveTo(p0.x, p0.y);
+  for (let i = 1; i < points.length; i++) {
+    const p = worldToScreen(points[i].x, points[i].y);
+    ctx.lineTo(p.x, p.y);
+  }
+  ctx.strokeStyle = '#ffeb3b';
+  ctx.lineWidth = 4;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+}
+
+// A rough client-side pre-check only, sampled straight off the rendered
+// canvas pixel (occupied cells render reddish, unmapped cells orange - see
+// compression.py's compress_occupancy_grid) - it exists purely to warn the
+// operator before they tap "send"; Nav2's own costmap is the real gate and
+// will refuse/fail an actually-invalid goal regardless of this check.
+function classifyScreenPoint(sx, sy) {
+  try {
+    const d = mapOnlyCtx.getImageData(Math.round(sx), Math.round(sy), 1, 1).data;
+    if (d[0] > 200 && d[1] < 150 && d[2] < 100) return 'obstacle';
+    if (d[0] > 200 && d[1] > 70 && d[1] < 190 && d[2] < 90) return 'unmapped';
+    return ((d[0] + d[1] + d[2]) / 3) > 140 ? 'free' : 'tight';
+  } catch (e) {
+    return 'unknown';
+  }
+}
+
+// ---------- interaction ----------
+let mode = 'view';
+const activePointers = new Map();
+let panState = {active: false, lastX: 0, lastY: 0};
+let goalDraft = null;   // {ax, ay, tx, ty}
+let pathDraft = null;   // {points: [{x,y}, ...]}
+
+function setMode(next) {
+  mode = next;
+  goalDraft = null;
+  pathDraft = null;
+  hideConfirm();
+  for (const id of ['mode-view', 'mode-goal', 'mode-path', 'mode-initpose']) {
+    document.getElementById(id).classList.toggle('active', id === 'mode-' + next);
+  }
+  redraw();
+}
+document.getElementById('mode-view').addEventListener('click', () => setMode('view'));
+document.getElementById('mode-goal').addEventListener('click', () => setMode('goal'));
+document.getElementById('mode-path').addEventListener('click', () => setMode('path'));
+document.getElementById('mode-initpose').addEventListener('click', () => setMode('initpose'));
+
+document.getElementById('btn-cancel-nav').addEventListener('click', () => {
+  if (!authenticated) return;
+  transport.navCancel();
+  setActiveGoal(null);
+  clearPlan();
+  redraw();
+  setStatus('ส่งคำสั่งหยุดนำทางแล้ว');
+});
+
+function hideConfirm() { confirmPanel.hidden = true; btnSend.onclick = null; }
+
+function showConfirm(text, warnText, onSend) {
+  confirmText.innerHTML = text + (warnText ? ' <span class="warn">' + warnText + '</span>' : '');
+  confirmPanel.hidden = false;
+  btnSend.onclick = onSend;
+}
+btnDiscard.addEventListener('click', () => {
+  goalDraft = null;
+  pathDraft = null;
+  hideConfirm();
+  redraw();
+});
+
+canvas.addEventListener('pointerdown', (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  activePointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+  if (activePointers.size === 1) {
+    if (mode === 'view') {
+      panState = {active: true, lastX: e.clientX, lastY: e.clientY};
+    } else if ((mode === 'goal' || mode === 'initpose') && mapInfo) {
+      const w = screenToWorld(e.clientX, e.clientY);
+      goalDraft = {ax: w.x, ay: w.y, tx: w.x, ty: w.y};
+      hideConfirm();
+    } else if (mode === 'path' && mapInfo) {
+      const w = screenToWorld(e.clientX, e.clientY);
+      pathDraft = {points: [w]};
+      hideConfirm();
+    }
+  } else if (activePointers.size === 2) {
+    panState.active = false;
+    goalDraft = null;
+    pathDraft = null;
+  }
+  redraw();
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!activePointers.has(e.pointerId)) return;
+  activePointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
+
+  if (activePointers.size >= 2) {
+    handlePinch();
+  } else if (activePointers.size === 1) {
+    if (mode === 'view' && panState.active) {
+      view.panX += e.clientX - panState.lastX;
+      view.panY += e.clientY - panState.lastY;
+      panState.lastX = e.clientX;
+      panState.lastY = e.clientY;
+    } else if ((mode === 'goal' || mode === 'initpose') && goalDraft) {
+      const w = screenToWorld(e.clientX, e.clientY);
+      goalDraft.tx = w.x;
+      goalDraft.ty = w.y;
+    } else if (mode === 'path' && pathDraft) {
+      const w = screenToWorld(e.clientX, e.clientY);
+      const last = pathDraft.points[pathDraft.points.length - 1];
+      if (Math.hypot(w.x - last.x, w.y - last.y) >= PATH_POINT_MIN_SPACING) {
+        pathDraft.points.push(w);
+      }
+    }
+  }
+  redraw();
+});
+
+function endPointer(e) {
+  activePointers.delete(e.pointerId);
+  if (activePointers.size === 0) {
+    panState.active = false;
+    if ((mode === 'goal' || mode === 'initpose') && goalDraft) finalizeGoalDraft();
+    else if (mode === 'path' && pathDraft) finalizePathDraft();
+  } else if (activePointers.size === 1) {
+    const remaining = [...activePointers.values()][0];
+    panState = {active: mode === 'view', lastX: remaining.x, lastY: remaining.y};
+  }
+  redraw();
+}
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', endPointer);
+
+let pinchStartDist = null;
+let pinchStartScale = null;
+function handlePinch() {
+  const pts = [...activePointers.values()];
+  const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+  const midClient = {x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2};
+  if (pinchStartDist === null) {
+    pinchStartDist = dist;
+    pinchStartScale = view.scale;
+    return;
+  }
+  const worldAtMid = screenToWorld(midClient.x, midClient.y);
+  view.scale = Math.max(2, Math.min(4000, pinchStartScale * (dist / pinchStartDist)));
+  const midPixel = toCanvasPixel(midClient.x, midClient.y);
+  view.panX = midPixel.x - canvas.width / 2 - worldAtMid.x * view.scale;
+  view.panY = midPixel.y - canvas.height / 2 + worldAtMid.y * view.scale;
+}
+canvas.addEventListener('pointerup', () => { pinchStartDist = null; });
+canvas.addEventListener('pointercancel', () => { pinchStartDist = null; });
+
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const p = toCanvasPixel(e.clientX, e.clientY);
+  const worldAtCursor = screenToWorld(e.clientX, e.clientY);
+  const factor = Math.exp(-e.deltaY * 0.001);
+  view.scale = Math.max(2, Math.min(4000, view.scale * factor));
+  view.panX = p.x - canvas.width / 2 - worldAtCursor.x * view.scale;
+  view.panY = p.y - canvas.height / 2 + worldAtCursor.y * view.scale;
+  redraw();
+}, {passive: false});
+
+// ---------- finalize goal / path drafts ----------
+function finalizeGoalDraft() {
+  const draft = goalDraft;
+  const dragDist = Math.hypot(draft.tx - draft.ax, draft.ty - draft.ay);
+  const theta = dragDist >= TAP_VS_DRAG_THRESHOLD ? Math.atan2(draft.ty - draft.ay, draft.tx - draft.ax) : 0;
+
+  if (mode === 'initpose') {
+    showConfirm(
+      'ตั้งตำแหน่งเริ่มต้นที่ (' + draft.ax.toFixed(2) + ', ' + draft.ay.toFixed(2) + ') ม.?', null,
+      () => {
+        if (!confirm('ยืนยันตั้งตำแหน่งเริ่มต้นของหุ่นยนต์ที่จุดนี้?\n\n' +
+            'ใช้เมื่อรู้แน่ชัดว่าหุ่นยนต์อยู่ตรงนี้จริงบนแผนที่เท่านั้น ' +
+            '(เช่น เพิ่งเปิดโหมดนำทาง หรือระบบระบุตำแหน่งหลงทาง) ' +
+            'ถ้าตั้งผิดตำแหน่ง/ทิศทาง ระบบนำทางจะคำนวณผิดพลาดทั้งหมด')) {
+          return;
+        }
+        transport.initialPose({x: draft.ax, y: draft.ay, theta: theta});
+        setStatus('ตั้งตำแหน่งเริ่มต้นแล้ว');
+        goalDraft = null;
+        hideConfirm();
+        redraw();
+      });
+    return;
+  }
+
+  const s = worldToScreen(draft.ax, draft.ay);
+  const cls = classifyScreenPoint(s.x, s.y);
+  const warnings = {
+    obstacle: 'จุดนี้อยู่ในตำแหน่งสิ่งกีดขวางบนแผนที่',
+    unmapped: 'จุดนี้อยู่นอกพื้นที่ที่สำรวจไว้',
+    tight: 'บริเวณนี้ค่อนข้างแคบ/มืดในแผนที่ ตรวจสอบก่อนส่ง',
+  };
+
+  showConfirm(
+    'ส่งหุ่นยนต์ไปที่ (' + draft.ax.toFixed(2) + ', ' + draft.ay.toFixed(2) + ') ม.?',
+    warnings[cls],
+    () => {
+      if (!confirm('ยืนยันส่งหุ่นยนต์ไปยังจุดหมายนี้?\n\n' +
+          'ตรวจสอบว่าตลอดเส้นทางและบริเวณจุดหมายไม่มีคน/สิ่งกีดขวางที่ไม่ปลอดภัย (ISO 3691-4) ' +
+          'ก่อนยืนยัน หุ่นยนต์จะเคลื่อนที่แบบอัตโนมัติทันทีที่กดตกลง')) {
+        return;
+      }
+      transport.navGoal({x: draft.ax, y: draft.ay, theta: theta});
+      setActiveGoal({x: draft.ax, y: draft.ay, theta: theta});
+      setStatus('ส่งจุดหมายแล้ว - หุ่นยนต์กำลังนำทางอัตโนมัติ');
+      goalDraft = null;
+      hideConfirm();
+      redraw();
+    });
+}
+
+function resamplePath(points, spacing) {
+  if (points.length < 2) return points.slice();
+  const out = [points[0]];
+  let carry = 0;
+  for (let i = 1; i < points.length; i++) {
+    let p0 = out[out.length - 1];
+    const p1 = points[i];
+    let segLen = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+    while (carry + segLen >= spacing && out.length < PATH_MAX_WAYPOINTS) {
+      const t = (spacing - carry) / segLen;
+      const np = {x: p0.x + (p1.x - p0.x) * t, y: p0.y + (p1.y - p0.y) * t};
+      out.push(np);
+      p0 = np;
+      segLen = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+      carry = 0;
+    }
+    carry += segLen;
+  }
+  const last = points[points.length - 1];
+  const tail = out[out.length - 1];
+  if (Math.hypot(last.x - tail.x, last.y - tail.y) > spacing * 0.3 && out.length < PATH_MAX_WAYPOINTS) {
+    out.push(last);
+  }
+  return out;
+}
+
+function withHeadings(points) {
+  const out = [];
+  for (let i = 0; i < points.length; i++) {
+    let theta;
+    if (i < points.length - 1) {
+      theta = Math.atan2(points[i + 1].y - points[i].y, points[i + 1].x - points[i].x);
+    } else {
+      theta = out.length ? out[out.length - 1].theta : 0;
+    }
+    out.push({x: points[i].x, y: points[i].y, theta: theta});
+  }
+  return out;
+}
+
+function finalizePathDraft() {
+  const raw = pathDraft.points;
+  if (raw.length < 2) {
+    pathDraft = null;
+    return;
+  }
+  const resampled = withHeadings(resamplePath(raw, PATH_RESAMPLE_SPACING));
+  pathDraft = {points: resampled};
+  redraw();
+
+  showConfirm(
+    'ส่งเส้นทางนี้ (' + resampled.length + ' จุด)?', null,
+    () => {
+      if (!confirm('ยืนยันส่งเส้นทางที่ลากไว้ให้หุ่นยนต์วิ่งตาม?\n\n' +
+          'ตรวจสอบว่าตลอดเส้นทางไม่มีคน/สิ่งกีดขวางที่ไม่ปลอดภัย (ISO 3691-4) ' +
+          'ก่อนยืนยัน หุ่นยนต์จะเคลื่อนที่แบบอัตโนมัติทันทีที่กดตกลง')) {
+        return;
+      }
+      transport.navPath({points: resampled});
+      const end = resampled[resampled.length - 1];
+      setActiveGoal({x: end.x, y: end.y, theta: end.theta});
+      setStatus('ส่งเส้นทางแล้ว - หุ่นยนต์กำลังนำทางอัตโนมัติ');
+      pathDraft = null;
+      hideConfirm();
+      redraw();
+    });
+}
+
+resizeCanvas();
+</script>
+</body>
+</html>

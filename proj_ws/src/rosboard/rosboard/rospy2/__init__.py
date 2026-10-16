@@ -10,6 +10,7 @@ import importlib
 import os
 import random
 import rclpy
+import rclpy.executors
 import rclpy.logging
 import rclpy.qos
 try:
@@ -40,6 +41,7 @@ rclpy.init(args = sys.argv)
 _node = None
 _logger = None
 _clock = None
+_executor = None
 _thread_spin = None
 _wait_for_message_release = False
 _on_shutdown = None
@@ -56,7 +58,7 @@ def get_param(param_name, default_value = None):
     return _node.get_parameter(param_name)._value
 
 def init_node(node_name, anonymous=False, log_level=INFO, disable_signals=False):
-    global _node, _logger, _clock, _thread_spin
+    global _node, _logger, _clock, _executor, _thread_spin
     if anonymous:
         node_name += "_" + str(random.randint(10000,99999))
 
@@ -77,12 +79,24 @@ def init_node(node_name, anonymous=False, log_level=INFO, disable_signals=False)
     }.get(log_level, rclpy.logging.LoggingSeverity.UNSET)
     rclpy.logging.set_logger_level(_logger.name, ros2_log_level)
 
+    # An explicit executor (rather than the implicit one rclpy.spin() would
+    # create) so create_subscription()/create_publisher() calls made from
+    # OTHER threads (rosboard.py's sync_subs_loop calls these while THIS
+    # thread is blocked inside executor.spin()) can wake() it below. Without
+    # that wake, a new subscription added from another thread can sit
+    # unnoticed until the executor's wait-set happens to be rebuilt for some
+    # unrelated reason - which, worse, has been observed to wedge the
+    # executor's wait-set entirely (no further callbacks for ANY topic ever
+    # fire again, not just the new one) rather than merely delaying it.
+    _executor = rclpy.executors.SingleThreadedExecutor()
+    _executor.add_node(_node)
+
     _thread_spin = threading.Thread(target=_thread_spin_target, daemon=True)
     _thread_spin.start()
 
 def _thread_spin_target():
-    global _on_shutdown, _node
-    rclpy.spin(_node)
+    global _on_shutdown, _node, _executor
+    _executor.spin()
     if _on_shutdown:
         _on_shutdown()
 
@@ -225,9 +239,26 @@ class Subscriber(object):
         self.type = _ros2_type_to_type_name(topic_type)
         self.callback = callback
         self.callback_args = callback_args
-        self.qos_profile = rclpy.qos.QoSProfile(depth = 10, history = rclpy.qos.HistoryPolicy.KEEP_LAST, reliability = rclpy.qos.ReliabilityPolicy.BEST_EFFORT, durability = rclpy.qos.DurabilityPolicy.VOLATILE)
+        # A caller-supplied QoSProfile (e.g. rosboard.py's get_topic_qos(),
+        # which matches a topic's actual publisher QoS - critical for
+        # TRANSIENT_LOCAL/latched topics like /map, whose one-shot publish
+        # a VOLATILE subscriber can never receive) used to be silently
+        # discarded here in favor of this hardcoded BEST_EFFORT/VOLATILE
+        # default, no matter what was passed in. Only fall back to this
+        # default depth-only profile for plain integer "queue size" values
+        # (rospy1-style), which is what every other call site still passes.
+        if isinstance(qos, rclpy.qos.QoSProfile):
+            self.qos_profile = qos
+        else:
+            self.qos_profile = rclpy.qos.QoSProfile(depth = qos, history = rclpy.qos.HistoryPolicy.KEEP_LAST, reliability = rclpy.qos.ReliabilityPolicy.BEST_EFFORT, durability = rclpy.qos.DurabilityPolicy.VOLATILE)
         self._sub = _node.create_subscription(topic_type, topic_name, self._ros2_callback, self.qos_profile, event_callbacks = SubscriptionEventCallbacks())
-        _node.guards
+        # Wake the executor (see init_node()'s comment) so it notices this
+        # new subscription right away instead of leaving it - and
+        # potentially every later callback on any topic - stuck waiting on
+        # a wait-set that was never rebuilt to include it. This call is
+        # itself thread-safe (that's the whole point of Executor.wake()).
+        if _executor is not None:
+            _executor.wake()
         self.get_num_connections = lambda: 1 # No good ROS2 equivalent
 
     def __del__(self):

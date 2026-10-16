@@ -44,6 +44,9 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
         self.update_intervals_by_topic = {}  # this socket's throttle rate on each topic
         self.last_data_times_by_topic = {}   # last time this socket received data on each topic
 
+        self.authenticated = False  # gated by the PIN in on_message() until MSG_AUTH succeeds
+        self.auth_attempts = 0
+
         ROSBoardSocketHandler.sockets.add(self)
 
         self.write_message(json.dumps([ROSBoardSocketHandler.MSG_SYSTEM, {
@@ -89,6 +92,8 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
             if message[0] == ROSBoardSocketHandler.MSG_TOPICS:
                 json_msg = json.dumps(message, separators=(',', ':'))
                 for socket in cls.sockets:
+                    if not socket.authenticated:
+                        continue
                     if socket.ws_connection and not socket.ws_connection.is_closing():
                         socket.write_message(json_msg)
             elif message[0] == ROSBoardSocketHandler.MSG_MSG:
@@ -132,8 +137,34 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
             print("error: bad: %s" % message)
             return
 
+        # client submitting the access PIN - always processed, regardless of
+        # current auth state, so a wrong first guess can be retried
+        if argv[0] == ROSBoardSocketHandler.MSG_AUTH:
+            if len(argv) != 2 or type(argv[1]) is not dict:
+                print("error: auth: bad: %s" % message)
+                return
+
+            self.auth_attempts += 1
+            if self.auth_attempts > 10:
+                self.node.logwarn("socket %s exceeded PIN attempt limit; closing" % str(self.id))
+                self.close()
+                return
+
+            code = str(argv[1].get("code", ""))
+            self.authenticated = (code == self.node.access_pin)
+            self.write_message(json.dumps(
+                [ROSBoardSocketHandler.MSG_AUTH_RESULT, {"ok": self.authenticated}],
+                separators=(',', ':')))
+            if self.authenticated:
+                self.node.sync_subs()  # in case MSG_TOPICS was withheld pre-auth
+            return
+
+        # everything else requires a successful MSG_AUTH first
+        if not self.authenticated:
+            return
+
         # if we got a pong for our own ping, compute latency and clock difference
-        elif argv[0] == ROSBoardSocketHandler.MSG_PONG:
+        if argv[0] == ROSBoardSocketHandler.MSG_PONG:
             if len(argv) != 2 or type(argv[1]) is not dict:
                 print("error: pong: bad: %s" % message)
                 return
@@ -172,6 +203,59 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
             self.node.remote_subs[topic_name].add(self.id)
             self.node.sync_subs()
 
+        # client sent a teleop (virtual joystick) command
+        elif argv[0] == ROSBoardSocketHandler.MSG_TELEOP:
+            if len(argv) != 2 or type(argv[1]) is not dict:
+                print("error: teleop: bad: %s" % message)
+                return
+            self.node.on_teleop_cmd(
+                argv[1].get("linear", 0.0),
+                argv[1].get("angular", 0.0),
+            )
+
+        # client (goal_picker page) sent a single navigation goal: tap a
+        # point on the map, optionally drag to set heading
+        elif argv[0] == ROSBoardSocketHandler.MSG_NAV_GOAL:
+            if len(argv) != 2 or type(argv[1]) is not dict:
+                print("error: nav_goal: bad: %s" % message)
+                return
+            self.node.on_nav_goal(
+                argv[1].get("x", 0.0),
+                argv[1].get("y", 0.0),
+                argv[1].get("theta", 0.0),
+            )
+
+        # client (goal_picker page) sent a drawn path to follow, as a list
+        # of {x, y, theta} waypoints in the map frame
+        elif argv[0] == ROSBoardSocketHandler.MSG_NAV_PATH:
+            if len(argv) != 2 or type(argv[1]) is not dict:
+                print("error: nav_path: bad: %s" % message)
+                return
+            self.node.on_nav_path(argv[1].get("points", []))
+
+        # client wants to cancel the in-progress navigation goal/path
+        elif argv[0] == ROSBoardSocketHandler.MSG_NAV_CANCEL:
+            self.node.on_nav_cancel()
+
+        # client (goal_picker page) set AMCL's initial pose estimate: tap a
+        # point on the map where the robot actually is, drag to set heading
+        elif argv[0] == ROSBoardSocketHandler.MSG_INITIAL_POSE:
+            if len(argv) != 2 or type(argv[1]) is not dict:
+                print("error: initial_pose: bad: %s" % message)
+                return
+            self.node.on_initial_pose(
+                argv[1].get("x", 0.0),
+                argv[1].get("y", 0.0),
+                argv[1].get("theta", 0.0),
+            )
+
+        # client sent a mapping control (start/pause scan, save, finish)
+        elif argv[0] == ROSBoardSocketHandler.MSG_MAPPING:
+            if len(argv) != 2 or type(argv[1]) is not dict:
+                print("error: mapping: bad: %s" % message)
+                return
+            self.node.on_mapping_cmd(argv[1].get("action"), argv[1].get("name", ""))
+
         # client wants to unsubscribe from topic
         elif argv[0] == ROSBoardSocketHandler.MSG_UNSUB:
             if len(argv) != 2 or type(argv[1]) is not dict:
@@ -194,6 +278,14 @@ ROSBoardSocketHandler.MSG_TOPICS = "t";
 ROSBoardSocketHandler.MSG_SUB = "s";
 ROSBoardSocketHandler.MSG_SYSTEM = "y";
 ROSBoardSocketHandler.MSG_UNSUB = "u";
+ROSBoardSocketHandler.MSG_TELEOP = "v";
+ROSBoardSocketHandler.MSG_AUTH = "a";
+ROSBoardSocketHandler.MSG_AUTH_RESULT = "r";
+ROSBoardSocketHandler.MSG_NAV_GOAL = "g";
+ROSBoardSocketHandler.MSG_NAV_PATH = "w";
+ROSBoardSocketHandler.MSG_NAV_CANCEL = "c";
+ROSBoardSocketHandler.MSG_INITIAL_POSE = "i";
+ROSBoardSocketHandler.MSG_MAPPING = "k";
 
 ROSBoardSocketHandler.PING_SEQ = "s";
 ROSBoardSocketHandler.PONG_SEQ = "s";

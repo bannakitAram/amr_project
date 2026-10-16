@@ -4,6 +4,10 @@ importJsOnce("js/viewers/meta/Viewer.js");
 importJsOnce("js/viewers/meta/Space2DViewer.js");
 importJsOnce("js/viewers/meta/Space3DViewer.js");
 
+// MapScanViewer must load before ImageViewer so it wins as the default
+// viewer for nav_msgs/msg/OccupancyGrid (first-registered-wins, see
+// Viewer.getDefaultViewerForType).
+importJsOnce("js/viewers/MapScanViewer.js");
 importJsOnce("js/viewers/ImageViewer.js");
 importJsOnce("js/viewers/LogViewer.js");
 importJsOnce("js/viewers/ProcessListViewer.js");
@@ -77,7 +81,10 @@ function newCard() {
   return card;
 }
 
-let onOpen = function() {
+// Called once this connection has passed the PIN gate (see auth.js).
+// Renamed from the old "onOpen" - subscribing to topics before the user is
+// authenticated would leak sensor data to anyone who guesses the URL.
+let onAuthenticated = function() {
   const urlParams = new URLSearchParams(window.location.search);
 
   for( let [key, value] of urlParams ){
@@ -112,9 +119,36 @@ let onSystem = function(system) {
   }
 }
 
+// Lets a viewer (e.g. MapScanViewer) listen to a topic it doesn't "own" a
+// card for - e.g. /tf, /tf_static, /scan feeding into a combined map view.
+// Reference-counted per topic name so multiple listeners / repeated
+// subscribe calls share one underlying rosboard subscription.
+let extraTopicListeners = {}; // topicName -> Set<callback>
+
+function subscribeExtra(topicName, topicType, callback) {
+  if (!extraTopicListeners[topicName]) {
+    extraTopicListeners[topicName] = new Set();
+    currentTransport.subscribe({topicName: topicName, maxUpdateRate: 24.0});
+  }
+  extraTopicListeners[topicName].add(callback);
+}
+
+function unsubscribeExtra(topicName, callback) {
+  if (!extraTopicListeners[topicName]) return;
+  extraTopicListeners[topicName].delete(callback);
+  if (extraTopicListeners[topicName].size === 0) {
+    delete extraTopicListeners[topicName];
+    currentTransport.unsubscribe({topicName: topicName});
+  }
+}
+
 let onMsg = function(msg) {
+  if (extraTopicListeners[msg._topic_name]) {
+    for (const cb of extraTopicListeners[msg._topic_name]) cb(msg);
+  }
+
   if(!subscriptions[msg._topic_name]) {
-    console.log("Received unsolicited message", msg);
+    if (!extraTopicListeners[msg._topic_name]) console.log("Received unsolicited message", msg);
   } else if(!subscriptions[msg._topic_name].viewer) {
     console.log("Received msg but no viewer", msg);
   } else {
@@ -236,8 +270,9 @@ let currentTransport = null;
 function initDefaultTransport() {
   currentTransport = new WebSocketV1Transport({
     path: "/rosboard/v1",
-    onOpen: onOpen,
-    onMsg: onMsg,
+    onOpen: onAuthGateOpen,     // defined in auth.js - starts the PIN handshake
+    onAuthResult: onAuthResult, // defined in auth.js
+    onRosMsg: onMsg,
     onTopics: onTopics,
     onSystem: onSystem,
   });

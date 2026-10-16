@@ -439,3 +439,204 @@ input, textarea, *[contenteditable=true] {
     transform: rotate(360deg);
   }
 }
+
+/* ---------- Virtual joystick (teleop) ---------- */
+.joystick-toggle-btn {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 1000;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  border: none;
+  background: #3f51b5;
+  color: #fff;
+  font-size: 26px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  touch-action: manipulation;
+}
+.joystick-toggle-btn.active {
+  background: #d32f2f;
+}
+
+.joystick-panel {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 999;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 16px 28px;
+  background: rgba(20,20,20,0.85);
+  backdrop-filter: blur(2px);
+}
+.joystick-panel:not([hidden]) {
+  display: flex;
+}
+
+.joystick-stop-btn {
+  width: 100%;
+  max-width: 320px;
+  padding: 12px;
+  text-align: center;
+  border-radius: 8px;
+  background: #d32f2f;
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  touch-action: manipulation;
+  user-select: none;
+}
+
+.joystick-pad {
+  position: relative;
+  width: 200px;
+  height: 200px;
+  max-width: 60vw;
+  max-height: 60vw;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.08);
+  border: 2px solid rgba(255,255,255,0.25);
+  touch-action: none;
+  transition: background 0.15s, border-color 0.15s;
+}
+/* Brief flash confirming the deadman was released and the stop command
+   was sent - paired with a short vibration in joystick.js. */
+.joystick-pad--stopped {
+  background: rgba(211,47,47,0.35);
+  border-color: #ff6b6b;
+}
+
+/* ---------- PIN auth gate ---------- */
+#auth-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10,10,10,0.96);
+}
+#auth-gate:not([hidden]) {
+  display: flex;
+}
+#auth-gate-form {
+  width: 260px;
+  max-width: 80vw;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  text-align: center;
+}
+.auth-gate-title {
+  color: #fff;
+  font-size: 20px;
+  font-weight: 700;
+}
+.auth-gate-subtitle {
+  color: #aaa;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+#auth-gate-input {
+  font-size: 28px;
+  letter-spacing: 8px;
+  text-align: center;
+  padding: 10px;
+  border-radius: 8px;
+  border: 2px solid #555;
+  background: #1c1c1c;
+  color: #fff;
+}
+#auth-gate-form button[type="submit"] {
+  padding: 12px;
+  border: none;
+  border-radius: 8px;
+  background: #3f51b5;
+  color: #fff;
+  font-weight: 700;
+  touch-action: manipulation;
+}
+.auth-gate-error {
+  color: #ff6b6b;
+  font-size: 13px;
+  min-height: 16px;
+}
+
+.joystick-knob {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 64px;
+  height: 64px;
+  margin-left: -32px;
+  margin-top: -32px;
+  border-radius: 50%;
+  background: #3f51b5;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.5);
+  pointer-events: none;
+}
+
+/* Mapping controls (js/mapping.js): a narrow column on the left edge,
+   bottom-aligned with the joystick. The mobile wrapper page only shows a
+   300px-high slice of this page and the open joystick panel fills it, so
+   a top/bottom bar would cover the pad. While the column is shown,
+   body.mapping-active pads the joystick panel so the pad re-centres in
+   the space to the right of it - nothing overlaps on narrow phones. */
+.mapping-bar {
+  position: fixed;
+  left: 6px;
+  bottom: 24px;
+  width: 76px;
+  z-index: 1001;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-family: sans-serif;
+}
+.mapping-bar[hidden] { display: none; }
+.mapping-bar-status {
+  padding: 4px 2px;
+  border-radius: 6px;
+  background: #e89a1c;
+  color: #1a1a1a;
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+  line-height: 1.2;
+}
+.mapping-bar.scanning .mapping-bar-status { background: #2e9e48; color: #fff; }
+.mapping-bar.offline .mapping-bar-status { background: #777; color: #fff; }
+.mapping-btn {
+  min-height: 48px;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.15;
+  color: #1a1a1a;
+  background: #e89a1c;
+  touch-action: manipulation;
+}
+.mapping-btn-scan.scanning { background: #2e9e48; color: #fff; }
+.mapping-btn-save { background: #2f7fd8; color: #fff; }
+.mapping-btn-finish { background: #d93636; color: #fff; }
+.mapping-btn:disabled { opacity: 0.4; }
+body.mapping-active .joystick-panel { padding-left: 88px; }
+.mapping-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 240px;
+  transform: translateX(-50%);
+  max-width: 80vw;
+  z-index: 1002;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.85);
+  color: #fff;
+  font: 14px sans-serif;
+  pointer-events: none;
+}
+.mapping-toast[hidden] { display: none; }

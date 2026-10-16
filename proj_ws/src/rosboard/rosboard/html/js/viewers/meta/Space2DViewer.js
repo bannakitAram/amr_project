@@ -279,7 +279,44 @@ class Space2DViewer extends Viewer {
 
     for(let i in drawObjects) {
       let drawObject = drawObjects[i];
-      if(drawObject.type === "path") {
+      if(drawObject.type === "image") {
+        // draws a raster (e.g. an OccupancyGrid map) at a given world-space
+        // pose. drawObject: {img, x, y, theta, width, height} where (x,y,theta)
+        // is the pose (in meters/radians) of the image's bottom-left corner,
+        // and (width,height) is its size in meters - matching ROS's
+        // OccupancyGrid.info.origin convention.
+        const k = this.size / (this.xmax - this.xmin);
+        const res = drawObject.width / drawObject.img.naturalWidth;
+        const heightPx = drawObject.img.naturalHeight;
+        const cos = Math.cos(drawObject.theta), sin = Math.sin(drawObject.theta);
+
+        const a = k * cos * res;
+        const b = -k * sin * res;
+        const c = k * sin * res;
+        const d = k * cos * res;
+        const e = k * (drawObject.x - sin * res * heightPx - this.xmin);
+        const f = this.size - k * cos * res * heightPx - k * (drawObject.y - this.ymin);
+
+        this.ctx.setTransform(a, b, c, d, e, f);
+        this.ctx.drawImage(drawObject.img, 0, 0);
+        this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+      } else if(drawObject.type === "robot") {
+        // simple triangular heading marker at (x,y,theta)
+        const r = drawObject.size || 0.25;
+        const theta = drawObject.theta;
+        const tips = [
+          [drawObject.x + r * Math.cos(theta), drawObject.y + r * Math.sin(theta)],
+          [drawObject.x + r * Math.cos(theta + 2.5), drawObject.y + r * Math.sin(theta + 2.5)],
+          [drawObject.x + r * Math.cos(theta - 2.5), drawObject.y + r * Math.sin(theta - 2.5)],
+        ];
+        this.ctx.fillStyle = drawObject.color || "#00e5ff";
+        this.ctx.beginPath();
+        this.ctx.moveTo(x2px(tips[0][0]), y2py(tips[0][1]));
+        this.ctx.lineTo(x2px(tips[1][0]), y2py(tips[1][1]));
+        this.ctx.lineTo(x2px(tips[2][0]), y2py(tips[2][1]));
+        this.ctx.closePath();
+        this.ctx.fill();
+      } else if(drawObject.type === "path") {
         this.ctx.lineWidth = drawObject.lineWidth || 1;
         this.ctx.strokeStyle = drawObject.color || "#e0e0e0";
         this.ctx.beginPath();
