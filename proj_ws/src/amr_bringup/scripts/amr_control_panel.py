@@ -1986,10 +1986,21 @@ class AmrControlPanel(tk.Tk):
         if pose is None:
             messagebox.showwarning('ไม่พบตำแหน่ง', 'ยังไม่มี TF map → base_footprint (AMCL)')
             return
-        name = self._show_save_name_dialog('Station_A', title='ตั้งชื่อ Station')
+        existing = load_stations(self._nav_map_name)
+        names = {s['name'] for s in existing}
+        # Default to the first unused Station_A, Station_B, ... - a fixed
+        # 'Station_A' default silently replaced that station with the
+        # current pose every time it was accepted (looked like the station
+        # "followed the robot").
+        default = next((f'Station_{c}' for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+                        if f'Station_{c}' not in names), f'Station_{len(names) + 1}')
+        name = self._show_save_name_dialog(default, title='ตั้งชื่อ Station')
         if not name:
             return
-        stations = [s for s in load_stations(self._nav_map_name) if s['name'] != name]
+        if name in names and not messagebox.askyesno(
+                'ชื่อซ้ำ', f'มี Station "{name}" อยู่แล้ว - ย้ายไปตำแหน่งปัจจุบัน (ทับของเดิม)?'):
+            return
+        stations = [s for s in existing if s['name'] != name]
         stations.append({'name': name, 'x': round(pose[0], 3), 'y': round(pose[1], 3),
                          'theta': round(pose[2], 3)})
         save_stations(self._nav_map_name, stations)
