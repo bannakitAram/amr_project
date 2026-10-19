@@ -987,21 +987,37 @@ class MapView(tk.Canvas):
         self.delete('overlay')
         if self._xf is None:
             return
-        for m in markers:
-            cx, cy = self.w2c(m['x'], m['y'])
-            col = AMBER if m.get('selected') else BLUE
-            self.create_rectangle(cx - px(6), cy - px(6), cx + px(6), cy + px(6), fill=col,
-                                  outline='white', tags='overlay')
-            self.create_text(cx + px(9), cy, anchor='w', text=m['name'],
-                             fill=TEXT_MAIN, font=('Sans', -px(13), 'bold'), tags='overlay')
         if goal is not None:
             self._arrow(goal[0], goal[1], goal[2], AMBER, 'overlay', r=7)
         if pose is not None:
             self._arrow(pose[0], pose[1], pose[2], GREEN, 'overlay')
+        # Station pins last, so the robot arrow never hides one (a station
+        # saved where the robot is parked used to vanish under it).
+        for m in markers:
+            self._pin(m, AMBER if m.get('selected') else BLUE)
         if self._press:
             x0, y0, x1, y1 = self._press
             self.create_line(x0, y0, x1, y1, fill=AMBER, width=px(3),
                              arrow='last', tags='overlay')
+
+    def _pin(self, m, col):
+        """Map pin: the tip sits exactly on the station (x, y), a short
+        line from the tip shows the saved heading, name above the head."""
+        cx, cy = self.w2c(m['x'], m['y'])
+        r, h = px(8), px(22)  # head radius, tip-to-head-centre height
+        hx, hy = self.w2c(m['x'] + math.cos(m.get('theta', 0.0)),
+                          m['y'] + math.sin(m.get('theta', 0.0)))
+        d = math.hypot(hx - cx, hy - cy) or 1.0
+        self.create_line(cx, cy, cx + (hx - cx) / d * px(18), cy + (hy - cy) / d * px(18),
+                         fill=col, width=px(3), arrow='last', tags='overlay')
+        self.create_polygon(cx, cy, cx - r * 0.8, cy - h + r * 0.4, cx + r * 0.8, cy - h + r * 0.4,
+                            fill=col, outline='white', tags='overlay')
+        self.create_oval(cx - r, cy - h - r, cx + r, cy - h + r, fill=col,
+                         outline='white', width=px(2), tags='overlay')
+        self.create_oval(cx - r * 0.35, cy - h - r * 0.35, cx + r * 0.35, cy - h + r * 0.35,
+                         fill='white', outline='', tags='overlay')
+        self.create_text(cx, cy - h - r - px(3), anchor='s', text=m['name'],
+                         fill=TEXT_MAIN, font=('Sans', -px(13), 'bold'), tags='overlay')
 
     def _on_press(self, e):
         if self._xf is not None:
@@ -2004,7 +2020,7 @@ class AmrControlPanel(tk.Tk):
         stations.append({'name': name, 'x': round(pose[0], 3), 'y': round(pose[1], 3),
                          'theta': round(pose[2], 3)})
         save_stations(self._nav_map_name, stations)
-        self._stations = stations
+        self._refresh_stations()  # Auto page buttons + pins pick it up now
         messagebox.showinfo('บันทึกแล้ว', f'Station "{name}" ({pose[0]:.2f}, {pose[1]:.2f})')
 
     def _on_del_station(self):
@@ -2021,7 +2037,7 @@ class AmrControlPanel(tk.Tk):
         if messagebox.askyesno('ลบ Station', f'ลบ "{names[pick]}"?'):
             del stations[pick]
             save_stations(self._nav_map_name, stations)
-            self._stations = stations
+            self._refresh_stations()
 
     def _render_log(self):
         warn = self._log_warn_only.get()
