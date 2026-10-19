@@ -17,7 +17,8 @@ import os
 import subprocess
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, TimerAction
+from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription, LogInfo,
+                            SetEnvironmentVariable, TimerAction)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch.conditions import IfCondition
@@ -238,7 +239,14 @@ def generate_launch_description():
         '  ** UNCOMMITTED CHANGES - not for line use **'
         if version.endswith('-dirty') or version.startswith('unknown') else ''))
 
+    # Bigger Fast DDS shared-memory segment for every node below - see the
+    # comment in config/fastdds_shm_8mb.xml (depth point cloud drops).
+    fastdds_profile = SetEnvironmentVariable(
+        'FASTRTPS_DEFAULT_PROFILES_FILE',
+        os.path.join(pkg_bringup, 'config', 'fastdds_shm_8mb.xml'))
+
     return LaunchDescription([
+        fastdds_profile,
         version_log,
         declare_use_sim_time,
         declare_use_rviz,
