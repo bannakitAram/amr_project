@@ -84,6 +84,15 @@
   #confirm-panel[hidden] { display: none; }
   #confirm-panel .warn { color: #ffb300; }
 
+  #station-panel {
+    position: absolute; left: 10px; right: 10px; bottom: 66px;
+    background: rgba(20,20,20,0.92); color: #eee; border-radius: 10px;
+    padding: 10px; z-index: 22; display: flex; gap: 8px; flex-wrap: wrap;
+    max-height: 40vh; overflow-y: auto;
+  }
+  #station-panel[hidden] { display: none; }
+  #station-panel .title { width: 100%; font-size: 12px; color: #aaa; }
+
   #pin-gate {
     position: absolute; inset: 0; background: rgba(0,0,0,0.85);
     display: flex; align-items: center; justify-content: center; z-index: 50;
@@ -115,11 +124,14 @@
     <button class="btn" id="btn-discard">ยกเลิก</button>
   </div>
 
+  <div id="station-panel" hidden></div>
+
   <div id="mode-bar">
     <button class="btn active" id="mode-view">ดูแผนที่</button>
     <button class="btn" id="mode-goal">ตั้งจุดหมาย</button>
     <button class="btn" id="mode-path">ลากเส้นทาง</button>
     <button class="btn" id="mode-initpose">ตั้งตำแหน่งเริ่มต้น</button>
+    <button class="btn" id="btn-stations">Station</button>
     <button class="btn" id="btn-refit">พอดีจอ</button>
     <button class="btn danger" id="btn-cancel-nav">หยุดนำทาง</button>
   </div>
@@ -216,6 +228,7 @@ function onAuthResult(result) {
     transport.subscribe({topicName: '/imu_watchdog/ok', maxUpdateRate: 2.0});
     transport.subscribe({topicName: '/plan', maxUpdateRate: 2.0});
     transport.subscribe({topicName: '/mppi_local_plan', maxUpdateRate: 5.0});
+    transport.subscribe({topicName: '/amr_stations', maxUpdateRate: 1.0});
   } else {
     localStorage.removeItem('rosboard_pin');
     showPinGate('รหัสไม่ถูกต้อง กรุณาลองใหม่');
@@ -246,6 +259,7 @@ function onRosMsg(msg) {
   else if (msg._topic_name === '/imu_watchdog/ok') handleImuOk(msg);
   else if (msg._topic_name === '/plan') handlePlan(msg);
   else if (msg._topic_name === '/mppi_local_plan') handleLocalPlan(msg);
+  else if (msg._topic_name === '/amr_stations') handleStations(msg);
 }
 
 // ---------- map state ----------
@@ -597,6 +611,7 @@ function redraw() {
   const robotPose = tfLookup('map', 'base_footprint');
   if (robotPose) drawRobot(robotPose);
 
+  drawStations();
   if (activeGoal) drawGoalPin(activeGoal);
   if ((mode === 'goal' || mode === 'initpose') && goalDraft) drawGoalDraft(goalDraft, mode === 'initpose');
   if (mode === 'path' && pathDraft) drawPathDraft(pathDraft.points);
@@ -791,6 +806,100 @@ setInterval(() => {
 setInterval(() => {
   if (planPoints && Date.now() - planReceivedAt > PLAN_STALE_MS) { clearPlan(); redraw(); }
 }, 1000);
+
+// ---------- stations (from the AMR control panel, /amr_stations) ----------
+// The panel publishes {map, stations: [{name, x, y, theta}]} once a second
+// while Navigation runs (empty otherwise). Pins are drawn on the map; the
+// "Station" button lists them and sends the robot to one through the same
+// validated nav-goal channel and confirm steps as a tapped goal.
+let stations = [];
+let stationsMap = '';
+let stationsAt = 0;
+const stationPanel = document.getElementById('station-panel');
+
+function handleStations(msg) {
+  try {
+    const d = JSON.parse(msg.data);
+    const list = (d.stations || []).filter(
+      (s) => s && isFinite(s.x) && isFinite(s.y) && typeof s.name === 'string');
+    const changed = JSON.stringify(list) !== JSON.stringify(stations) || d.map !== stationsMap;
+    stations = list;
+    stationsMap = d.map || '';
+    stationsAt = Date.now();
+    if (changed) { if (!stationPanel.hidden) renderStationPanel(); redraw(); }
+  } catch (e) {}
+}
+
+function drawStations() {
+  if (Date.now() - stationsAt > 5000) return;  // panel gone: don't show stale pins
+  for (const s of stations) {
+    const p = worldToScreen(s.x, s.y);
+    const h = worldToScreen(s.x + Math.cos(s.theta || 0), s.y + Math.sin(s.theta || 0));
+    const d = Math.hypot(h.x - p.x, h.y - p.y) || 1;
+    const dpr = 1;  // same pixel units as drawGoalPin (worldToScreen output)
+    const r = 7 * dpr, tall = 20 * dpr, color = '#1e88e5';
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.strokeStyle = color; ctx.lineWidth = 3 * dpr;
+    ctx.beginPath(); ctx.moveTo(p.x, p.y);
+    ctx.lineTo(p.x + (h.x - p.x) / d * 16 * dpr, p.y + (h.y - p.y) / d * 16 * dpr); ctx.stroke();
+    ctx.fillStyle = color; ctx.strokeStyle = 'white'; ctx.lineWidth = 1.5 * dpr;
+    ctx.beginPath(); ctx.moveTo(p.x, p.y);
+    ctx.lineTo(p.x - r * 0.8, p.y - tall + r * 0.4); ctx.lineTo(p.x + r * 0.8, p.y - tall + r * 0.4);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.arc(p.x, p.y - tall, r, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = 'white';
+    ctx.beginPath(); ctx.arc(p.x, p.y - tall, r * 0.35, 0, 2 * Math.PI); ctx.fill();
+    ctx.font = 'bold ' + (12 * dpr) + 'px sans-serif'; ctx.textAlign = 'center';
+    ctx.lineWidth = 3 * dpr; ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.strokeText(s.name, p.x, p.y - tall - r - 3 * dpr);
+    ctx.fillText(s.name, p.x, p.y - tall - r - 3 * dpr);
+    ctx.restore();
+  }
+}
+
+function renderStationPanel() {
+  stationPanel.innerHTML = '';
+  const title = document.createElement('div');
+  title.className = 'title';
+  const fresh = Date.now() - stationsAt < 5000;
+  title.textContent = !fresh ? 'ไม่มีข้อมูล Station (เปิดโหมด Navigation ที่ AMR control panel)'
+    : stations.length ? 'เลือก Station (แผนที่ ' + stationsMap + ')'
+    : 'แผนที่ ' + stationsMap + ' ยังไม่มี Station';
+  stationPanel.appendChild(title);
+  if (!fresh) return;
+  for (const s of stations) {
+    const b = document.createElement('button');
+    b.className = 'btn primary';
+    b.textContent = s.name;
+    b.onclick = () => sendToStation(s);
+    stationPanel.appendChild(b);
+  }
+}
+
+function sendToStation(s) {
+  stationPanel.hidden = true;
+  showConfirm('ส่งหุ่นยนต์ไปที่ Station "' + s.name + '" (' + s.x.toFixed(2) + ', ' + s.y.toFixed(2) + ') ม.?',
+    null,
+    () => {
+      if (!confirm('ยืนยันส่งหุ่นยนต์ไปยัง Station "' + s.name + '"?\n\n' +
+          'ตรวจสอบว่าตลอดเส้นทางและบริเวณจุดหมายไม่มีคน/สิ่งกีดขวางที่ไม่ปลอดภัย (ISO 3691-4) ' +
+          'ก่อนยืนยัน หุ่นยนต์จะเคลื่อนที่แบบอัตโนมัติทันทีที่กดตกลง')) {
+        return;
+      }
+      const theta = s.theta || 0;
+      transport.navGoal({x: s.x, y: s.y, theta: theta});
+      setActiveGoal({x: s.x, y: s.y, theta: theta});
+      setStatus('ส่งไป Station "' + s.name + '" แล้ว - หุ่นยนต์กำลังนำทางอัตโนมัติ');
+      hideConfirm();
+      redraw();
+    });
+}
+
+document.getElementById('btn-stations').addEventListener('click', () => {
+  if (stationPanel.hidden) { hideConfirm(); renderStationPanel(); stationPanel.hidden = false; }
+  else stationPanel.hidden = true;
+});
 
 // ---------- active goal pin ----------
 // The last goal sent stays on the map as a pin until the robot reaches it

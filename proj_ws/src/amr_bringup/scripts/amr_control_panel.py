@@ -808,6 +808,9 @@ class RosBridge:
             String, '/rosboard_mapping_cmd',
             lambda m: self.mapping_cmds.append(m.data), 10)
         self.mapping_state_pub = node.create_publisher(String, '/amr_mapping_state', 10)
+        # Stations of the map Navigation is running on, for the phone
+        # goal_picker page (pins + "send to station"). JSON, sent at 1 Hz.
+        self.stations_pub = node.create_publisher(String, '/amr_stations', 10)
         # amr_slam scan_gate_node: SLAM only receives scans while open.
         self._SetBool = SetBool
         self.gate_client = node.create_client(SetBool, '/scan_gate/set_enabled')
@@ -879,6 +882,11 @@ class RosBridge:
                 self.cmd_pub.publish(z)
                 time.sleep(0.03)
         threading.Thread(target=burst, daemon=True).start()
+
+    def publish_stations(self, map_name, stations):
+        if self.ok:
+            self.stations_pub.publish(self._String(data=json.dumps(
+                {'map': map_name or '', 'stations': stations})))
 
     def publish_mapping_state(self, state):
         if self.ok:
@@ -1112,6 +1120,7 @@ class AmrControlPanel(tk.Tk):
         # Auto-mode mission state
         self._stations = []
         self._selected_station = None
+        self._stations_pub_t = 0.0
         self._mission = None  # {'station', 'state': active|paused|arrived, 'd0'}
         self._nav_goal = None  # last goal sent from the Nav-test map (x, y, th)
 
@@ -2255,6 +2264,13 @@ class AmrControlPanel(tk.Tk):
         if self._mode == 'mapping' and time.monotonic() - self._mapping_state_t > 1.0:
             self.ros.publish_mapping_state(self._mapping_state())
             self._mapping_state_t = time.monotonic()
+        if time.monotonic() - self._stations_pub_t > 1.0:
+            nav = self._mode == 'navigation' and self._nav_map_name
+            # read the file, not self._stations: that is only refreshed
+            # when the Auto page is opened
+            self.ros.publish_stations(self._nav_map_name if nav else '',
+                                      load_stations(self._nav_map_name) if nav else [])
+            self._stations_pub_t = time.monotonic()
         ip = get_local_ip() if int(time.time()) % 5 == 0 or self.pill_net.cget('text') == 'Net —' else None
         if ip:
             online = ip != '127.0.0.1'
