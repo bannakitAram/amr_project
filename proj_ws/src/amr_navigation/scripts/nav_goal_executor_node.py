@@ -21,9 +21,11 @@ the in-progress task first) - the operator's most recent tap wins, same as
 re-pressing "2D Nav Goal" in RViz.
 """
 import sys
+import time
 
 import rclpy
 from geometry_msgs.msg import PoseStamped
+from lifecycle_msgs.srv import GetState
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 from nav_msgs.msg import Path
 from std_msgs.msg import Empty
@@ -34,11 +36,42 @@ def restamp(pose_stamped, navigator):
     return pose_stamped
 
 
+def wait_for_active(navigator, node_name, timeout_s=2.0):
+    """Block until `node_name` reports lifecycle state 'active'.
+
+    Replaces BasicNavigator.waitUntilNav2Active(), which (Humble) has two
+    problems here:
+      * it calls <node>/get_state with spin_until_future_complete() and NO
+        timeout - a lost response right after launch hung this node forever
+        in "waiting for Nav2 to become active", so it never subscribed to
+        /rosboard_nav_goal and every goal from the panel / phone was
+        silently dropped;
+      * with the default localizer='amcl' it keeps publishing a ZERO pose
+        to /initialpose until /amcl_pose arrives, resetting AMCL to (0,0,0)
+        - the operator sets the initial pose (panel / goal picker) instead.
+    Here every call has a timeout and is simply retried."""
+    client = navigator.create_client(GetState, f'{node_name}/get_state')
+    while rclpy.ok():
+        if not client.wait_for_service(timeout_sec=1.0):
+            navigator.get_logger().info(f'{node_name}/get_state not available, waiting...')
+            continue
+        future = client.call_async(GetState.Request())
+        rclpy.spin_until_future_complete(navigator, future, timeout_sec=timeout_s)
+        if future.done() and future.result() is not None and \
+                future.result().current_state.label == 'active':
+            break
+        if not future.done():
+            future.cancel()
+        time.sleep(1.0)
+    navigator.destroy_client(client)
+
+
 def main():
     rclpy.init()
     navigator = BasicNavigator()
     navigator.get_logger().info('nav_goal_executor_node: waiting for Nav2 to become active...')
-    navigator.waitUntilNav2Active()
+    wait_for_active(navigator, 'amcl')
+    wait_for_active(navigator, 'bt_navigator')
     navigator.get_logger().info('nav_goal_executor_node: Nav2 active, ready for goals')
 
     task_active = {'value': False}
