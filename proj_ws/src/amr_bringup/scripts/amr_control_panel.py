@@ -909,6 +909,29 @@ class RosBridge:
 
 
 # ======================================================================
+class MapPlaceholder(tk.Frame):
+    """Stands in for MapView: the panel no longer draws the map (operator
+    asked to watch it on the phone goal_picker page instead - also frees
+    the CPU the 4 Hz map/overlay redraw took while Nav2 was missing its
+    control rate). Same set_map/set_overlay API as MapView, as no-ops, so
+    the pages and _tick need no other change. Stations are still chosen
+    with the buttons; tap-to-goal is on the phone."""
+
+    def __init__(self, parent, on_tap=None, **kw):
+        super().__init__(parent, bg='#1c222a', highlightthickness=1,
+                         highlightbackground=BORDER, **kw)
+        tk.Label(self, text=T('แผนที่ดูบนมือถือ\n(ปุ่ม QR มือถือ → หน้า Goal Picker)'),
+                 bg='#1c222a', fg=TEXT_MUTED, font=('Sans', -px(16)),
+                 justify='center').place(relx=0.5, rely=0.5, anchor='center')
+
+    def set_map(self, *_a, **_k):
+        pass
+
+    def set_overlay(self, *_a, **_k):
+        pass
+
+
+# ======================================================================
 class MapView(tk.Canvas):
     """Occupancy grid + robot + markers. Optional tap (and drag for
     heading) callback in map coordinates: on_tap(x, y, theta)."""
@@ -1486,7 +1509,7 @@ class AmrControlPanel(tk.Tk):
         p.columnconfigure(1, weight=2)
         p.rowconfigure(0, weight=1)
 
-        self.auto_map = MapView(p)
+        self.auto_map = MapPlaceholder(p)
         self.auto_map.grid(row=0, column=0, sticky='nsew', padx=(px(0), px(8)))
 
         right = tk.Frame(p, bg=BG)
@@ -1750,7 +1773,7 @@ class AmrControlPanel(tk.Tk):
             font=self.f_button_sub, bg=AMBER, fg='#1a1a1a', pady=px(8))
         self.mapping_banner.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(px(0), px(8)))
 
-        self.mapping_map = MapView(p)
+        self.mapping_map = MapPlaceholder(p)
         self.mapping_map.grid(row=1, column=0, sticky='nsew', padx=(px(0), px(8)))
 
         right = tk.Frame(p, bg=BG)
@@ -1820,7 +1843,7 @@ class AmrControlPanel(tk.Tk):
         p.columnconfigure(1, weight=0, minsize=px(450))
         p.rowconfigure(0, weight=1)
 
-        self.nav_map = MapView(p, on_tap=self._on_map_tap)
+        self.nav_map = MapPlaceholder(p, on_tap=self._on_map_tap)
         self.nav_map.grid(row=0, column=0, sticky='nsew', padx=(px(0), px(8)))
 
         right = tk.Frame(p, bg=BG, width=px(450))
