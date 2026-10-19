@@ -33,7 +33,8 @@ from rosboard.subscribers.dmesg_subscriber import DMesgSubscriber
 from rosboard.subscribers.processes_subscriber import ProcessesSubscriber
 from rosboard.subscribers.system_stats_subscriber import SystemStatsSubscriber
 from rosboard.subscribers.dummy_subscriber import DummySubscriber
-from rosboard.handlers import ROSBoardSocketHandler, NoCacheStaticFileHandler
+from rosboard.handlers import LATCHED_TOPICS, ROSBoardSocketHandler, NoCacheStaticFileHandler
+
 
 class ROSBoardNode(object):
     instance = None
@@ -61,6 +62,16 @@ class ROSBoardNode(object):
         # last time data arrived for a particular topic
         # dict of topic_name -> float (time in seconds)
         self.last_data_times_by_topic = {}
+        # Latched topics (/map, /tf_static) are published once per publisher.
+        # They must never be rate-limited (several /tf_static publishers -
+        # robot_state_publisher, camera static TF - deliver their one-shot
+        # messages within the same second, and the 1 Hz limit dropped all
+        # but the first: base_link->lidar_link never reached the browser,
+        # so goal_picker could not place the scan). The last data is also
+        # kept so a client that connects later still gets it (see
+        # handlers.py MSG_SUB) - the ROS subscription is shared and will not
+        # receive the latched message again.
+        self.latched_msgs = {}
 
         if rospy.__name__ == "rospy2":
             # ros2 hack: need to subscribe to at least 1 topic
@@ -672,7 +683,9 @@ class ROSBoardNode(object):
         """
         topic_name, topic_type = topic_info
         t = time.time()
-        if t - self.last_data_times_by_topic.get(topic_name, 0) < self.update_intervals_by_topic[topic_name] - 1e-4:
+        latched = topic_name in LATCHED_TOPICS
+        if not latched and \
+                t - self.last_data_times_by_topic.get(topic_name, 0) < self.update_intervals_by_topic[topic_name] - 1e-4:
             return
 
         if self.event_loop is None:
@@ -688,6 +701,16 @@ class ROSBoardNode(object):
 
         # log last time we received data on this topic
         self.last_data_times_by_topic[topic_name] = t
+
+        if latched:
+            if topic_name == "/tf_static":
+                # merge every publisher's static transforms, keyed by child
+                prev = self.latched_msgs.get(topic_name)
+                merged = {tr["child_frame_id"]: tr for tr in (prev or {}).get("transforms", [])}
+                for tr in ros_msg_dict.get("transforms", []):
+                    merged[tr["child_frame_id"]] = tr
+                ros_msg_dict = dict(ros_msg_dict, transforms=list(merged.values()))
+            self.latched_msgs[topic_name] = ros_msg_dict
 
         # broadcast it to the listeners that care
         self.event_loop.add_callback(

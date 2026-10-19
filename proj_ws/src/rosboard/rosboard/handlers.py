@@ -10,6 +10,10 @@ import uuid
 
 from . import __version__
 
+# Published once (TRANSIENT_LOCAL): never rate-limited, cached and replayed
+# to late subscribers - see ROSBoardNode.latched_msgs in rosboard.py.
+LATCHED_TOPICS = ("/map", "/tf_static")
+
 class NoCacheStaticFileHandler(tornado.web.StaticFileHandler):
     def set_extra_headers(self, path):
         # Disable cache
@@ -105,7 +109,8 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
                     if socket.id not in socket.node.remote_subs[topic_name]:
                         continue
                     t = time.time()
-                    if t - socket.last_data_times_by_topic.get(topic_name, 0.0) < \
+                    if topic_name not in LATCHED_TOPICS and \
+                            t - socket.last_data_times_by_topic.get(topic_name, 0.0) < \
                             socket.update_intervals_by_topic.get(topic_name) - 2e-4:
                         continue
                     if socket.ws_connection and not socket.ws_connection.is_closing():
@@ -202,6 +207,13 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
 
             self.node.remote_subs[topic_name].add(self.id)
             self.node.sync_subs()
+
+            # latched topic already received before this client asked: replay
+            cached = self.node.latched_msgs.get(topic_name)
+            if cached is not None and self.ws_connection and \
+                    not self.ws_connection.is_closing():
+                self.write_message(json.dumps(
+                    [ROSBoardSocketHandler.MSG_MSG, cached], separators=(',', ':')))
 
         # client sent a teleop (virtual joystick) command
         elif argv[0] == ROSBoardSocketHandler.MSG_TELEOP:
