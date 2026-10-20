@@ -98,6 +98,8 @@ YAW_TOL = 0.04           # rad (~2.3 deg) - final heading tolerance
 HALF_TRACK = 0.236       # m - wheel_sep / 2 (STM32 firmware)
 NO_REVERSE = 0.8         # while driving keep |w| <= this * v / HALF_TRACK
 CORRIDOR_LATERAL = 0.25  # m - within this of the line (and past the pre-goal) skip leg 1
+CORRIDOR_ENTRY = 0.25    # m - leg 1 hands over once within this before the pre-goal (MPPI
+                         # stalled 0.18 m from it, then a recovery Spin; bag 20261020_161338)
 LATERAL_ABORT = 0.35     # m - too far off the line: stop, give up (0.25 tripped after AMCL jumped at the pre-goal)
 APPROACH_TIMEOUT = 90.0  # s
 
@@ -412,6 +414,21 @@ def main():
                     task_active['value'] = True
                 else:  # 'cancel'
                     navigator.get_logger().info('nav_goal_executor_node: goal cancelled by operator')
+
+            # leg 1: hand over to the final approach as soon as the robot is in
+            # the corridor - no need for Nav2 to hit the pre-goal exactly
+            if station['value'] is not None and task_active['value']:
+                g = station['value']
+                e = station_errors(tf_buffer, g.pose.position.x, g.pose.position.y,
+                                   yaw_of(g.pose.orientation))
+                if e is not None and -APPROACH_DIST - CORRIDOR_ENTRY < e[0] < 0.05 and \
+                        abs(e[1]) < CORRIDOR_LATERAL:
+                    navigator.cancelTask()
+                    task_active['value'] = False
+                    station['value'] = None
+                    navigator.get_logger().info(
+                        'nav_goal_executor_node: in the approach corridor - final approach')
+                    approach['value'] = StationApproach(navigator, tf_buffer, cmd_pub, g)
 
             # re-sent at 1 Hz so a page opened later still sees it
             if time.time() - last_alert['t'] > 1.0:
