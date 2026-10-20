@@ -112,6 +112,18 @@
   }
   #station-panel .title { width: 100%; font-size: 12px; color: #aaa; }
 
+  /* nav_goal_executor_node's /nav_alert (wheel-slip stop / retry). Below
+     the IMU banner so both can show. */
+  #nav-alert {
+    position: absolute; left: 50%; top: 142px; transform: translateX(-50%);
+    max-width: calc(100% - 32px);
+    padding: 8px 14px; border-radius: 8px;
+    background: #c62828; color: #fff; font-size: 14px; font-weight: bold;
+    text-align: center; z-index: 25; pointer-events: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+  }
+  #nav-alert.warn { background: #ef6c00; }
+
   #pin-gate {
     position: absolute; inset: 0; background: rgba(0,0,0,0.85);
     display: flex; align-items: center; justify-content: center; z-index: 50;
@@ -136,6 +148,7 @@
   <div id="freshness-badge" hidden></div>
   <div id="speed-badge" hidden></div>
   <div id="imu-banner" hidden></div>
+  <div id="nav-alert" hidden></div>
 
   <div id="confirm-panel" hidden>
     <span id="confirm-text"></span>
@@ -252,6 +265,7 @@ function onAuthResult(result) {
     transport.subscribe({topicName: '/mppi_local_plan', maxUpdateRate: 5.0});
     transport.subscribe({topicName: '/amr_stations', maxUpdateRate: 1.0});
     transport.subscribe({topicName: '/rosboard_bag_state', maxUpdateRate: 2.0});
+    transport.subscribe({topicName: '/nav_alert', maxUpdateRate: 2.0});
   } else {
     localStorage.removeItem('rosboard_pin');
     showPinGate('รหัสไม่ถูกต้อง กรุณาลองใหม่');
@@ -284,6 +298,7 @@ function onRosMsg(msg) {
   else if (msg._topic_name === '/mppi_local_plan') handleLocalPlan(msg);
   else if (msg._topic_name === '/amr_stations') handleStations(msg);
   else if (msg._topic_name === '/rosboard_bag_state') handleBagState(msg);
+  else if (msg._topic_name === '/nav_alert') handleNavAlert(msg);
 }
 
 // ---------- map state ----------
@@ -447,6 +462,18 @@ function updateImuBanner() {
   }
 }
 setInterval(updateImuBanner, 250);
+
+// Wheel-slip stop / retry from nav_goal_executor_node. Stays up until the
+// executor clears it (new goal, or the retry starts).
+const navAlert = document.getElementById('nav-alert');
+function handleNavAlert(msg) {
+  let a;
+  try { a = JSON.parse(msg.data); } catch (e) { return; }
+  if (!a || a.level === 'ok' || !a.text) { navAlert.hidden = true; return; }
+  navAlert.className = a.level === 'warn' ? 'warn' : '';
+  navAlert.textContent = '⚠ ' + a.text;
+  navAlert.hidden = false;
+}
 
 // ---------- laser scan ----------
 let scanPoints = null;  // Float32Array of [x0,y0,x1,y1,...] in the scan's own frame
@@ -912,7 +939,7 @@ function sendToStation(s) {
         return;
       }
       const theta = s.theta || 0;
-      transport.navGoal({x: s.x, y: s.y, theta: theta});
+      transport.navGoal({x: s.x, y: s.y, theta: theta, station: true});
       setActiveGoal({x: s.x, y: s.y, theta: theta});
       setStatus('ส่งไป Station "' + s.name + '" แล้ว - หุ่นยนต์กำลังนำทางอัตโนมัติ');
       hideConfirm();
@@ -1051,7 +1078,7 @@ btnBag.addEventListener('click', () => {
 // The last goal sent stays on the map as a pin until the robot reaches it
 // (within GOAL_PIN_CLEAR_DIST), a new goal/path is sent, or the operator
 // presses "หยุดนำทาง". Kept in localStorage so a page reload keeps it.
-const GOAL_PIN_CLEAR_DIST = 0.35;  // m - a bit looser than Nav2's xy_goal_tolerance (0.30)
+const GOAL_PIN_CLEAR_DIST = 0.35;  // m - looser than Nav2's xy_goal_tolerance (0.10, station 0.05)
 let activeGoal = null;  // {x, y, theta}
 try {
   const saved = JSON.parse(localStorage.getItem('goal_picker_active_goal'));

@@ -77,9 +77,9 @@ class WebSocketV1Transport {
       this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_AUTH, {code: code}]));
     }
 
-    navGoal({x, y, theta}) {
+    navGoal({x, y, theta, station = false}) {
       if (!this.isConnected()) return;
-      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_NAV_GOAL, {x: x, y: y, theta: theta}]));
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_NAV_GOAL, {x: x, y: y, theta: theta, station: station}]));
     }
 
     navPath({points}) {

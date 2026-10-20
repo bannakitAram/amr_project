@@ -796,6 +796,8 @@ class RosBridge:
         node.create_subscription(Bool, '/imu_watchdog/ok', wd('imu'), 10)
 
         self.goal_pub = node.create_publisher(PoseStamped, '/rosboard_nav_goal', 10)
+        # station missions: nav_goal_executor parks inside the station box
+        self.station_pub = node.create_publisher(PoseStamped, '/rosboard_nav_station', 10)
         self.cancel_pub = node.create_publisher(Empty, '/rosboard_nav_cancel', 10)
         self.cmd_pub = node.create_publisher(Twist, '/cmd_vel', 10)
 
@@ -854,7 +856,7 @@ class RosBridge:
         return item is not None and time.monotonic() - item[-1] < age
 
     # ----- commands -----
-    def send_goal(self, x, y, theta):
+    def send_goal(self, x, y, theta, station=False):
         if not self.ok:
             return False
         m = self._PoseStamped()
@@ -863,7 +865,7 @@ class RosBridge:
         m.pose.position.x, m.pose.position.y = float(x), float(y)
         m.pose.orientation.z = math.sin(theta / 2.0)
         m.pose.orientation.w = math.cos(theta / 2.0)
-        self.goal_pub.publish(m)
+        (self.station_pub if station else self.goal_pub).publish(m)
         return True
 
     def cancel_goal(self):
@@ -1604,7 +1606,7 @@ class AmrControlPanel(tk.Tk):
     def _start_mission(self, st):
         pose = self.ros.pose()
         d0 = math.hypot(st['x'] - pose[0], st['y'] - pose[1]) if pose else None
-        if self.ros.send_goal(st['x'], st['y'], st['theta']):
+        if self.ros.send_goal(st['x'], st['y'], st['theta'], station=True):
             self._mission = {'station': st, 'state': 'active', 'd0': d0}
         self._update_mission_ui()
 
@@ -1616,7 +1618,8 @@ class AmrControlPanel(tk.Tk):
             self.ros.cancel_goal()
             m['state'] = 'paused'
         elif m['state'] == 'paused':
-            self.ros.send_goal(m['station']['x'], m['station']['y'], m['station']['theta'])
+            self.ros.send_goal(m['station']['x'], m['station']['y'], m['station']['theta'],
+                               station=True)
             m['state'] = 'active'
         self._update_mission_ui()
 

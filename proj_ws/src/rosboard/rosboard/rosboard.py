@@ -176,6 +176,8 @@ class ROSBoardNode(object):
         # PoseStamped/Path, same as it republishes a validated Twist for
         # teleop.
         self.nav_goal_pub = rospy.Publisher("/rosboard_nav_goal", PoseStamped, queue_size=1)
+        # station goal: executor parks inside the box (pre-goal + precise leg)
+        self.nav_station_pub = rospy.Publisher("/rosboard_nav_station", PoseStamped, queue_size=1)
         self.nav_path_pub = rospy.Publisher("/rosboard_nav_path", Path, queue_size=1)
         self.nav_cancel_pub = rospy.Publisher("/rosboard_nav_cancel", Empty, queue_size=1)
         # Mapping controls (start/pause scan, save, finish) from the phone.
@@ -235,15 +237,17 @@ class ROSBoardNode(object):
         pose.pose.orientation.w = math.cos(theta / 2.0)
         return pose
 
-    def on_nav_goal(self, x, y, theta):
+    def on_nav_goal(self, x, y, theta, station=False):
         """Handle a single navigation goal tapped on the goal_picker page's
         map. Publishes a validated PoseStamped on /rosboard_nav_goal for
-        nav_goal_executor_node to send to Nav2's navigate_to_pose action."""
+        nav_goal_executor_node to send to Nav2's navigate_to_pose action.
+        station=True ("send to station") goes to /rosboard_nav_station
+        instead, for the precise park-in-the-box approach."""
         pose = self._nav_pose(x, y, theta)
         if pose is None:
             print("error: nav_goal: bad coordinates: x=%r y=%r theta=%r" % (x, y, theta))
             return
-        self.nav_goal_pub.publish(pose)
+        (self.nav_station_pub if station is True else self.nav_goal_pub).publish(pose)
 
     def on_nav_path(self, points):
         """Handle a drawn path from the goal_picker page: a list of

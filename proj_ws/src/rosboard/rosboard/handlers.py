@@ -235,6 +235,7 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
                 argv[1].get("x", 0.0),
                 argv[1].get("y", 0.0),
                 argv[1].get("theta", 0.0),
+                argv[1].get("station", False),
             )
 
         # client (goal_picker page) sent a drawn path to follow, as a list
