@@ -4,7 +4,9 @@ import asyncio
 import importlib
 import os
 import random
+import signal
 import socket
+import subprocess
 import threading
 import time
 import tornado, tornado.web, tornado.websocket
@@ -183,6 +185,22 @@ class ROSBoardNode(object):
         self.mapping_cmd_pub = rospy.Publisher("/rosboard_mapping_cmd", String, queue_size=5)
         self.MAPPING_ACTIONS = ("start", "pause", "save", "finish")
 
+        # rosbag recording from the phone: rosboard runs `ros2 bag record`
+        # itself on the topics ticked on the goal_picker page. Topics must
+        # be ones currently advertised (self.all_topics), so the browser
+        # can't inject arguments. State goes out on /rosboard_bag_state.
+        self.bag_dir = os.path.expanduser(rospy.get_param("~bag_dir", "~/AMR_Project/bags"))
+        self.BAG_MAX_TOPICS = 40
+        self.BAG_MAX_DURATION_S = 1800.0  # auto-stop so a forgotten recording can't fill the disk
+        self.bag_proc = None
+        self.bag_name = ""
+        self.bag_topics = []
+        self.bag_started = 0.0
+        self.bag_error = ""
+        self.bag_lock = threading.Lock()
+        self.bag_state_pub = rospy.Publisher("/rosboard_bag_state", String, queue_size=1)
+        threading.Thread(target=self.bag_state_loop, daemon=True).start()
+
         self.NAV_COORD_LIMIT = 1000.0    # m - reject obviously-bogus coordinates; Nav2's own costmap bounds are the real gate
         self.NAV_PATH_MAX_POINTS = 200   # cap a drawn path's waypoint count
 
@@ -271,6 +289,82 @@ class ROSBoardNode(object):
             return
         name = re.sub(r"[^A-Za-z0-9_\-]", "", str(name or "").strip().replace(" ", "_"))[:40]
         self.mapping_cmd_pub.publish(String(data=json.dumps({"action": action, "name": name})))
+
+    def on_bag_cmd(self, action, topics):
+        """Start/stop `ros2 bag record` for the goal_picker page. Only
+        currently-advertised topic names are accepted."""
+        with self.bag_lock:
+            if action == "start":
+                if self.bag_proc is not None:
+                    return
+                if type(topics) is not list:
+                    return
+                known = getattr(self, "all_topics", {})
+                topics = sorted(set(t for t in topics if type(t) is str and t in known
+                                    and re.match(r"^/[A-Za-z0-9_/]+$", t)))[:self.BAG_MAX_TOPICS]
+                if not topics:
+                    self.bag_error = "no valid topics"
+                    return
+                os.makedirs(self.bag_dir, exist_ok=True)
+                self.bag_name = "bag_" + time.strftime("%Y%m%d_%H%M%S")
+                try:
+                    self.bag_proc = subprocess.Popen(
+                        ["ros2", "bag", "record", "-o", os.path.join(self.bag_dir, self.bag_name)] + topics,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                except OSError as e:
+                    self.bag_proc = None
+                    self.bag_error = str(e)
+                    return
+                self.bag_topics = topics
+                self.bag_started = time.time()
+                self.bag_error = ""
+                rospy.loginfo("bag record start: %s %s" % (self.bag_name, " ".join(topics)))
+            elif action == "stop":
+                self._bag_stop()
+        self.publish_bag_state()
+
+    def _bag_stop(self):
+        # caller holds bag_lock. SIGINT so the recorder closes the bag cleanly.
+        if self.bag_proc is None:
+            return
+        try:
+            os.killpg(self.bag_proc.pid, signal.SIGINT)
+            self.bag_proc.wait(timeout=10)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(self.bag_proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        rospy.loginfo("bag record stop: %s" % self.bag_name)
+        self.bag_proc = None
+
+    def publish_bag_state(self):
+        rec = self.bag_proc is not None
+        self.bag_state_pub.publish(String(data=json.dumps({
+            "recording": rec,
+            "name": self.bag_name,
+            "topics": self.bag_topics if rec else [],
+            "elapsed": round(time.time() - self.bag_started, 1) if rec else 0.0,
+            "max_s": self.BAG_MAX_DURATION_S,
+            "dir": self.bag_dir,
+            "error": self.bag_error,
+        })))
+
+    def bag_state_loop(self):
+        while True:
+            time.sleep(1.0)
+            try:
+                with self.bag_lock:
+                    if self.bag_proc is not None:
+                        if self.bag_proc.poll() is not None:
+                            self.bag_error = "recorder exited (code %s)" % self.bag_proc.returncode
+                            self.bag_proc = None
+                        elif time.time() - self.bag_started > self.BAG_MAX_DURATION_S:
+                            self.bag_error = "auto-stopped after %d min" % (self.BAG_MAX_DURATION_S / 60)
+                            self._bag_stop()
+                self.publish_bag_state()
+            except Exception:
+                pass
 
     def on_initial_pose(self, x, y, theta):
         """Handle a "set initial pose" tap from the goal_picker page - where
@@ -401,6 +495,10 @@ class ROSBoardNode(object):
             rospy.spin()
         except KeyboardInterrupt:
             pass
+        finally:
+            # recorder runs in its own session; don't leave it orphaned
+            with self.bag_lock:
+                self._bag_stop()
 
     def get_msg_class(self, msg_type):
         """

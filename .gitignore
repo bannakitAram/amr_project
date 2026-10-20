@@ -25,3 +25,6 @@ __pycache__/
 # tf2_tools view_frames output (regenerate when needed)
 frames_*.gv
 frames_*.pdf
+
+# rosbags recorded from the goal_picker page
+bags/

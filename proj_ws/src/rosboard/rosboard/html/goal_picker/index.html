@@ -91,6 +91,25 @@
     max-height: 40vh; overflow-y: auto;
   }
   #station-panel[hidden] { display: none; }
+
+  /* rosbag recorder: tick topics, start/stop - see renderBagPanel(). */
+  #bag-panel {
+    position: absolute; left: 10px; right: 10px; bottom: 66px;
+    background: rgba(20,20,20,0.92); color: #eee; border-radius: 10px;
+    padding: 10px; z-index: 22; max-height: 55vh; overflow-y: auto; font-size: 13px;
+  }
+  #bag-panel[hidden] { display: none; }
+  #bag-panel .title { font-size: 12px; color: #aaa; margin-bottom: 6px; }
+  #bag-panel .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+  #bag-panel label { display: block; padding: 5px 2px; word-break: break-all; }
+  #bag-panel label .type { color: #888; font-size: 11px; }
+  #bag-panel input[type=checkbox] { transform: scale(1.3); margin-right: 8px; }
+  #bag-badge {
+    position: absolute; right: 10px; top: 72px;
+    padding: 4px 10px; border-radius: 6px;
+    background: #c62828; color: #fff; font-size: 12px; font-weight: bold;
+    z-index: 20; pointer-events: none;
+  }
   #station-panel .title { width: 100%; font-size: 12px; color: #aaa; }
 
   #pin-gate {
@@ -125,6 +144,8 @@
   </div>
 
   <div id="station-panel" hidden></div>
+  <div id="bag-panel" hidden></div>
+  <div id="bag-badge" hidden></div>
 
   <div id="mode-bar">
     <button class="btn active" id="mode-view">ดูแผนที่</button>
@@ -132,6 +153,7 @@
     <button class="btn" id="mode-path">ลากเส้นทาง</button>
     <button class="btn" id="mode-initpose">ตั้งตำแหน่งเริ่มต้น</button>
     <button class="btn" id="btn-stations">Station</button>
+    <button class="btn" id="btn-bag">บันทึก Bag</button>
     <button class="btn" id="btn-refit">พอดีจอ</button>
     <button class="btn danger" id="btn-cancel-nav">หยุดนำทาง</button>
   </div>
@@ -197,7 +219,7 @@ const transport = new WebSocketV1Transport({
   onOpen: () => { setStatus('เชื่อมต่อแล้ว กำลังยืนยันตัวตน...'); tryAuth(); },
   onClose: () => { authenticated = false; setStatus('ขาดการเชื่อมต่อ กำลังลองใหม่...'); setTimeout(() => transport.connect(), 3000); },
   onRosMsg: onRosMsg,
-  onTopics: () => {},
+  onTopics: onTopics,
   onSystem: () => {},
   onAuthResult: onAuthResult,
 });
@@ -229,6 +251,7 @@ function onAuthResult(result) {
     transport.subscribe({topicName: '/plan', maxUpdateRate: 2.0});
     transport.subscribe({topicName: '/mppi_local_plan', maxUpdateRate: 5.0});
     transport.subscribe({topicName: '/amr_stations', maxUpdateRate: 1.0});
+    transport.subscribe({topicName: '/rosboard_bag_state', maxUpdateRate: 2.0});
   } else {
     localStorage.removeItem('rosboard_pin');
     showPinGate('รหัสไม่ถูกต้อง กรุณาลองใหม่');
@@ -260,6 +283,7 @@ function onRosMsg(msg) {
   else if (msg._topic_name === '/plan') handlePlan(msg);
   else if (msg._topic_name === '/mppi_local_plan') handleLocalPlan(msg);
   else if (msg._topic_name === '/amr_stations') handleStations(msg);
+  else if (msg._topic_name === '/rosboard_bag_state') handleBagState(msg);
 }
 
 // ---------- map state ----------
@@ -897,8 +921,130 @@ function sendToStation(s) {
 }
 
 document.getElementById('btn-stations').addEventListener('click', () => {
-  if (stationPanel.hidden) { hideConfirm(); renderStationPanel(); stationPanel.hidden = false; }
+  if (stationPanel.hidden) { hideConfirm(); bagPanel.hidden = true; renderStationPanel(); stationPanel.hidden = false; }
   else stationPanel.hidden = true;
+});
+
+// ---------- rosbag recorder ----------
+// rosboard.py runs `ros2 bag record` on the ticked topics (on_bag_cmd);
+// files go to its ~bag_dir on the robot (default ~/AMR_Project/bags).
+// Ticked topics are remembered per browser.
+const bagPanel = document.getElementById('bag-panel');
+const bagBadge = document.getElementById('bag-badge');
+const btnBag = document.getElementById('btn-bag');
+// big topics: warn, they can fill the disk / load the Jetson
+const BAG_HEAVY_TYPES = /PointCloud2|Image|OccupancyGrid/;
+let allTopics = {};   // name -> type, from rosboard's topic list
+let bagState = null;  // last /rosboard_bag_state
+let bagStateAt = 0;
+let bagSelected = new Set();
+try {
+  const saved = JSON.parse(localStorage.getItem('goal_picker_bag_topics'));
+  if (Array.isArray(saved)) bagSelected = new Set(saved);
+} catch (e) {}
+
+function saveBagSelection() {
+  try { localStorage.setItem('goal_picker_bag_topics', JSON.stringify([...bagSelected])); } catch (e) {}
+}
+
+function onTopics(topics) {
+  const changed = Object.keys(topics).join() !== Object.keys(allTopics).join();
+  allTopics = topics;
+  if (changed && !bagPanel.hidden && !(bagState && bagState.recording)) renderBagPanel();
+}
+
+function handleBagState(msg) {
+  try { bagState = JSON.parse(msg.data); } catch (e) { return; }
+  bagStateAt = Date.now();
+  updateBagBadge();
+  if (!bagPanel.hidden) renderBagStatus();
+}
+
+function fmtDuration(s) {
+  s = Math.floor(s);
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+function updateBagBadge() {
+  const rec = bagState && bagState.recording;
+  bagBadge.hidden = !rec;
+  btnBag.classList.toggle('danger', !!rec);
+  if (rec) bagBadge.textContent = '● REC ' + fmtDuration(bagState.elapsed) + ' (' + bagState.topics.length + ' topics)';
+}
+
+function renderBagStatus() {
+  const el = document.getElementById('bag-status');
+  if (!el) return;
+  const fresh = Date.now() - bagStateAt < 5000;
+  if (!fresh) el.textContent = 'ไม่มีสถานะจากเครื่องบันทึก (rosboard)';
+  else if (bagState.recording) el.textContent = 'กำลังบันทึก ' + bagState.name + ' - ' + fmtDuration(bagState.elapsed) +
+    ' (หยุดเองเมื่อครบ ' + Math.round(bagState.max_s / 60) + ' นาที)';
+  else el.textContent = (bagState.name ? 'ไฟล์ล่าสุด: ' + bagState.dir + '/' + bagState.name : 'ยังไม่ได้บันทึก') +
+    (bagState.error ? ' - ' + bagState.error : '');
+  const start = document.getElementById('bag-start');
+  const stop = document.getElementById('bag-stop');
+  const rec = fresh && bagState.recording;
+  if (start) start.disabled = rec || bagSelected.size === 0;
+  if (stop) stop.disabled = !rec;
+  for (const cb of bagPanel.querySelectorAll('input[type=checkbox]')) cb.disabled = rec;
+}
+
+function renderBagPanel() {
+  bagPanel.innerHTML = '';
+  const title = document.createElement('div');
+  title.className = 'title';
+  title.id = 'bag-status';
+  bagPanel.appendChild(title);
+
+  const row = document.createElement('div');
+  row.className = 'row';
+  const mk = (id, cls, text, fn) => {
+    const b = document.createElement('button');
+    b.id = id; b.className = 'btn ' + cls; b.textContent = text; b.onclick = fn;
+    row.appendChild(b);
+  };
+  mk('bag-start', 'primary', 'เริ่มบันทึก', () => {
+    const topics = [...bagSelected].filter(t => t in allTopics);
+    if (!topics.length) return;
+    const heavy = topics.filter(t => BAG_HEAVY_TYPES.test(allTopics[t]));
+    if (heavy.length && !confirm('Topic ขนาดใหญ่: ' + heavy.join(', ') +
+        '\nไฟล์จะโตเร็วและเพิ่มโหลด CPU/disk ของ Jetson - บันทึกต่อ?')) return;
+    transport.bagCmd({action: 'start', topics: topics});
+  });
+  mk('bag-stop', 'danger', 'หยุดบันทึก', () => transport.bagCmd({action: 'stop'}));
+  mk('bag-none', '', 'ล้างที่เลือก', () => { bagSelected.clear(); saveBagSelection(); renderBagPanel(); });
+  bagPanel.appendChild(row);
+
+  const names = Object.keys(allTopics).sort();
+  if (!names.length) {
+    const d = document.createElement('div');
+    d.textContent = 'กำลังรอรายชื่อ topic...';
+    bagPanel.appendChild(d);
+  }
+  for (const name of names) {
+    const label = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = bagSelected.has(name);
+    cb.onchange = () => {
+      if (cb.checked) bagSelected.add(name); else bagSelected.delete(name);
+      saveBagSelection();
+      renderBagStatus();
+    };
+    const type = document.createElement('span');
+    type.className = 'type';
+    type.textContent = '  ' + allTopics[name];
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(name));
+    label.appendChild(type);
+    bagPanel.appendChild(label);
+  }
+  renderBagStatus();
+}
+
+btnBag.addEventListener('click', () => {
+  if (bagPanel.hidden) { hideConfirm(); stationPanel.hidden = true; renderBagPanel(); bagPanel.hidden = false; }
+  else bagPanel.hidden = true;
 });
 
 // ---------- active goal pin ----------

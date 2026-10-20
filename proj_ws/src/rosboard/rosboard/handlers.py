@@ -275,6 +275,13 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
                 return
             self.node.on_mapping_cmd(argv[1].get("action"), argv[1].get("name", ""))
 
+        # client sent a rosbag record control (start with topics / stop)
+        elif argv[0] == ROSBoardSocketHandler.MSG_BAG:
+            if len(argv) != 2 or type(argv[1]) is not dict:
+                print("error: bag: bad: %s" % message)
+                return
+            self.node.on_bag_cmd(argv[1].get("action"), argv[1].get("topics", []))
+
         # client wants to unsubscribe from topic
         elif argv[0] == ROSBoardSocketHandler.MSG_UNSUB:
             if len(argv) != 2 or type(argv[1]) is not dict:
@@ -306,6 +313,7 @@ ROSBoardSocketHandler.MSG_NAV_CANCEL = "c";
 ROSBoardSocketHandler.MSG_INITIAL_POSE = "i";
 ROSBoardSocketHandler.MSG_MAPPING = "k";
 ROSBoardSocketHandler.MSG_TELEOP_CFG = "x";
+ROSBoardSocketHandler.MSG_BAG = "b";
 
 ROSBoardSocketHandler.PING_SEQ = "s";
 ROSBoardSocketHandler.PONG_SEQ = "s";

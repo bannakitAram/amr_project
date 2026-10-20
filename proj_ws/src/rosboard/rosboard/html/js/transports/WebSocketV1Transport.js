@@ -102,6 +102,11 @@ class WebSocketV1Transport {
       this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_MAPPING, {action: action, name: name || ""}]));
     }
 
+    bagCmd({action, topics}) {
+      if (!this.isConnected()) return;
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_BAG, {action: action, topics: topics || []}]));
+    }
+
     initialPose({x, y, theta}) {
       if (!this.isConnected()) return;
       this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_INITIAL_POSE, {x: x, y: y, theta: theta}]));
@@ -124,6 +129,7 @@ class WebSocketV1Transport {
   WebSocketV1Transport.MSG_INITIAL_POSE = "i";
   WebSocketV1Transport.MSG_MAPPING = "k";
   WebSocketV1Transport.MSG_TELEOP_CFG = "x";
+  WebSocketV1Transport.MSG_BAG = "b";
 
   WebSocketV1Transport.PING_SEQ= "s";
   WebSocketV1Transport.PONG_SEQ = "s";
