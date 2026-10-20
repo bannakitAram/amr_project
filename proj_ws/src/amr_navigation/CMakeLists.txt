@@ -14,6 +14,7 @@ install(DIRECTORY
 install(PROGRAMS
   scripts/nav_goal_executor_node.py
   scripts/slip_speed_limiter_node.py
+  scripts/slip_localization_node.py
   scripts/imu_watchdog_node.py
   scripts/local_plan_relay_node.py
   DESTINATION lib/${PROJECT_NAME}

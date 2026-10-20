@@ -166,6 +166,16 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}],
     )
 
+    # Raises AMCL's translation alphas while the wheels slip so the LiDAR
+    # pulls the pose back - see slip_localization_node.py's docstring.
+    slip_localization_node = Node(
+        package='amr_navigation',
+        executable='slip_localization_node.py',
+        name='slip_localization',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
+    )
+
     # Cancels all Nav2 goals if /imu/data stops - ekf.yaml takes yaw rate
     # from the gyro only, see imu_watchdog_node.py's docstring.
     imu_watchdog_node = Node(
@@ -227,6 +237,7 @@ def generate_launch_description():
         collision_monitor_node,
         nav_goal_executor_node,
         slip_speed_limiter_node,
+        slip_localization_node,
         imu_watchdog_node,
         local_plan_relay_node,
         lifecycle_manager_localization,
