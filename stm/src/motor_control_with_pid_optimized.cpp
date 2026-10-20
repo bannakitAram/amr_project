@@ -579,6 +579,40 @@ float accel_bias_z = 0.0f;
 // ============================================================
 float latest_gyro_yaw_rate_rad_s = 0.0f;
 bool gyro_yaw_rate_valid = false;  // true once publish_imu() has stored a real reading
+unsigned long latest_gyro_ms = 0;  // millis() of that reading (yaw assist freshness check)
+
+// ============================================================
+// YAW-RATE ASSIST (2026-10-20)
+//
+// Slow turns don't turn this robot: at v <= ~0.07 m/s, or in place at
+// |w| <~ 0.3 rad/s, the wheels run the commanded differential (encoders
+// agree) but the body barely yaws (gyro ~0; bags 20261020_155840 /
+// _161338 - casters/floor hold it). The wheel PIDs can't see that, so
+// this outer loop integrates (commanded w - gyro w) into an extra wheel
+// differential, `yaw_boost`, until the body turns as commanded.
+//
+// Bounded so a bad gyro can't run away with the motors:
+//  - only adds turning in the commanded direction (0 .. YAW_BOOST_MAX),
+//    never reverses or reduces a commanded turn;
+//  - off (boost dropped at once) when |w_cmd| < YAW_ASSIST_MIN_W, when
+//    stopping, when the turn direction flips, or when the gyro reading is
+//    older than YAW_GYRO_STALE_MS (IMU lost -> plain encoder control);
+//  - while driving, the inner wheel is never pushed through zero (no
+//    direction-latch stops mid-curve); what it can't take goes to the
+//    outer wheel, capped at YAW_OUTER_EXTRA_MAX so the robot is never more
+//    than 0.05 m/s faster than commanded. In place both wheels take half.
+// The slip check below now also requires the body to miss the command,
+// so a turn the assist recovered is no longer reported as slip.
+// ============================================================
+const float YAW_ASSIST_MIN_W = 0.05f;     // rad/s - commanded turn below this: no assist
+const float YAW_ASSIST_KI = 2.0f;         // rad/s of boost per (rad/s error * s)
+const float YAW_BOOST_MAX = 0.40f;        // rad/s - max extra differential
+const float YAW_BOOST_LEAK = 1.0f;        // rad/s^2 - boost decay while overshooting
+const unsigned long YAW_GYRO_STALE_MS = 100;
+const float YAW_OUTER_EXTRA_MAX = 0.10f;  // m/s - outer wheel may go this much over its command
+                                          // (robot v at most +0.05 m/s over cmd_vel)
+float yaw_boost = 0.0f;                   // >= 0, applied in the sign of w_cmd
+float yaw_boost_sign = 0.0f;
 
 const float SLIP_YAW_RATE_THRESHOLD_RAD_S = 0.15f;  // ~8.6 deg/s - above normal filter-lag mismatch between the two signals
 const unsigned long SLIP_DEBOUNCE_MS = 300;          // mismatch must persist this long before latching true (avoids false positives from turning transients)
@@ -1416,6 +1450,58 @@ void motor_control_process()
 }
 
 // ============================================================
+// YAW-RATE ASSIST - see its declaration comment
+// ============================================================
+// Takes the ramped wheel targets, returns the targets the PIDs get.
+void apply_yaw_assist(float tgt_l, float tgt_r, float dt, float &out_l, float &out_r)
+{
+  out_l = tgt_l; out_r = tgt_r;
+  float w_cmd = (tgt_r - tgt_l) / wheel_sep;
+  float sign = (w_cmd > 0.0f) ? 1.0f : -1.0f;
+  bool gyro_fresh = gyro_yaw_rate_valid && (millis() - latest_gyro_ms) < YAW_GYRO_STALE_MS;
+  bool stopping = fabs(target_speed_l) < STOP_TARGET_THRESHOLD && fabs(target_speed_r) < STOP_TARGET_THRESHOLD;
+  if (!gyro_fresh || stopping || fabs(w_cmd) < YAW_ASSIST_MIN_W || sign != yaw_boost_sign)
+  {
+    yaw_boost = 0.0f;
+    yaw_boost_sign = sign;
+    if (!gyro_fresh || stopping || fabs(w_cmd) < YAW_ASSIST_MIN_W) return;
+  }
+
+  // error in the commanded direction: > 0 = body turning too slowly
+  float err = sign * (w_cmd - latest_gyro_yaw_rate_rad_s);
+  if (err > 0.0f) yaw_boost += YAW_ASSIST_KI * err * dt;
+  else yaw_boost -= YAW_BOOST_LEAK * dt;
+  yaw_boost = constrain(yaw_boost, 0.0f, YAW_BOOST_MAX);
+  if (yaw_boost <= 0.0f) return;
+
+  float d = yaw_boost * wheel_sep;           // total extra speed difference
+  if (tgt_l * tgt_r <= 0.0f)
+  {
+    // in place / pivoting (wheels already opposite or one at 0): both
+    // wheels take half, away from each other - never toward each other
+    out_r = tgt_r + sign * d / 2.0f;
+    out_l = tgt_l - sign * d / 2.0f;
+  }
+  else
+  {
+    // driving (both wheels same direction): slow the inner wheel down to
+    // (not through) zero, the rest goes on the outer
+    float &inner = (sign > 0.0f) ? out_l : out_r;
+    float &outer = (sign > 0.0f) ? out_r : out_l;
+    float inner_tgt = inner;
+    float half = d / 2.0f;
+    float room = fabs(inner_tgt);            // how far inner can go toward 0
+    float take = min(half, room);
+    float inner_dir = (inner_tgt >= 0.0f) ? 1.0f : -1.0f;
+    inner = inner_tgt - inner_dir * take;
+    float outer_dir = (outer >= 0.0f) ? 1.0f : -1.0f;
+    outer = outer + outer_dir * min(d - take, YAW_OUTER_EXTRA_MAX);
+  }
+  out_l = constrain(out_l, -MAX_SPEED_MS, MAX_SPEED_MS);
+  out_r = constrain(out_r, -MAX_SPEED_MS, MAX_SPEED_MS);
+}
+
+// ============================================================
 // UPDATE CONTROL + ODOM
 // ============================================================
 void update_and_publish_odom()
@@ -1454,8 +1540,10 @@ void update_and_publish_odom()
       robot_stationary = true;
   }
 
-  desired_dac_l = compute_left_dac(current_target_l, control_speed_l, dt);
-  desired_dac_r = compute_right_dac(current_target_r, control_speed_r, dt);
+  float assist_target_l, assist_target_r;
+  apply_yaw_assist(current_target_l, current_target_r, dt, assist_target_l, assist_target_r);
+  desired_dac_l = compute_left_dac(assist_target_l, control_speed_l, dt);
+  desired_dac_r = compute_right_dac(assist_target_r, control_speed_r, dt);
 
   // Command points the other way than the latched direction: bring this
   // wheel's DAC to 0 first (STOP slew below); update_wheel_dir() flips the
@@ -1500,9 +1588,14 @@ void update_and_publish_odom()
 
   // WHEEL SLIP DETECTION - see its declaration comment for why this
   // compares against the gyro instead of trusting encoders alone.
+  // Slip = wheels disagree with the gyro AND the body misses the commanded
+  // turn (yaw assist adds wheel differential on purpose, so the first
+  // alone would stay true for a turn the assist recovered).
+  float w_cmd_slip = (current_target_r - current_target_l) / wheel_sep;
   if (gyro_yaw_rate_valid)
   {
-    if (fabs(w - latest_gyro_yaw_rate_rad_s) > SLIP_YAW_RATE_THRESHOLD_RAD_S)
+    if (fabs(w - latest_gyro_yaw_rate_rad_s) > SLIP_YAW_RATE_THRESHOLD_RAD_S &&
+        fabs(w_cmd_slip - latest_gyro_yaw_rate_rad_s) > SLIP_YAW_RATE_THRESHOLD_RAD_S)
     {
       if (!slip_mismatch_active) { slip_mismatch_active = true; slip_mismatch_start = now; }
       else if (now - slip_mismatch_start > SLIP_DEBOUNCE_MS) wheel_slip_detected = true;
@@ -1824,6 +1917,7 @@ void publish_imu()
       // encoder-derived yaw rate.
       latest_gyro_yaw_rate_rad_s = imu_msg.angular_velocity.z;
       gyro_yaw_rate_valid = true;
+      latest_gyro_ms = millis();
     }
   }
 
