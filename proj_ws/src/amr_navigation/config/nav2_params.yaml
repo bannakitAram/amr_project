@@ -260,13 +260,13 @@ controller_server:
         cost_weight: 14.0
         max_path_occupancy_ratio: 0.05
         trajectory_point_step: 4
-        threshold_to_consider: 0.5
-        offset_from_furthest: 20
+        threshold_to_consider: 0.3   # was 0.5 - keep aligning closer to goal
+        offset_from_furthest: 10     # was 20 - align also on curves/start
         use_path_orientations: false
       PathFollowCritic:
         enabled: true
         cost_power: 1
-        cost_weight: 5.0
+        cost_weight: 8.0    # was 5.0 - robot drifted off a stable plan
         offset_from_furthest: 5
         threshold_to_consider: 1.4
       PathAngleCritic:
