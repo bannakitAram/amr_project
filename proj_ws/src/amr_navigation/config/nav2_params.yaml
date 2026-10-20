@@ -22,9 +22,13 @@ amcl:
       y: 0.0
       z: 0.0
       yaw: 0.0
-    alpha1: 0.2
-    alpha2: 0.2
-    alpha3: 0.2
+    # Odometry noise model. Yaw comes from the gyro (EKF), so rotation is
+    # trusted more; wheels slip now and then on straights (start-up and
+    # cruising), so translation is trusted less and the scans pull the pose
+    # back sooner. (were all 0.2)
+    alpha1: 0.1   # rotation noise from rotation
+    alpha2: 0.2   # rotation noise from translation
+    alpha3: 0.4   # translation noise from translation
     alpha4: 0.2
     alpha5: 0.2
     base_frame_id: "base_footprint"
