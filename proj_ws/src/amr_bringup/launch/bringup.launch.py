@@ -55,6 +55,8 @@ def generate_launch_description():
     foxglove_port = LaunchConfiguration('foxglove_port')
     use_depth_camera = LaunchConfiguration('depth_camera')
     use_slam = LaunchConfiguration('slam')
+    use_hook = LaunchConfiguration('hook')
+    hook_port = LaunchConfiguration('hook_port')
     use_navigation = LaunchConfiguration('navigation')
     nav_map = LaunchConfiguration('map')
     slam_start_scanning = LaunchConfiguration('slam_start_scanning')
@@ -77,6 +79,13 @@ def generate_launch_description():
         'depth_camera', default_value='true',
         description='Launch the YDLIDAR HP60C depth camera (depth-only -> /depth_camera/points) '
                      'for Nav2 obstacle avoidance; set false if the camera is unplugged')
+    declare_use_hook = DeclareLaunchArgument(
+        'hook', default_value='true',
+        description='Launch hook_bridge (Arduino Mega hook lift <-> /hook/state, /hook/cmd); '
+                    'set false if the hook controller is unplugged')
+    declare_hook_port = DeclareLaunchArgument(
+        'hook_port', default_value='/dev/hook',
+        description='Serial port of the hook Mega (udev/99-amr-hook.rules)')
     declare_use_slam = DeclareLaunchArgument(
         'slam', default_value='true',
         description='Launch slam_toolbox for mapping. Mutually exclusive with navigation '
@@ -234,6 +243,16 @@ def generate_launch_description():
         condition=IfCondition(use_depth_camera),
     )
 
+    # 9) Hook lift controller (Arduino Mega, plain serial - no micro-ROS)
+    hook_bridge_node = Node(
+        package='amr_bringup',
+        executable='hook_bridge.py',
+        name='hook_bridge',
+        parameters=[{'port': hook_port}],
+        output='screen',
+        condition=IfCondition(use_hook),
+    )
+
     version = _software_version()
     version_log = LogInfo(msg='AMR software version: ' + version + (
         '  ** UNCOMMITTED CHANGES - not for line use **'
@@ -257,6 +276,8 @@ def generate_launch_description():
         declare_use_navigation,
         declare_nav_map,
         declare_slam_start_scanning,
+        declare_use_hook,
+        declare_hook_port,
         description_launch,
         micro_ros_agent_node,
         wheel_joint_state_publisher_node,
@@ -268,4 +289,5 @@ def generate_launch_description():
         delayed_rviz_node,
         foxglove_launch,
         depth_camera_launch,
+        hook_bridge_node,
     ])

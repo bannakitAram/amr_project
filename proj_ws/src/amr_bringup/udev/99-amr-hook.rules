@@ -1,0 +1,13 @@
+# Hook lift controller (Arduino Mega 2560 clone, CH340 USB-serial) -> /dev/hook
+# Used by amr_bringup/scripts/hook_bridge.py.
+#
+# CH340 has no serial number, so VID:PID alone matches ANY CH340 adapter.
+# ENV{ID_PATH} pins it to the physical USB port on the Jetson as well -
+# if the Mega is moved to another port, update ID_PATH:
+#   udevadm info -q property /dev/ttyUSBx | grep ID_PATH=
+#
+# Install:
+#   sudo cp 99-amr-hook.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   ls -l /dev/hook
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", ENV{ID_PATH}=="platform-3610000.usb-usb-0:2.4.2:1.0", SYMLINK+="hook", MODE="0666"
