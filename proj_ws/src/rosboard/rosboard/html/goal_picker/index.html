@@ -92,6 +92,23 @@
   }
   #station-panel[hidden] { display: none; }
 
+  /* /rosout viewer - see renderLogPanel(). */
+  #log-panel {
+    position: absolute; left: 10px; right: 10px; bottom: 66px;
+    background: rgba(20,20,20,0.94); color: #eee; border-radius: 10px;
+    padding: 10px; z-index: 22; max-height: 55vh; display: flex; flex-direction: column;
+  }
+  #log-panel[hidden] { display: none; }
+  #log-panel .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; }
+  #log-panel .sum { font-size: 12px; color: #aaa; }
+  #log-panel .sum.bad { color: #ff7043; font-weight: bold; }
+  #log-lines { overflow-y: auto; font-family: monospace; font-size: 11px; white-space: pre-wrap;
+               word-break: break-all; }
+  #log-lines .W { color: #ffb300; }
+  #log-lines .E, #log-lines .F { color: #ef5350; }
+  #log-lines .D { color: #888; }
+  #log-lines .load { background: rgba(255,112,67,0.25); }
+
   /* rosbag recorder: tick topics, start/stop - see renderBagPanel(). */
   #bag-panel {
     position: absolute; left: 10px; right: 10px; bottom: 66px;
@@ -164,6 +181,7 @@
 
   <div id="station-panel" hidden></div>
   <div id="bag-panel" hidden></div>
+  <div id="log-panel" hidden></div>
   <div id="bag-badge" hidden></div>
 
   <div id="mode-bar">
@@ -173,6 +191,7 @@
     <button class="btn" id="mode-initpose">ตั้งตำแหน่งเริ่มต้น</button>
     <button class="btn" id="btn-stations">Station</button>
     <button class="btn" id="btn-bag">บันทึก Bag</button>
+    <button class="btn" id="btn-log">Log</button>
     <button class="btn" id="btn-refit">พอดีจอ</button>
     <button class="btn danger" id="btn-cancel-nav">หยุดนำทาง</button>
   </div>
@@ -272,6 +291,7 @@ function onAuthResult(result) {
     transport.subscribe({topicName: '/amr_stations', maxUpdateRate: 1.0});
     transport.subscribe({topicName: '/rosboard_bag_state', maxUpdateRate: 2.0});
     transport.subscribe({topicName: '/nav_alert', maxUpdateRate: 2.0});
+    transport.subscribe({topicName: '/rosout', maxUpdateRate: 30.0});
   } else {
     localStorage.removeItem('rosboard_pin');
     showPinGate('รหัสไม่ถูกต้อง กรุณาลองใหม่');
@@ -305,7 +325,97 @@ function onRosMsg(msg) {
   else if (msg._topic_name === '/amr_stations') handleStations(msg);
   else if (msg._topic_name === '/rosboard_bag_state') handleBagState(msg);
   else if (msg._topic_name === '/nav_alert') handleNavAlert(msg);
+  else if (msg._topic_name === '/rosout') handleLog(msg);
 }
+
+// ---------- /rosout log (is the Jetson keeping up?) ----------
+// Every line is kept (rosboard passes /rosout unthrottled, max 30/s).
+// "Overload" lines = the usual signs that a node can't keep up (SLAM /
+// costmaps dropping scans, controller missing its rate, TF too old);
+// their count over the last 60 s is shown on the Log button.
+const LOG_MAX = 300;
+const LOG_LEVELS = {10: 'D', 20: 'I', 30: 'W', 40: 'E', 50: 'F'};
+const LOG_LOAD_RE = /dropping message|queue is full|Control loop missed|missed its desired rate|extrapolation into the (past|future)|timed out waiting for transform|message filter/i;
+const logPanel = document.getElementById('log-panel');
+const btnLog = document.getElementById('btn-log');
+let logLines = [];      // {t, lvl, text, load}
+let logLoadTimes = [];  // ms timestamps of overload lines
+let logWarnOnly = false;
+let logPaused = false;
+let logDirty = false;
+
+function handleLog(msg) {
+  const lvl = LOG_LEVELS[msg.level] || '?';
+  const text = '[' + lvl + '] ' + (msg.name || '') + ': ' + (msg.msg || '');
+  const load = LOG_LOAD_RE.test(msg.msg || '');
+  const now = Date.now();
+  logLines.push({t: now, lvl: lvl, text: text, load: load});
+  if (logLines.length > LOG_MAX) logLines.splice(0, logLines.length - LOG_MAX);
+  if (load) logLoadTimes.push(now);
+  logDirty = true;
+}
+
+function logLoadCount() {
+  const cut = Date.now() - 60000;
+  while (logLoadTimes.length && logLoadTimes[0] < cut) logLoadTimes.shift();
+  return logLoadTimes.length;
+}
+
+function renderLogPanel() {
+  logPanel.innerHTML = '';
+  const row = document.createElement('div');
+  row.className = 'row';
+  const mk = (text, fn, cls) => {
+    const b = document.createElement('button');
+    b.className = 'btn ' + (cls || ''); b.textContent = text; b.onclick = fn;
+    row.appendChild(b);
+  };
+  mk(logWarnOnly ? 'แสดงทั้งหมด' : 'เฉพาะ WARN/ERROR', () => { logWarnOnly = !logWarnOnly; renderLogPanel(); });
+  mk(logPaused ? 'เลื่อนต่อ' : 'หยุดเลื่อน', () => { logPaused = !logPaused; renderLogPanel(); });
+  mk('ล้าง', () => { logLines = []; logLoadTimes = []; renderLogPanel(); });
+  const sum = document.createElement('span');
+  sum.id = 'log-sum';
+  row.appendChild(sum);
+  logPanel.appendChild(row);
+  const box = document.createElement('div');
+  box.id = 'log-lines';
+  logPanel.appendChild(box);
+  updateLogLines(true);
+}
+
+function updateLogLines(force) {
+  const n = logLoadCount();
+  btnLog.textContent = n ? 'Log ⚠' + n : 'Log';
+  btnLog.classList.toggle('danger', n > 0);
+  if (logPanel.hidden) return;
+  const sum = document.getElementById('log-sum');
+  if (sum) {
+    sum.className = 'sum' + (n ? ' bad' : '');
+    sum.textContent = n ? 'ไม่ไหว: ' + n + ' ข้อความ overload ใน 60 วิ (แถวที่ไฮไลต์)'
+                        : 'ไม่มีข้อความ overload ใน 60 วิ';
+  }
+  if (logPaused || !(force || logDirty)) return;
+  logDirty = false;
+  const box = document.getElementById('log-lines');
+  if (!box) return;
+  box.innerHTML = '';
+  for (const l of logLines) {
+    if (logWarnOnly && !l.load && (l.lvl === 'D' || l.lvl === 'I')) continue;
+    const d = document.createElement('div');
+    d.className = l.lvl + (l.load ? ' load' : '');
+    d.textContent = new Date(l.t).toTimeString().slice(0, 8) + ' ' + l.text;
+    box.appendChild(d);
+  }
+  box.scrollTop = box.scrollHeight;
+}
+setInterval(() => updateLogLines(false), 500);
+
+btnLog.addEventListener('click', () => {
+  if (logPanel.hidden) {
+    hideConfirm(); stationPanel.hidden = true; bagPanel.hidden = true;
+    logPanel.hidden = false; renderLogPanel();
+  } else logPanel.hidden = true;
+});
 
 // ---------- map state ----------
 let mapInfo = null;   // {resolution, widthCells, heightCells, originX, originY, originTheta}
@@ -957,7 +1067,7 @@ function sendToStation(s) {
 }
 
 document.getElementById('btn-stations').addEventListener('click', () => {
-  if (stationPanel.hidden) { hideConfirm(); bagPanel.hidden = true; renderStationPanel(); stationPanel.hidden = false; }
+  if (stationPanel.hidden) { hideConfirm(); bagPanel.hidden = true; logPanel.hidden = true; renderStationPanel(); stationPanel.hidden = false; }
   else stationPanel.hidden = true;
 });
 
@@ -1117,7 +1227,7 @@ function renderBagPanel() {
 }
 
 btnBag.addEventListener('click', () => {
-  if (bagPanel.hidden) { hideConfirm(); stationPanel.hidden = true; renderBagPanel(); bagPanel.hidden = false; }
+  if (bagPanel.hidden) { hideConfirm(); stationPanel.hidden = true; logPanel.hidden = true; renderBagPanel(); bagPanel.hidden = false; }
   else bagPanel.hidden = true;
 });
 

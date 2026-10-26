@@ -64,6 +64,9 @@ class ROSBoardNode(object):
         # last time data arrived for a particular topic
         # dict of topic_name -> float (time in seconds)
         self.last_data_times_by_topic = {}
+        self.ROSOUT_MAX_PER_S = 30
+        self.rosout_window_start = 0.0
+        self.rosout_count = 0
         # Latched topics (/map, /tf_static) are published once per publisher.
         # They must never be rate-limited (several /tf_static publishers -
         # robot_state_publisher, camera static TF - deliver their one-shot
@@ -840,7 +843,16 @@ class ROSBoardNode(object):
         topic_name, topic_type = topic_info
         t = time.time()
         latched = topic_name in LATCHED_TOPICS
-        if not latched and \
+        if topic_name == "/rosout":
+            # Log lines are discrete events - the normal "latest value at N Hz"
+            # throttle would silently drop most of a burst. Pass every line,
+            # capped at ROSOUT_MAX_PER_S so a log storm can't flood the WiFi.
+            if t - self.rosout_window_start >= 1.0:
+                self.rosout_window_start, self.rosout_count = t, 0
+            self.rosout_count += 1
+            if self.rosout_count > self.ROSOUT_MAX_PER_S:
+                return
+        elif not latched and \
                 t - self.last_data_times_by_topic.get(topic_name, 0) < self.update_intervals_by_topic[topic_name] - 1e-4:
             return
 
