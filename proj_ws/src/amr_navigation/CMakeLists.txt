@@ -17,6 +17,7 @@ install(PROGRAMS
   scripts/slip_localization_node.py
   scripts/imu_watchdog_node.py
   scripts/local_plan_relay_node.py
+  scripts/map_edit.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
