@@ -68,7 +68,7 @@ def restamp(pose_stamped, navigator):
     return pose_stamped
 
 
-SLIP_FAULT_S = 3.0       # s of continuous slip before the robot is stopped
+SLIP_FAULT_S = 6.0       # s of continuous slip before the robot is stopped (was 3.0: stopped too often)
 SLIP_RESUME_S = 3.0      # s slip-free before the stopped request is resent (once)
 
 APPROACH_DIST = 1.0      # m - pre-goal distance behind the station
