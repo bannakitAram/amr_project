@@ -2186,14 +2186,54 @@ class AmrControlPanel(tk.Tk):
         par.bind('<Configure>', lambda _e: cv.configure(scrollregion=cv.bbox('all')))
         cv.bind('<Configure>', lambda e: cv.itemconfigure(win, width=e.width))
 
+        # bound on 'all' (plus the class bindings, which still run) and
+        # filtered to widgets inside this tab, so buttons/labels scroll too
+        inside = str(outer) + '.'
+
+        def mine(e):
+            return isinstance(e.widget, tk.Misc) and str(e.widget).startswith(inside) \
+                and e.widget is not sb
+
         def wheel(e):
-            cv.yview_scroll(-1 if (e.num == 4 or getattr(e, 'delta', 0) > 0) else 1, 'units')
+            if mine(e):
+                cv.yview_scroll(-1 if (e.num == 4 or getattr(e, 'delta', 0) > 0) else 1, 'units')
         for seq in ('<Button-4>', '<Button-5>', '<MouseWheel>'):
-            outer.bind(seq, wheel)
-        outer.bind('<Enter>', lambda _e: [cv.bind_all(s, wheel) for s in
-                                          ('<Button-4>', '<Button-5>', '<MouseWheel>')])
-        outer.bind('<Leave>', lambda _e: [cv.unbind_all(s) for s in
-                                          ('<Button-4>', '<Button-5>', '<MouseWheel>')])
+            cv.bind_all(seq, wheel, add='+')
+
+        # finger drag scrolls like a phone. Past DRAG_PX it is a drag, not a
+        # tap: the pressed tk.Button's command is unhooked until after its
+        # release (class binding runs before 'all'), so no accidental +/-
+        # or Save while scrolling.
+        DRAG_PX = px(12)
+        drag = {'y': None, 'top': 0.0, 'on': False}
+
+        def press(e):
+            drag.update(y=e.y_root, top=cv.yview()[0], on=False, w=e.widget) if mine(e) \
+                else drag.update(y=None)
+
+        def motion(e):
+            if drag['y'] is None:
+                return
+            dy = e.y_root - drag['y']
+            if not drag['on'] and abs(dy) < DRAG_PX:
+                return
+            if not drag['on']:
+                drag['on'] = True
+                w = drag['w']
+                if isinstance(w, tk.Button):
+                    drag['cmd'] = (w, w.cget('command'))
+                    w.config(command='')
+            total = cv.bbox('all')[3] if cv.bbox('all') else 1
+            cv.yview_moveto(drag['top'] - dy / max(total, 1))
+
+        def release(_e):
+            drag['y'] = None
+            held = drag.pop('cmd', None)
+            if held:
+                held[0].after_idle(lambda: held[0].config(command=held[1]))
+        cv.bind_all('<ButtonPress-1>', press, add='+')
+        cv.bind_all('<B1-Motion>', motion, add='+')
+        cv.bind_all('<ButtonRelease-1>', release, add='+')
 
         par.columnconfigure(0, weight=3)
         par.columnconfigure(1, weight=2)
