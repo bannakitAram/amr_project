@@ -340,6 +340,14 @@ NAV_PARAM_SPECS = [
     ('acc_rot', 'เร่งหมุน (α)', 'rad/s²', 0.30, 2.00, 0.10, '{:.2f}'),
     ('dec_rot', 'เบรกหมุน', 'rad/s²', 0.50, 2.00, 0.10, '{:.2f}'),
 ]
+# "ค่า Default" button: the values the robot was tested with (nav2_params.yaml
+# on 2026-10-26, bare chassis footprint). Loads into the editor only - Save
+# still asks for confirmation. Update this when a new tested set is tagged.
+NAV_PARAM_DEFAULTS = {
+    'v_max': 0.30, 'w_max': 0.70, 'inflation': 0.55, 'goal_tol': 0.10,
+    'fp_front': 0.49, 'fp_rear': 0.49, 'fp_left': 0.26, 'fp_right': 0.26,
+    'acc_lin': 0.30, 'dec_lin': 0.50, 'acc_rot': 0.50, 'dec_rot': 1.00,
+}
 STOP_LATENCY_S = 0.2      # cmd -> wheels, used for the stop-distance note
 FRONT_STOP_DEPTH = 0.35   # m ahead of the bumper (matches nav2_params.yaml)
 FRONT_STOP_MARGIN = 0.03  # m each side beyond the footprint half-width
@@ -514,6 +522,7 @@ EN = {
         'robot or payload - not how far the payload sticks out',
     'บันทึกลงไฟล์': 'Save to file',
     'คืนค่าจากไฟล์': 'Revert',
+    'ค่า Default': 'Defaults',
     'อ่านไฟล์ไม่ได้ - แก้ผ่านไฟล์เท่านั้น': 'Cannot parse file - edit the file directly',
     'รัศมีมุมหุ่น': 'Corner radius',
     '⚠ inflation น้อยกว่ารัศมีมุมหุ่น - หุ่นอาจวิ่งเฉียดสิ่งกีดขวางตอนหมุน':
@@ -2264,6 +2273,7 @@ class AmrControlPanel(tk.Tk):
         self.btn_param_save = self._btn(btns, 'บันทึกลงไฟล์', self._on_param_save, kind='warn')
         self.btn_param_save.pack(side='left', fill='x', expand=True, padx=(0, px(4)))
         self._btn(btns, 'คืนค่าจากไฟล์', self._load_params).pack(side='left')
+        self._btn(btns, 'ค่า Default', self._default_params).pack(side='left', padx=(px(4), 0))
         self._load_params()
 
     def _load_params(self):
@@ -2275,6 +2285,12 @@ class AmrControlPanel(tk.Tk):
             self._param_file = {}
             self._param_error = str(e)
         self._param_edit = dict(self._param_file)
+        self._refresh_params()
+
+    def _default_params(self):
+        if self._param_error:
+            return
+        self._param_edit = dict(NAV_PARAM_DEFAULTS)
         self._refresh_params()
 
     def _adjust_param(self, key, delta):
