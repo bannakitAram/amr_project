@@ -340,6 +340,30 @@ def main():
         elif level == 'warn':
             navigator.get_logger().warn('nav_goal_executor_node: ' + text)
 
+    def cancel_and_wait(timeout=3.0):
+        """Cancel the active Nav2 task and wait until bt_navigator has really
+        finished it. A goal sent while the cancel is still being processed is
+        queued as a preempt, and the cancel then aborts that new goal too
+        (seen 2026-10-26 11:42:44: re-sent station -> 'pre-goal failed')."""
+        navigator.cancelTask()
+        fut = navigator.result_future
+        if fut is not None:
+            rclpy.spin_until_future_complete(navigator, fut, timeout_sec=timeout)
+            if not fut.done():
+                navigator.get_logger().warn(
+                    'nav_goal_executor_node: previous task did not finish '
+                    'cancelling within %.0f s' % timeout)
+
+    def sent(ok, what):
+        """Book-keeping after goToPose/goThroughPoses; False = rejected."""
+        if ok:
+            task_active['value'] = True
+            return True
+        station['value'] = None
+        current['req'] = None
+        alert('error', 'Nav2 rejected the %s - send it again' % what)
+        return False
+
     def stop_all():
         if task_active['value']:
             navigator.cancelTask()
@@ -366,7 +390,7 @@ def main():
                 pending['value'] = None
 
                 if task_active['value']:
-                    navigator.cancelTask()
+                    cancel_and_wait()
                     task_active['value'] = False
                 if approach['value'] is not None:
                     approach['value'].finish('failed', 'approach interrupted')
@@ -382,8 +406,7 @@ def main():
                     navigator.get_logger().info(
                         'nav_goal_executor_node: new goal (%.2f, %.2f)'
                         % (msg.pose.position.x, msg.pose.position.y))
-                    navigator.goToPose(restamp(msg, navigator))
-                    task_active['value'] = True
+                    sent(navigator.goToPose(restamp(msg, navigator)), 'goal')
                 elif kind == 'station':
                     e = station_errors(tf_buffer, msg.pose.position.x, msg.pose.position.y,
                                        yaw_of(msg.pose.orientation))
@@ -400,9 +423,8 @@ def main():
                         'nav_goal_executor_node: station (%.2f, %.2f) - pre-goal (%.2f, %.2f)'
                         % (msg.pose.position.x, msg.pose.position.y,
                            pre.pose.position.x, pre.pose.position.y))
-                    navigator.goToPose(restamp(pre, navigator))
                     station['value'] = msg
-                    task_active['value'] = True
+                    sent(navigator.goToPose(restamp(pre, navigator)), 'station pre-goal')
                 elif kind == 'path':
                     if not msg.poses:
                         continue
@@ -410,8 +432,7 @@ def main():
                         'nav_goal_executor_node: new path with %d waypoints'
                         % len(msg.poses))
                     poses = [restamp(p, navigator) for p in msg.poses]
-                    navigator.goThroughPoses(poses)
-                    task_active['value'] = True
+                    sent(navigator.goThroughPoses(poses), 'path')
                 else:  # 'cancel'
                     navigator.get_logger().info('nav_goal_executor_node: goal cancelled by operator')
 
