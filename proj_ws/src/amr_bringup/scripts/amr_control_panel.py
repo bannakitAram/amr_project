@@ -778,6 +778,7 @@ class RosBridge:
         self.map_msg = None
         self.map_seq = 0
         self.watchdog = {}      # name -> (bool, t)
+        self.hook_state = None  # latest /hook/state text (hook_bridge.py)
         self.rates = {'scan': collections.deque(maxlen=60),
                       'odom': collections.deque(maxlen=120),
                       'imu': collections.deque(maxlen=400)}
@@ -880,6 +881,12 @@ class RosBridge:
                               reliability=ReliabilityPolicy.RELIABLE)
         node.create_subscription(Bool, '/scan_gate/enabled', on_gate, gate_qos)
 
+        # hook_bridge.py publishes only on change (latched), so liveness is
+        # checked with hook_alive() rather than message age.
+        def on_hook(m):
+            self.hook_state = m.data
+        node.create_subscription(String, '/hook/state', on_hook, gate_qos)
+
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(node)
         threading.Thread(target=self._spin, daemon=True).start()
@@ -891,6 +898,11 @@ class RosBridge:
             pass
 
     # ----- queries -----
+    def hook_alive(self):
+        """True while hook_bridge is running (the latched value alone would
+        keep showing the last state after the bridge died)."""
+        return self.ok and self.node.count_publishers('/hook/state') > 0
+
     def pose(self):
         """(x, y, yaw) of base_footprint in map, or None."""
         if not self.ok:
@@ -1385,6 +1397,7 @@ class AmrControlPanel(tk.Tk):
         self.pill_safety = pill('Safety —')
         self.pill_net = pill('Net —')
         self.pill_batt = pill('Batt —')
+        self.pill_hook = pill('Hook —')
 
         st = tk.Frame(h, bg=SURFACE)
         st.pack(side='right', padx=px(10))
@@ -2392,6 +2405,21 @@ class AmrControlPanel(tk.Tk):
                if self._proc is not None else 'ค่าใหม่มีผลเมื่อเริ่มระบบครั้งถัดไป'))
 
     # ---------- periodic UI refresh ----------
+    def _update_hook_pill(self):
+        st = self.ros.hook_state if self.ros.hook_alive() else None
+        if not st:
+            self.pill_hook.config(text='Hook —', bg=SURFACE_2, fg=TEXT_MUTED)
+        elif st.startswith('FAULT') or st == 'UNKNOWN':
+            self.pill_hook.config(text=f'Hook {st}', bg=RED, fg='white')
+        elif st.startswith('MOVING'):
+            arrow = '▲' if st == 'MOVING_UP' else '▼'
+            self.pill_hook.config(text=f'Hook {arrow} moving', bg=AMBER_DARK, fg='white')
+        elif st in ('UP', 'DOWN'):
+            arrow = '▲' if st == 'UP' else '▼'
+            self.pill_hook.config(text=f'Hook {arrow} {st}', bg=BLUE_DARK, fg='white')
+        else:  # IDLE: between the limits
+            self.pill_hook.config(text='Hook mid', bg=AMBER_DARK, fg='white')
+
     def _tick(self):
         try:
             self._tick_inner()
@@ -2426,6 +2454,7 @@ class AmrControlPanel(tk.Tk):
             self.pill_safety.config(text='Safety OK', bg=GREEN_DARK, fg='white')
         else:
             self.pill_safety.config(text='SENSOR FAULT', bg=RED, fg='white')
+        self._update_hook_pill()
 
         page = self._page
         pose = self.ros.pose()
