@@ -199,6 +199,11 @@ class ROSBoardNode(object):
         self.bag_topics = []
         self.bag_started = 0.0
         self.bag_error = ""
+        # stop-distance analysis of the last bag (amr_bringup's
+        # stop_distance_from_bag.py), run on request from the bag panel
+        self.stop_proc_busy = False
+        self.stop_result = ""
+        self.stop_ok = None
         self.bag_lock = threading.Lock()
         self.bag_state_pub = rospy.Publisher("/rosboard_bag_state", String, queue_size=1)
         threading.Thread(target=self.bag_state_loop, daemon=True).start()
@@ -325,6 +330,30 @@ class ROSBoardNode(object):
                 rospy.loginfo("bag record start: %s %s" % (self.bag_name, " ".join(topics)))
             elif action == "stop":
                 self._bag_stop()
+            elif action == "stop_dist":
+                # last finished bag only; path is ours, never from the browser
+                if self.bag_proc is not None or self.stop_proc_busy or not self.bag_name:
+                    return
+                self.stop_proc_busy = True
+                self.stop_result = ""
+                self.stop_ok = None
+                threading.Thread(target=self._run_stop_dist,
+                                 args=(os.path.join(self.bag_dir, self.bag_name),),
+                                 daemon=True).start()
+        self.publish_bag_state()
+
+    def _run_stop_dist(self, path):
+        try:
+            r = subprocess.run(
+                ["ros2", "run", "amr_bringup", "stop_distance_from_bag.py", path],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120, text=True)
+            # drop rosbag2's [INFO] lines; keep the tail so the message stays small
+            lines = [l for l in r.stdout.splitlines() if not l.startswith("[INFO]")]
+            text, ok = "\n".join(lines)[-4000:], r.returncode == 0
+        except (OSError, subprocess.TimeoutExpired) as e:
+            text, ok = "analysis failed: %s" % e, False
+        with self.bag_lock:
+            self.stop_result, self.stop_ok, self.stop_proc_busy = text, ok, False
         self.publish_bag_state()
 
     def _bag_stop(self):
@@ -352,6 +381,9 @@ class ROSBoardNode(object):
             "max_s": self.BAG_MAX_DURATION_S,
             "dir": self.bag_dir,
             "error": self.bag_error,
+            "stop_busy": self.stop_proc_busy,
+            "stop_result": self.stop_result,
+            "stop_ok": self.stop_ok,
         })))
 
     def bag_state_loop(self):

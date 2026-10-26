@@ -104,6 +104,12 @@
   #bag-panel label { display: block; padding: 5px 2px; word-break: break-all; }
   #bag-panel label .type { color: #888; font-size: 11px; }
   #bag-panel input[type=checkbox] { transform: scale(1.3); margin-right: 8px; }
+  #stop-result { white-space: pre-wrap; font-family: monospace; font-size: 11px;
+                 background: #111; border-radius: 6px; padding: 6px; margin: 6px 0;
+                 max-height: 40vh; overflow: auto; }
+  #stop-result.pass { border-left: 4px solid #2e7d32; }
+  #stop-result.fail { border-left: 4px solid #c62828; }
+  #stop-result[hidden] { display: none; }
   #bag-badge {
     position: absolute; right: 10px; top: 72px;
     padding: 4px 10px; border-radius: 6px;
@@ -962,6 +968,9 @@ document.getElementById('btn-stations').addEventListener('click', () => {
 const bagPanel = document.getElementById('bag-panel');
 const bagBadge = document.getElementById('bag-badge');
 const btnBag = document.getElementById('btn-bag');
+// topics stop_distance_from_bag.py needs (stop-distance test preset)
+const STOP_TOPICS = ['/cmd_vel', '/cmd_vel_smoothed', '/cmd_vel_nav', '/odometry/filtered',
+                     '/wheel/odom', '/scan_filtered', '/tf_static'];
 // big topics: warn, they can fill the disk / load the Jetson
 const BAG_HEAVY_TYPES = /PointCloud2|Image|OccupancyGrid/;
 let allTopics = {};   // name -> type, from rosboard's topic list
@@ -1016,6 +1025,19 @@ function renderBagStatus() {
   const rec = fresh && bagState.recording;
   if (start) start.disabled = rec || bagSelected.size === 0;
   if (stop) stop.disabled = !rec;
+  const ana = document.getElementById('bag-stopdist');
+  const busy = fresh && bagState.stop_busy;
+  if (ana) {
+    ana.disabled = !fresh || rec || busy || !bagState.name;
+    ana.textContent = busy ? 'กำลังวิเคราะห์...' : 'วิเคราะห์ระยะหยุด';
+  }
+  const res = document.getElementById('stop-result');
+  if (res) {
+    const txt = fresh && bagState.stop_result;
+    res.hidden = !txt;
+    res.textContent = txt || '';
+    res.className = !txt ? '' : (bagState.stop_ok ? 'pass' : 'fail');
+  }
   for (const cb of bagPanel.querySelectorAll('input[type=checkbox]')) cb.disabled = rec;
 }
 
@@ -1044,6 +1066,28 @@ function renderBagPanel() {
   mk('bag-stop', 'danger', 'หยุดบันทึก', () => transport.bagCmd({action: 'stop'}));
   mk('bag-none', '', 'ล้างที่เลือก', () => { bagSelected.clear(); saveBagSelection(); renderBagPanel(); });
   bagPanel.appendChild(row);
+
+  // stop-distance test: tick the topics the analysis needs, record the
+  // runs, stop, then analyse the last bag on the robot (result below)
+  const row2 = document.createElement('div');
+  row2.className = 'row';
+  const mk2 = (id, cls, text, fn) => {
+    const b = document.createElement('button');
+    b.id = id; b.className = 'btn ' + cls; b.textContent = text; b.onclick = fn;
+    row2.appendChild(b);
+  };
+  mk2('bag-stoptopics', '', 'เลือก topic ทดสอบระยะหยุด', () => {
+    const missing = STOP_TOPICS.filter(t => !(t in allTopics));
+    STOP_TOPICS.filter(t => t in allTopics).forEach(t => bagSelected.add(t));
+    saveBagSelection(); renderBagPanel();
+    if (missing.length) alert('ไม่พบ topic: ' + missing.join(', ') + '\nเปิด Navigation ก่อน');
+  });
+  mk2('bag-stopdist', 'primary', 'วิเคราะห์ระยะหยุด', () => transport.bagCmd({action: 'stop_dist'}));
+  bagPanel.appendChild(row2);
+  const res = document.createElement('div');
+  res.id = 'stop-result';
+  res.hidden = true;
+  bagPanel.appendChild(res);
 
   const names = Object.keys(allTopics).sort();
   if (!names.length) {

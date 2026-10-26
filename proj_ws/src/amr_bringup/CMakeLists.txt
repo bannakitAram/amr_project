@@ -24,6 +24,7 @@ install(PROGRAMS
   scripts/depth_watchdog_node.py
   scripts/slip_ratio_from_bag.py
   scripts/accel_slip_test_node.py
+  scripts/stop_distance_from_bag.py
   scripts/hook_bridge.py
   DESTINATION lib/${PROJECT_NAME}
 )
