@@ -1370,15 +1370,20 @@ class AmrControlPanel(tk.Tk):
     def _set_card_enabled(self, card, enabled):
         self._set_btn_state(card, enabled)
 
-    def _stepper(self, parent, label, value_text, on_minus, on_plus, width=8):
+    def _stepper(self, parent, label, value_text, on_minus, on_plus, width=8,
+                 big=False):
+        # big: >= 48 px (design units) touch targets, e.g. the Parameters tab
+        btn_font, bpx, bpy = ((self.f_huge, px(26), px(10)) if big
+                              else (self.f_button, px(16), px(8)))
         row = tk.Frame(parent, bg=SURFACE)
         if label:
             self._label(row, label, width=7, anchor='w').pack(side='left')
-        minus = self._btn(row, '−', on_minus, font=self.f_button, padx=px(16), pady=px(8))
+        minus = self._btn(row, '−', on_minus, font=btn_font, padx=bpx, pady=bpy)
         minus.pack(side='left')
-        val = self._label(row, value_text, width=width, anchor='center')
+        val = self._label(row, value_text, width=width, anchor='center',
+                          font=self.f_button if big else None)
         val.pack(side='left', padx=px(4))
-        plus = self._btn(row, '+', on_plus, font=self.f_button, padx=px(16), pady=px(8))
+        plus = self._btn(row, '+', on_plus, font=btn_font, padx=bpx, pady=bpy)
         plus.pack(side='left')
         return row, minus, val, plus
 
@@ -2432,8 +2437,8 @@ class AmrControlPanel(tk.Tk):
             self._label(left, label, anchor='w', width=20).grid(row=r, column=0, sticky='w')
             row, minus, val, plus = self._stepper(
                 left, '', '', lambda k=key, st=step: self._adjust_param(k, -st),
-                lambda k=key, st=step: self._adjust_param(k, st), width=7)
-            row.grid(row=r, column=1, sticky='w', pady=px(3))
+                lambda k=key, st=step: self._adjust_param(k, st), width=6, big=True)
+            row.grid(row=r, column=1, sticky='w', pady=px(4))
             rng = self._label(left, f'{unit}  ({fmt.format(lo)}–{fmt.format(hi)})',
                               font=self.f_small, fg=TEXT_MUTED, anchor='w')
             rng.grid(row=r, column=2, sticky='w', padx=px(8))
