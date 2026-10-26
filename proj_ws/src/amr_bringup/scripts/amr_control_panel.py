@@ -730,8 +730,70 @@ EN = {
     'แผนที่แบบ Foxglove (Lichtblick) ด้านบน + จอย': 'Foxglove-style map (Lichtblick) on top + joy',
     'สติ๊กควบคุมขับ (rosboard 🕹) ด้านล่าง - ': 'stick drive (rosboard 🕹) below - ',
     'โหลดครั้งแรกอาจช้าสักครู่ (~170MB ผ่าน LAN)': 'first load may be slow (~170MB over LAN)',
+    # Parameters tab
+    'เร่ง (accel)': 'Accel',
+    'เบรก (decel)': 'Decel',
+    'เร่งหมุน (α)': 'Rot. accel (α)',
+    'เบรกหมุน': 'Rot. decel',
+    'ระยะหยุดโดยประมาณที่ v_max': 'Estimated stop distance at v_max',
+    '(รวม latency': '(incl. latency',
+    'accel/decel ใช้กับ Navigation (velocity_smoother) เท่านั้น - '
+    'teleop/joystick ส่ง /cmd_vel ตรง ใช้ ramp ของ STM32 (0.5 / 1.2)':
+        'accel/decel apply to Navigation (velocity_smoother) only - '
+        'teleop/joystick sends /cmd_vel directly and uses the STM32 ramp (0.5 / 1.2)',
+    '⚠ accel มากกว่า decel - ควรให้ decel ≥ accel': '⚠ accel > decel - keep decel ≥ accel',
+    '⚠ ระยะหยุดเกิน 80% ของความลึก FrontStop - เพิ่ม decel หรือลด v_max':
+        '⚠ stop distance > 80% of FrontStop depth - raise decel or lower v_max',
+    'เขียน nav2_params.yaml + laser_filter.yaml แล้ว (git tree เป็น -dirty)\n':
+        'nav2_params.yaml + laser_filter.yaml written (git tree is now -dirty)\n',
+    # Map placeholder / map picker / stations
+    'แผนที่ดูบนมือถือ\n(ปุ่ม QR มือถือ → หน้า Goal Picker)':
+        'Map is shown on the phone\n(Phone QR button → Goal Picker page)',
+    'แผนที่ ': 'Map ',
+    'มี Station "': 'Station "',
+    '" อยู่แล้ว - ย้ายไปตำแหน่งปัจจุบัน (ทับของเดิม)?':
+        '" already exists - move it to the current pose (overwrite)?',
+    ' เมตร มุม ': ' m, angle ',
+    # Map Edit
+    'แก้ไขแผนที่': 'Map Edit',
+    'แก้ไขแผนที่: ': 'Map Edit: ',
+    'แก้ไขแผนที่นี้': 'Edit this map',
+    'เลือกแผนที่ที่จะแก้ไข': 'Select a map to edit',
+    'ขั้นตอน: ① เปิดแก้ใน Pinta → Save → ② ตรวจ → ③ บันทึก':
+        'Steps: ① edit in Pinta → Save → ② review → ③ save',
+    '① เปิดแก้ใน Pinta': '① Edit in Pinta',
+    '② ตรวจการเปลี่ยนแปลง': '② Review changes',
+    '③ บันทึกเป็นแผนที่ใหม่': '③ Save as new map',
+    'ใน Pinta: ใช้ Pencil + ปิด Antialiasing · ดำ 000000 = สิ่งกีดขวาง · ขาว FEFEFE = ที่ว่าง · '
+    'เทา CDCDCD = unknown\nห้ามครอป/ย่อ/หมุนภาพ · กด Save (PNG) ใน Pinta แล้วกลับมากดขั้นที่ 2':
+        'In Pinta: Pencil tool, antialiasing off · black 000000 = obstacle · white FEFEFE = free · '
+        'grey CDCDCD = unknown\nDo not crop/resize/rotate · Save (PNG) in Pinta, then come back for step 2',
+    '\nแก้เสร็จแล้วกด Save ใน Pinta (PNG) แล้วกดขั้นที่ 2':
+        '\nWhen done, Save in Pinta (PNG), then press step 2',
+    '\nแก้ไฟล์นี้ด้วยโปรแกรมอื่นได้: ': '\nYou can also edit this file with another program: ',
+    'เปิด Pinta ไม่ได้: ': 'Cannot open Pinta: ',
+    'เปิด Pinta: ': 'Opening Pinta: ',
+    'มีไฟล์ที่แก้ค้างไว้ (': 'An edited file already exists (',
+    ')\nYes = แก้ต่อจากไฟล์เดิม\nNo = เริ่มใหม่จากแผนที่ต้นฉบับ':
+        ')\nYes = continue that edit\nNo = start over from the original map',
+    'ยังไม่มีไฟล์ที่แก้ - กดขั้นที่ 1 ก่อน': 'No edited file yet - do step 1 first',
+    'บันทึกเป็นแผนที่ใหม่ (ไม่ทับแผนที่เดิม)?': 'Save as a new map (the original is kept)?',
+    '\n\n⚠ มีสิ่งกีดขวางถูกลบออก - ตรวจหน้างานจริงทุกจุดใน list ว่าไม่มีของอยู่แล้ว':
+        '\n\n⚠ Obstacles were removed - check every listed spot on site is really clear',
+    '\n\nเลือกแผนที่ใหม่ได้ตอนเริ่ม Navigation · ทดสอบวิ่งทุกเส้นทางก่อนใช้ในไลน์ · commit แผนที่ใหม่เข้า git':
+        '\n\nPick the new map when starting Navigation · test-drive every route before line use · '
+        'commit the new map to git',
 }
-_EN_FRAGMENTS = sorted(EN.items(), key=lambda kv: -len(kv[0]))
+# Thai has no spaces between words, so a short one-word key used as a
+# fragment matches inside other words ("ปิด" close inside "เปิด" open,
+# "ตรง" straight inside a sentence). Only keys that carry their own
+# boundary (space/punctuation/latin/digit) or are long phrases are used as
+# fragments; short single words translate only as a whole string.
+_THAI_ONLY_RE = re.compile('^[\u0e00-\u0e7f]+$')
+_EN_FRAGMENTS = sorted(
+    ((k, v) for k, v in EN.items()
+     if not (_THAI_ONLY_RE.match(k) and len(k) < 10)),
+    key=lambda kv: -len(kv[0]))
 _THAI_RE = re.compile('[฀-๿]')
 
 
@@ -1365,6 +1427,10 @@ class AmrControlPanel(tk.Tk):
                 f.write(_LANG['cur'])
         except OSError:
             pass
+        # Notes built from several T() pieces are rebuilt in the new
+        # language (the walker can only re-translate whole strings).
+        if getattr(self, '_param_widgets', None):
+            self._refresh_params()
         self._i18n_walk()
 
     def _set_card_enabled(self, card, enabled):
