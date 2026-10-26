@@ -16,10 +16,10 @@ scan_to_scan_filter_chain:
       type: laser_filters/LaserScanBoxFilter
       params:
         box_frame: base_footprint
-        min_x: -0.50
+        min_x: -0.59
         max_x: 0.50
-        min_y: -0.27
-        max_y: 0.27
+        min_y: -0.39
+        max_y: 0.39
         min_z: -1.0
         max_z: 2.0
         invert: false        # false = drop points INSIDE the box

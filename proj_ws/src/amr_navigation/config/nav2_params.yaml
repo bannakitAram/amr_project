@@ -195,7 +195,7 @@ controller_server:
       # action, not everyday driving.
       vx_min: 0.0
       vy_max: 0.0
-      wz_max: 0.70    # was 1.0 - wheels slip badly when turning fast
+      wz_max: 0.50    # was 1.0 - wheels slip badly when turning fast
       iteration_count: 1
       prune_distance: 1.7
       transform_tolerance: 0.2
@@ -298,7 +298,7 @@ local_costmap:
       # (base_depth=0.951, base_width=0.496, centered on base_link), rounded
       # up ~1.5cm/side to cover the drive wheels poking slightly past the
       # base box on Y. Rectangle corners, base_link frame, X forward/Y left.
-      footprint: "[[0.49, 0.26], [0.49, -0.26], [-0.49, -0.26], [-0.49, 0.26]]"
+      footprint: "[[0.49, 0.38], [0.49, -0.38], [-0.58, -0.38], [-0.58, 0.38]]"
       # stvl_layer is configured below but NOT loaded: inside controller_server
       # it marks nothing (0 voxels, 2026-10-05), while the same params in a
       # standalone costmap work. Until that is fixed, depth only feeds
@@ -397,7 +397,7 @@ global_costmap:
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_footprint
-      footprint: "[[0.49, 0.26], [0.49, -0.26], [-0.49, -0.26], [-0.49, 0.26]]"
+      footprint: "[[0.49, 0.38], [0.49, -0.38], [-0.58, -0.38], [-0.58, 0.38]]"
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -471,7 +471,7 @@ behavior_server:
     robot_base_frame: base_footprint
     transform_tolerance: 0.2
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.70   # was 1.0 - match MPPI wz_max
+    max_rotational_vel: 0.50   # was 1.0 - match MPPI wz_max
     min_rotational_vel: 0.4
     rotational_acc_lim: 1.0   # was 2.0 - reduce slip during Spin recovery
 
@@ -492,12 +492,12 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.30, 0.0, 0.70]    # angular was 1.0 - match MPPI wz_max
-    min_velocity: [-0.30, 0.0, -0.70]
+    max_velocity: [0.30, 0.0, 0.50]    # angular was 1.0 - match MPPI wz_max
+    min_velocity: [-0.30, 0.0, -0.50]
     # Lowered to reduce wheel slip on start/stop (was 1.0/2.0: 0 -> 0.2 m/s
     # in 0.2 s). Decel kept steeper than accel so stopping distance stays
     # short: 0.2 m/s -> 0 in 0.4 s (~4 cm).
-    max_accel: [0.30, 0.0, 0.50]
+    max_accel: [0.20, 0.0, 0.40]
     max_decel: [-0.50, 0.0, -1.00]
     odom_topic: "/odometry/filtered"
     odom_duration: 0.1
@@ -531,7 +531,7 @@ collision_monitor:
       type: "polygon"
       action_type: "stop"
       # x,y pairs in base_footprint: bumper (0.49) .. +0.35 m, width +-0.29
-      points: [0.84, 0.29, 0.84, -0.29, 0.49, -0.29, 0.49, 0.29]
+      points: [0.84, 0.41, 0.84, -0.41, 0.49, -0.41, 0.49, 0.41]
       max_points: 5          # Humble: act when MORE than this many points inside
       visualize: True
       polygon_pub_topic: "polygon_front_stop"
