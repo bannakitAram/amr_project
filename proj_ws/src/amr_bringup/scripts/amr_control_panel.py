@@ -29,6 +29,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -54,6 +55,7 @@ NAV2_PARAMS = os.path.normpath(os.path.join(MAPS_DIR, '..', 'config', 'nav2_para
 LASER_FILTER = os.path.normpath(os.path.join(
     MAPS_DIR, '..', '..', 'amr_bringup', 'config', 'laser_filter.yaml'))
 REPO_DIR = os.path.normpath(os.path.join(MAPS_DIR, '..', '..', '..', '..'))
+MAP_EDIT = os.path.normpath(os.path.join(MAPS_DIR, '..', 'scripts', 'map_edit.py'))
 
 ROSBOARD_PORT = 8888
 
@@ -1857,11 +1859,112 @@ class AmrControlPanel(tk.Tk):
         for i, (th, en, kind, page) in enumerate((
                 ('สร้างแผนที่', 'Mapping', 'primary', 'mapping'),
                 ('ทดสอบนำทาง', 'Navigation Test', 'info', 'navtest'),
+                ('แก้ไขแผนที่', 'Map Edit', 'neutral', None),
                 ('ตั้งค่า', 'Settings', 'neutral', 'settings'))):
             cards.columnconfigure(i, weight=1, uniform='d')
-            self._make_mode_card(cards, th, en, kind,
-                                 lambda pg=page: self._show_page(pg)
+            cmd = (self._on_map_edit if page is None
+                   else lambda pg=page: self._show_page(pg))
+            self._make_mode_card(cards, th, en, kind, cmd
                                  ).grid(row=0, column=i, sticky='nsew', padx=px(4), pady=(px(0), px(8)))
+
+    # ---------- Map Edit (popup) ----------
+    # Hand-editing goes PGM -> PNG -> Pinta -> PNG -> new PGM through
+    # amr_navigation/scripts/map_edit.py (GIMP's file plug-ins crash on the
+    # Jetson; Pinta cannot write PGM). map_edit.py never overwrites a map:
+    # the result is <map>_eN with a copy of the stations.
+    def _run_map_edit(self, *args):
+        try:
+            r = subprocess.run([sys.executable, MAP_EDIT, *args], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, timeout=60)
+            return r.returncode, r.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return 1, str(e)
+
+    def _on_map_edit(self):
+        yaml_path = self._show_map_picker(title='เลือกแผนที่ที่จะแก้ไข',
+                                          ok_text='แก้ไขแผนที่นี้')
+        if not yaml_path:
+            return
+        name = os.path.splitext(os.path.basename(yaml_path))[0]
+        png = os.path.join(MAPS_DIR, name + '_edit.png')
+
+        win = tk.Toplevel(self)
+        win.title('Map Edit')
+        win.configure(bg=SURFACE)
+        win.transient(self)
+        self._label(win, f'แก้ไขแผนที่: {name}', font=self.f_button
+                    ).pack(padx=px(20), pady=(px(16), px(4)), anchor='w')
+        self._label(win, T('ใน Pinta: ใช้ Pencil + ปิด Antialiasing · ดำ 000000 = สิ่งกีดขวาง · '
+                           'ขาว FEFEFE = ที่ว่าง · เทา CDCDCD = unknown\n'
+                           'ห้ามครอป/ย่อ/หมุนภาพ · กด Save (PNG) ใน Pinta แล้วกลับมากดขั้นที่ 2'),
+                    font=self.f_small, fg=TEXT_MUTED, justify='left'
+                    ).pack(padx=px(20), anchor='w')
+        out = tk.Text(win, height=14, width=78, bg=SURFACE_2, fg=TEXT_MAIN,
+                      font=('Monospace', -px(13)), relief='flat', wrap='word')
+        out.pack(padx=px(20), pady=px(10), fill='both', expand=True)
+
+        def show(text, color=TEXT_MAIN):
+            out.config(state='normal', fg=color)
+            out.delete('1.0', 'end')
+            out.insert('end', text)
+            out.config(state='disabled')
+
+        def open_pinta():
+            if os.path.exists(png):
+                if not messagebox.askyesno(
+                        'Map Edit', f'มีไฟล์ที่แก้ค้างไว้ ({os.path.basename(png)})\n'
+                        'Yes = แก้ต่อจากไฟล์เดิม\nNo = เริ่มใหม่จากแผนที่ต้นฉบับ', parent=win):
+                    rc, txt = self._run_map_edit('to-png', yaml_path, '-o', png, '--force')
+                    if rc:
+                        return show(txt, RED)
+            else:
+                rc, txt = self._run_map_edit('to-png', yaml_path, '-o', png)
+                if rc:
+                    return show(txt, RED)
+            try:
+                subprocess.Popen(['pinta', png], start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                show(f'เปิด Pinta: {png}\nแก้เสร็จแล้วกด Save ใน Pinta (PNG) แล้วกดขั้นที่ 2')
+            except OSError as e:
+                show(f'เปิด Pinta ไม่ได้: {e}\nแก้ไฟล์นี้ด้วยโปรแกรมอื่นได้: {png}', RED)
+
+        def check():
+            if not os.path.exists(png):
+                return show('ยังไม่มีไฟล์ที่แก้ - กดขั้นที่ 1 ก่อน', AMBER), None
+            rc, txt = self._run_map_edit('to-pgm', yaml_path, png, '--dry-run')
+            warn = rc or 'obstacle -> free' in txt or 'WARNING' in txt
+            show(txt, RED if rc else (AMBER if warn else TEXT_MAIN))
+            return txt, rc
+
+        def save():
+            txt, rc = check()
+            if txt is None or rc:
+                return
+            msg = 'บันทึกเป็นแผนที่ใหม่ (ไม่ทับแผนที่เดิม)?'
+            if 'obstacle -> free' in txt:
+                msg += ('\n\n⚠ มีสิ่งกีดขวางถูกลบออก - ตรวจหน้างานจริงทุกจุดใน list '
+                        'ว่าไม่มีของอยู่แล้ว')
+            if not messagebox.askyesno('Map Edit', msg, parent=win):
+                return
+            rc, txt = self._run_map_edit('to-pgm', yaml_path, png)
+            if rc:
+                return show(txt, RED)
+            try:
+                os.remove(png)  # done - next edit starts from the new map
+            except OSError:
+                pass
+            show(txt + '\n\nเลือกแผนที่ใหม่ได้ตอนเริ่ม Navigation · '
+                 'ทดสอบวิ่งทุกเส้นทางก่อนใช้ในไลน์ · commit แผนที่ใหม่เข้า git', GREEN)
+
+        row = tk.Frame(win, bg=SURFACE)
+        row.pack(fill='x', padx=px(20), pady=(0, px(16)))
+        self._btn(row, '① เปิดแก้ใน Pinta', open_pinta, kind='info').pack(side='left')
+        self._btn(row, '② ตรวจการเปลี่ยนแปลง', check).pack(side='left', padx=px(8))
+        self._btn(row, '③ บันทึกเป็นแผนที่ใหม่', save, kind='primary').pack(side='left')
+        self._btn(row, 'ปิด', win.destroy).pack(side='right')
+        show('ขั้นตอน: ① เปิดแก้ใน Pinta → Save → ② ตรวจ → ③ บันทึก')
+        win.update_idletasks()
+        self._center_toplevel(win, win.winfo_reqwidth() + 10, win.winfo_reqheight() + 10)
 
     # ---------- Mapping ----------
     def _build_mapping(self, p):
@@ -2915,7 +3018,7 @@ class AmrControlPanel(tk.Tk):
         win.wait_window()
         return result['idx']
 
-    def _show_map_picker(self):
+    def _show_map_picker(self, title='เลือกแผนที่สำหรับนำทาง', ok_text='เลือกแผนที่นี้'):
         yamls = sorted(glob.glob(os.path.join(MAPS_DIR, '*.yaml')),
                        key=os.path.getmtime, reverse=True)
         yamls = [p for p in yamls if not p.endswith('_stations.yaml')]
@@ -2927,7 +3030,7 @@ class AmrControlPanel(tk.Tk):
         win.configure(bg=SURFACE)
         win.transient(self)
         win.resizable(False, False)
-        self._label(win, 'เลือกแผนที่สำหรับนำทาง', font=self.f_button
+        self._label(win, title, font=self.f_button
                     ).pack(padx=px(20), pady=(px(16), px(8)), anchor='w')
 
         body = tk.Frame(win, bg=SURFACE)
@@ -3002,7 +3105,7 @@ class AmrControlPanel(tk.Tk):
             win.destroy()
 
         self._btn(btn_row, 'ยกเลิก', win.destroy).pack(side='right')
-        self._btn(btn_row, 'เลือกแผนที่นี้', confirm, kind='info', padx=px(24)
+        self._btn(btn_row, ok_text, confirm, kind='info', padx=px(24)
                   ).pack(side='right', padx=(0, px(8)))
 
         lb.bind('<<ListboxSelect>>', show)
