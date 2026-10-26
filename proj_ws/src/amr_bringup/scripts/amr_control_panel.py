@@ -340,13 +340,14 @@ NAV_PARAM_SPECS = [
     ('acc_rot', 'เร่งหมุน (α)', 'rad/s²', 0.30, 2.00, 0.10, '{:.2f}'),
     ('dec_rot', 'เบรกหมุน', 'rad/s²', 0.50, 2.00, 0.10, '{:.2f}'),
 ]
-# "ค่า Default" button: the values the robot was tested with (nav2_params.yaml
-# on 2026-10-26, bare chassis footprint). Loads into the editor only - Save
-# still asks for confirmation. Update this when a new tested set is tagged.
+# "ค่า Default" button: last committed nav2_params.yaml set (9f81a2e,
+# bare chassis footprint; FrontStop/decel were sized for this 0.2 m/s).
+# Loads into the editor only - Save still asks for confirmation. Update
+# this when a new tested set is tagged.
 NAV_PARAM_DEFAULTS = {
-    'v_max': 0.30, 'w_max': 0.70, 'inflation': 0.55, 'goal_tol': 0.10,
+    'v_max': 0.20, 'w_max': 0.50, 'inflation': 0.55, 'goal_tol': 0.10,
     'fp_front': 0.49, 'fp_rear': 0.49, 'fp_left': 0.26, 'fp_right': 0.26,
-    'acc_lin': 0.30, 'dec_lin': 0.50, 'acc_rot': 0.50, 'dec_rot': 1.00,
+    'acc_lin': 0.30, 'dec_lin': 0.50, 'acc_rot': 1.00, 'dec_rot': 1.50,
 }
 STOP_LATENCY_S = 0.2      # cmd -> wheels, used for the stop-distance note
 FRONT_STOP_DEPTH = 0.35   # m ahead of the bumper (matches nav2_params.yaml)
