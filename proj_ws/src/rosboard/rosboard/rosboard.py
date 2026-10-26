@@ -164,6 +164,13 @@ class ROSBoardNode(object):
         threading.Thread(target=self.teleop_state_loop, daemon=True).start()
         self.TELEOP_MAX_ANGULAR = 0.15   # rad/s - kept low so fast in-place turns during Mapping don't hurt SLAM scan-matching
         self.TELEOP_DEADMAN_TIMEOUT = 0.5  # seconds - stop if no joystick update arrives in time
+        # Linear accel ramp for the joystick (it bypasses velocity_smoother).
+        # Only speeding up is ramped: slowing down / stop passes through at
+        # once so releasing the knob still stops at the STM32 decel/brake.
+        # 0.2 = velocity_smoother max_accel with the payload rack.
+        self.TELEOP_MAX_ACCEL = 0.2      # m/s^2
+        self.TELEOP_RAMP_DT_MAX = 0.15   # s - cap per step (first msg / gaps); joystick sends every 0.1 s
+        self.teleop_out_linear = 0.0     # last published linear.x
         threading.Thread(target=self.teleop_watchdog_loop, daemon=True).start()
 
         # --- goal_picker page: navigation goal / path / cancel ---
@@ -445,12 +452,26 @@ class ROSBoardNode(object):
             return max(-limit, min(limit, value))
 
         twist = Twist()
-        twist.linear.x = clamp(linear, self.teleop_effective_max_linear())
+        twist.linear.x = self.teleop_ramp(clamp(linear, self.teleop_effective_max_linear()))
         twist.angular.z = clamp(angular, self.TELEOP_MAX_ANGULAR)
         if twist.linear.x != 0.0 or twist.angular.z != 0.0:
             self.teleop_last_active = time.time()
         self.teleop_pub.publish(twist)
         self.teleop_last_cmd_time = time.time()
+
+    def teleop_ramp(self, target):
+        out = self.teleop_out_linear
+        if out * target < 0.0:
+            out = 0.0  # direction change: drop to 0 first, then ramp up the other way
+        if abs(target) > abs(out):
+            last = self.teleop_last_cmd_time
+            dt = min(time.time() - last, self.TELEOP_RAMP_DT_MAX) if last else self.TELEOP_RAMP_DT_MAX
+            step = self.TELEOP_MAX_ACCEL * dt
+            out = min(target, out + step) if target > 0.0 else max(target, out - step)
+        else:
+            out = target
+        self.teleop_out_linear = out
+        return out
 
     def on_mapping_state(self, msg):
         try:
@@ -524,6 +545,7 @@ class ROSBoardNode(object):
                 continue
             if time.time() - self.teleop_last_cmd_time > self.TELEOP_DEADMAN_TIMEOUT:
                 self.teleop_pub.publish(Twist())
+                self.teleop_out_linear = 0.0
                 self.teleop_last_cmd_time = 0.0  # don't keep re-publishing zero every 100ms
 
     def start(self):
