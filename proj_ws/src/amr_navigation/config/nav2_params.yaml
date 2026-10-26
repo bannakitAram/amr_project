@@ -187,7 +187,7 @@ controller_server:
       vx_std: 0.1    # was 0.2 (= vx_max): smoother launch; Humble MPPI has no ax_max
       vy_std: 0.0
       wz_std: 0.2    # was 0.25 (0.4 before wz_max cut) - less jerky turn-in
-      vx_max: 0.20
+      vx_max: 0.30
       # 0.0, not negative: normal path-following (FollowPath/MPPI) never
       # plans a reversing trajectory. The BackUp recovery behavior (see
       # recovery_plugins below) is untouched and still backs up on its own
@@ -195,7 +195,7 @@ controller_server:
       # action, not everyday driving.
       vx_min: 0.0
       vy_max: 0.0
-      wz_max: 0.50    # was 1.0 - wheels slip badly when turning fast
+      wz_max: 0.70    # was 1.0 - wheels slip badly when turning fast
       iteration_count: 1
       prune_distance: 1.7
       transform_tolerance: 0.2
@@ -471,7 +471,7 @@ behavior_server:
     robot_base_frame: base_footprint
     transform_tolerance: 0.2
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.50   # was 1.0 - match MPPI wz_max
+    max_rotational_vel: 0.70   # was 1.0 - match MPPI wz_max
     min_rotational_vel: 0.4
     rotational_acc_lim: 1.0   # was 2.0 - reduce slip during Spin recovery
 
@@ -492,13 +492,13 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.20, 0.0, 0.50]    # angular was 1.0 - match MPPI wz_max
-    min_velocity: [-0.20, 0.0, -0.50]
+    max_velocity: [0.30, 0.0, 0.70]    # angular was 1.0 - match MPPI wz_max
+    min_velocity: [-0.30, 0.0, -0.70]
     # Lowered to reduce wheel slip on start/stop (was 1.0/2.0: 0 -> 0.2 m/s
     # in 0.2 s). Decel kept steeper than accel so stopping distance stays
     # short: 0.2 m/s -> 0 in 0.4 s (~4 cm).
-    max_accel: [0.30, 0.0, 1.00]
-    max_decel: [-0.50, 0.0, -1.50]
+    max_accel: [0.30, 0.0, 0.50]
+    max_decel: [-0.50, 0.0, -1.00]
     odom_topic: "/odometry/filtered"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
