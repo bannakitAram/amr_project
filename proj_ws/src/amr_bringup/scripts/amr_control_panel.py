@@ -509,6 +509,7 @@ EN = {
     'ยังไม่ได้ตั้ง PIN - ใช้ค่าเริ่มต้น (ตั้งได้ที่ ': 'No PIN set - using default (set in ',
     '4-6 หลัก': '4-6 digits',
     'PIN ไม่ถูกต้อง': 'Wrong PIN',
+    '▼  เลื่อนลงเพื่อดูค่าเพิ่มเติม': '▼  Scroll down for more',
     'เริ่มสแกน': 'Start scan',
     'หยุดสแกนชั่วคราว': 'Pause scan',
     'กำลังเริ่ม SLAM...': 'Starting SLAM...',
@@ -1283,9 +1284,11 @@ class AmrControlPanel(tk.Tk):
     def _make_mode_card(self, parent, title_th, title_en, kind, command,
                         desc=''):
         b = self._btn(parent, '', command, kind=kind, font=self.f_huge,
-                      padx=px(20), pady=px(40), justify='left', anchor='w',
-                      wraplength=px(420))
+                      padx=px(20), pady=px(40), justify='left', anchor='w')
         b._i18n_card = (title_th, title_en, desc)
+        # Card width depends on how many share the row (2 on Home, 4 on
+        # Developer): re-fit the text whenever the card is resized.
+        b.bind('<Configure>', lambda _e, b=b: self._fit_card(b), add='+')
         self._card_text(b)
         return b
 
@@ -1293,6 +1296,25 @@ class AmrControlPanel(tk.Tk):
         th, en, desc = b._i18n_card
         head = en if _LANG['cur'] == 'en' else f'{th}\n{en}'
         b.config(text=head + (f'\n\n{T(desc)}' if desc else ''))
+        self._fit_card(b)
+
+    def _fit_card(self, b):
+        """One font for every card in the same row: the largest whose
+        title lines fit the narrowest card (never cut mid-word);
+        wraplength follows each card's width."""
+        cards = [w for w in b.master.winfo_children()
+                 if getattr(w, '_i18n_card', None)]
+        if any(c.winfo_width() <= 1 for c in cards):
+            return
+        avail = min(c.winfo_width() for c in cards) - 2 * px(20) - px(8)
+        lines = [ln for c in cards for ln in c.cget('text').split('\n')[:2] if ln]
+        for f in (self.f_huge, self.f_title, self.f_button):
+            if all(f.measure(ln) <= avail for ln in lines):
+                break
+        for c in cards:
+            wrap = c.winfo_width() - 2 * px(20) - px(8)
+            if str(c.cget('font')) != str(f) or int(str(c.cget('wraplength'))) != wrap:
+                c.config(font=f, wraplength=wrap)
 
     # ---------- language ----------
     def _i18n_walk(self, root=None):
@@ -1428,9 +1450,10 @@ class AmrControlPanel(tk.Tk):
         self.status_label = tk.Label(row, text='', font=self.f_status,
                                      bg=SURFACE, fg=TEXT_MAIN)
         self.status_label.pack(side='left')
+        # Packed only while it has text, so a lone status line sits
+        # vertically centred in the header like the pills next to it.
         self.detail_label = tk.Label(st, text='', font=self.f_small, bg=SURFACE,
                                      fg=TEXT_MUTED, anchor='e', justify='right')
-        self.detail_label.pack(anchor='e')
 
     def _show_page(self, name):
         if name in self.DEV_PAGES and not self._dev_unlocked:
@@ -2331,6 +2354,21 @@ class AmrControlPanel(tk.Tk):
         par.bind('<Configure>', lambda _e: cv.configure(scrollregion=cv.bbox('all')))
         cv.bind('<Configure>', lambda e: cv.itemconfigure(win, width=e.width))
 
+        # The last visible row is usually cut by the screen edge, which read
+        # as "missing letters". Cover it with a scroll hint while more rows
+        # lie below; hidden once scrolled to the end.
+        more = tk.Label(outer, text='▼  เลื่อนลงเพื่อดูค่าเพิ่มเติม', font=self.f_small,
+                        bg=SURFACE_2, fg=TEXT_MAIN, pady=px(6))
+
+        def on_scroll(first, last):
+            sb.set(first, last)
+            if float(last) < 0.999:
+                more.place(relx=0, rely=1, anchor='sw', relwidth=1, width=-px(28))
+                more.lift()
+            else:
+                more.place_forget()
+        cv.configure(yscrollcommand=on_scroll)
+
         # bound on 'all' (plus the class bindings, which still run) and
         # filtered to widgets inside this tab, so buttons/labels scroll too
         inside = str(outer) + '.'
@@ -2404,6 +2442,8 @@ class AmrControlPanel(tk.Tk):
         self.param_note = self._label(right, '', font=self.f_small, fg=TEXT_MUTED,
                                       justify='left', anchor='nw', wraplength=px(330))
         self.param_note.pack(fill='both', expand=True)
+        right.bind('<Configure>', lambda e: self.param_note.config(
+            wraplength=max(px(200), e.width - px(8))), add='+')
         btns = tk.Frame(right, bg=SURFACE)
         btns.pack(fill='x', side='bottom')
         self.btn_param_save = self._btn(btns, 'บันทึกลงไฟล์', self._on_param_save, kind='warn')
@@ -2624,6 +2664,10 @@ class AmrControlPanel(tk.Tk):
         self.status_dot.itemconfig(self._dot_id, fill=colors.get(kind, '#9e9e9e'))
         self.status_label.config(text=T(text))
         self.detail_label.config(text=T(detail.replace('\n', ' · ')))
+        if detail:
+            self.detail_label.pack(anchor='e')
+        else:
+            self.detail_label.pack_forget()
 
     def _set_running_ui(self, running, mode=None):
         for b in self._start_buttons:
