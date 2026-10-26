@@ -2173,7 +2173,28 @@ class AmrControlPanel(tk.Tk):
         # before line use (CLAUDE.md).
         self._build_param_editor(par)
 
-    def _build_param_editor(self, par):
+    def _build_param_editor(self, outer):
+        # the stepper rows outgrow the 7" screen: scroll the whole tab
+        # (wide scrollbar for touch, wheel/touchpad for mouse)
+        sb = tk.Scrollbar(outer, width=px(28))
+        sb.pack(side='right', fill='y')
+        cv = tk.Canvas(outer, bg=SURFACE, highlightthickness=0, yscrollcommand=sb.set)
+        cv.pack(side='left', fill='both', expand=True)
+        sb.config(command=cv.yview)
+        par = tk.Frame(cv, bg=SURFACE)
+        win = cv.create_window(0, 0, window=par, anchor='nw')
+        par.bind('<Configure>', lambda _e: cv.configure(scrollregion=cv.bbox('all')))
+        cv.bind('<Configure>', lambda e: cv.itemconfigure(win, width=e.width))
+
+        def wheel(e):
+            cv.yview_scroll(-1 if (e.num == 4 or getattr(e, 'delta', 0) > 0) else 1, 'units')
+        for seq in ('<Button-4>', '<Button-5>', '<MouseWheel>'):
+            outer.bind(seq, wheel)
+        outer.bind('<Enter>', lambda _e: [cv.bind_all(s, wheel) for s in
+                                          ('<Button-4>', '<Button-5>', '<MouseWheel>')])
+        outer.bind('<Leave>', lambda _e: [cv.unbind_all(s) for s in
+                                          ('<Button-4>', '<Button-5>', '<MouseWheel>')])
+
         par.columnconfigure(0, weight=3)
         par.columnconfigure(1, weight=2)
         left = tk.Frame(par, bg=SURFACE)
