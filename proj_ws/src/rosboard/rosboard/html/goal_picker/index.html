@@ -888,7 +888,9 @@ function drawStations() {
     const h = worldToScreen(s.x + Math.cos(s.theta || 0), s.y + Math.sin(s.theta || 0));
     const d = Math.hypot(h.x - p.x, h.y - p.y) || 1;
     const dpr = 1;  // same pixel units as drawGoalPin (worldToScreen output)
-    const r = 7 * dpr, tall = 20 * dpr, color = '#1e88e5';
+    // colour chosen by the panel (STATION_COLORS); validate before use
+    const color = /^#[0-9a-fA-F]{6}$/.test(s.color || '') ? s.color : '#1e88e5';
+    const r = 7 * dpr, tall = 20 * dpr;
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.strokeStyle = color; ctx.lineWidth = 3 * dpr;
@@ -923,6 +925,7 @@ function renderStationPanel() {
     const b = document.createElement('button');
     b.className = 'btn primary';
     b.textContent = s.name;
+    if (/^#[0-9a-fA-F]{6}$/.test(s.color || '')) b.style.borderLeft = '8px solid ' + s.color;
     b.onclick = () => sendToStation(s);
     stationPanel.appendChild(b);
   }

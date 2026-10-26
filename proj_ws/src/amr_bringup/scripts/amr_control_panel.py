@@ -201,6 +201,15 @@ BLUE = '#2f7fd8'
 BLUE_DARK = '#2263ab'
 DISABLED_BG = '#2a313b'
 DISABLED_FG = '#5d6876'
+# Station pin colours, by position in the stations file (cycles after 8).
+# Green / amber / red are left out: robot arrow, goal / selection, faults.
+# Sent with /amr_stations so the phone goal_picker uses the same colours.
+STATION_COLORS = ('#1e88e5', '#8e24aa', '#00acc1', '#d81b60',
+                  '#3949ab', '#8d6e63', '#c0ca33', '#00897b')
+
+
+def station_color(i):
+    return STATION_COLORS[i % len(STATION_COLORS)]
 
 BTN_KINDS = {
     'neutral': (SURFACE_2, '#313b48', TEXT_MAIN),
@@ -956,7 +965,9 @@ class RosBridge:
     def publish_stations(self, map_name, stations):
         if self.ok:
             self.stations_pub.publish(self._String(data=json.dumps(
-                {'map': map_name or '', 'stations': stations})))
+                {'map': map_name or '',
+                 'stations': [dict(st, color=station_color(i))
+                              for i, st in enumerate(stations)]})))
 
     def publish_mapping_state(self, state):
         if self.ok:
@@ -1095,17 +1106,22 @@ class MapView(tk.Canvas):
         # Station pins last, so the robot arrow never hides one (a station
         # saved where the robot is parked used to vanish under it).
         for m in markers:
-            self._pin(m, AMBER if m.get('selected') else BLUE)
+            self._pin(m, m.get('color', BLUE), m.get('selected'))
         if self._press:
             x0, y0, x1, y1 = self._press
             self.create_line(x0, y0, x1, y1, fill=AMBER, width=px(3),
                              arrow='last', tags='overlay')
 
-    def _pin(self, m, col):
+    def _pin(self, m, col, selected=False):
         """Map pin: the tip sits exactly on the station (x, y), a short
-        line from the tip shows the saved heading, name above the head."""
+        line from the tip shows the saved heading, name above the head.
+        Selected: bigger head with an amber ring (colour stays the station's)."""
         cx, cy = self.w2c(m['x'], m['y'])
         r, h = px(8), px(22)  # head radius, tip-to-head-centre height
+        if selected:
+            r = px(11)
+            self.create_oval(cx - r - px(3), cy - h - r - px(3), cx + r + px(3), cy - h + r + px(3),
+                             fill='', outline=AMBER, width=px(3), tags='overlay')
         hx, hy = self.w2c(m['x'] + math.cos(m.get('theta', 0.0)),
                           m['y'] + math.sin(m.get('theta', 0.0)))
         d = math.hypot(hx - cx, hy - cy) or 1.0
@@ -1643,10 +1659,13 @@ class AmrControlPanel(tk.Tk):
             return
         for i, s in enumerate(self._stations[:8]):
             sel = self._selected_station == s['name']
-            b = self._btn(self.station_grid, s['name'],
+            # colour stripe = the station's pin colour on the map
+            cell = tk.Frame(self.station_grid, bg=station_color(i))
+            cell.grid(row=i // 2, column=i % 2, sticky='ew', padx=px(3), pady=px(3))
+            b = self._btn(cell, s['name'],
                           lambda n=s['name']: self._select_station(n),
                           kind=('warn' if sel else 'neutral'), pady=px(10))
-            b.grid(row=i // 2, column=i % 2, sticky='ew', padx=px(3), pady=px(3))
+            b.pack(fill='x', padx=(px(8), 0))
         self.station_grid.columnconfigure((0, 1), weight=1, uniform='s')
 
     def _select_station(self, name):
@@ -2460,8 +2479,9 @@ class AmrControlPanel(tk.Tk):
         pose = self.ros.pose()
         if page == 'auto':
             self.auto_map.set_map(self.ros.map_msg, self.ros.map_seq)
-            markers = [dict(s, selected=(s['name'] == self._selected_station))
-                       for s in self._stations]
+            markers = [dict(s, color=station_color(i),
+                            selected=(s['name'] == self._selected_station))
+                       for i, s in enumerate(self._stations)]
             self.auto_map.set_overlay(pose, markers)
             self._update_mission_ui()
         elif page == 'mapping':
