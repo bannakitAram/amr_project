@@ -51,6 +51,8 @@ MAPS_DIR = os.path.join(
     'src', 'amr_navigation', 'maps')
 MAPS_DIR = os.path.normpath(MAPS_DIR)
 NAV2_PARAMS = os.path.normpath(os.path.join(MAPS_DIR, '..', 'config', 'nav2_params.yaml'))
+LASER_FILTER = os.path.normpath(os.path.join(
+    MAPS_DIR, '..', '..', 'amr_bringup', 'config', 'laser_filter.yaml'))
 REPO_DIR = os.path.normpath(os.path.join(MAPS_DIR, '..', '..', '..', '..'))
 
 ROSBOARD_PORT = 8888
@@ -309,18 +311,27 @@ def load_map_image(yaml_path):
 # text in nav2_params.yaml (comments kept) and every related copy is kept in
 # sync: speed -> MPPI + velocity_smoother (+ behavior_server for w);
 # inflation -> local + global; footprint -> local + global + the
-# collision_monitor FrontStop polygon, which starts at the front bumper.
+# collision_monitor FrontStop polygon, which starts at the front bumper,
+# + the laser_filter.yaml self-hit box (footprint + LASER_BOX_MARGIN).
+# The footprint is edited as 4 edge distances from base_footprint so a
+# payload mounted off-centre gives an asymmetric rectangle.
 # The min/max bounds are hard limits - review ISO 3691-4 before widening:
 # FrontStop (0.35 m deep) and the decel limits were sized for 0.2 m/s.
 NAV_PARAM_SPECS = [
     # key, label, unit, min, max, step, fmt
     ('v_max', 'v_max', 'm/s', 0.05, 0.30, 0.01, '{:.2f}'),
     ('w_max', 'ω_max', 'rad/s', 0.10, 1.00, 0.05, '{:.2f}'),
-    ('inflation', 'Inflation radius', 'm', 0.30, 1.00, 0.05, '{:.2f}'),
+    ('inflation', 'Inflation radius', 'm', 0.30, 1.30, 0.05, '{:.2f}'),
     ('goal_tol', 'xy_goal_tolerance', 'm', 0.10, 0.50, 0.05, '{:.2f}'),
-    # footprint steps are 2 cm so the half-length stays on whole cm
-    ('fp_len', 'Footprint ยาว', 'm', 0.60, 1.40, 0.02, '{:.2f}'),
-    ('fp_wid', 'Footprint กว้าง', 'm', 0.40, 0.90, 0.02, '{:.2f}'),
+    # footprint edges, distance from base_footprint (wheel axle centre).
+    # Lower bounds = bare chassis (0.49 / 0.26): smaller would cut the
+    # self-hit box into the body and re-expose its returns. Upper bounds:
+    # local costmap is 3 x 3 m, so edges past ~1.0 m leave MPPI too little
+    # window ahead - grow width/height there first if more is needed.
+    ('fp_front', 'กลางรถ→ขอบหน้า (+x)', 'm', 0.49, 1.00, 0.01, '{:.2f}'),
+    ('fp_rear', 'กลางรถ→ขอบหลัง (-x)', 'm', 0.49, 1.00, 0.01, '{:.2f}'),
+    ('fp_left', 'กลางรถ→ขอบซ้าย (+y)', 'm', 0.26, 0.70, 0.01, '{:.2f}'),
+    ('fp_right', 'กลางรถ→ขอบขวา (-y)', 'm', 0.26, 0.70, 0.01, '{:.2f}'),
     # velocity_smoother max_accel / max_decel [x, -, theta]. Upper bounds =
     # STM32 ramp (MAX_ACCEL 0.5 / MAX_DECEL 1.2 m/s^2 per wheel; /0.236 m
     # half track for theta) - beyond that the firmware caps it anyway.
@@ -332,6 +343,7 @@ NAV_PARAM_SPECS = [
 STOP_LATENCY_S = 0.2      # cmd -> wheels, used for the stop-distance note
 FRONT_STOP_DEPTH = 0.35   # m ahead of the bumper (matches nav2_params.yaml)
 FRONT_STOP_MARGIN = 0.03  # m each side beyond the footprint half-width
+LASER_BOX_MARGIN = 0.01   # m self-hit box beyond the footprint (laser_filter.yaml)
 
 _NUM = r'(-?\d+(?:\.\d+)?)'
 _PARAM_RES = {
@@ -365,8 +377,10 @@ def read_nav_params(text):
         'w_max': float(_PARAM_RES['wz_max'].search(text).group(2)),
         'inflation': float(_PARAM_RES['inflation'].search(text).group(2)),
         'goal_tol': float(_PARAM_RES['goal_tol'].search(text).group(2)),
-        'fp_len': round(max(xs) - min(xs), 3),
-        'fp_wid': round(max(ys) - min(ys), 3),
+        'fp_front': round(max(xs), 3),
+        'fp_rear': round(-min(xs), 3),
+        'fp_left': round(max(ys), 3),
+        'fp_right': round(-min(ys), 3),
         'acc_lin': float(_PARAM_RES['max_acc'].search(text).group(2)),
         'acc_rot': float(_PARAM_RES['max_acc'].search(text).group(4)),
         'dec_lin': -float(_PARAM_RES['max_dec'].search(text).group(2)),
@@ -376,11 +390,11 @@ def read_nav_params(text):
 
 def write_nav_params(text, v):
     """Returns text with every copy of the edited values replaced.
-    Footprint is written as a centred rectangle (same as today)."""
+    Footprint is written as a rectangle that may be off-centre."""
     read_nav_params(text)  # layout check before touching anything
     f2 = lambda x: f'{x:.2f}'  # noqa: E731
-    hl, hw = v['fp_len'] / 2, v['fp_wid'] / 2
-    sw = hw + FRONT_STOP_MARGIN
+    fr, rr, lf, rt = v['fp_front'], v['fp_rear'], v['fp_left'], v['fp_right']
+    sl, sr = lf + FRONT_STOP_MARGIN, rt + FRONT_STOP_MARGIN
     text = _PARAM_RES['vx_max'].sub(lambda m: m.group(1) + f2(v['v_max']), text)
     text = _PARAM_RES['wz_max'].sub(lambda m: m.group(1) + f2(v['w_max']), text)
     text = _PARAM_RES['max_vel'].sub(
@@ -394,13 +408,38 @@ def write_nav_params(text, v):
     text = _PARAM_RES['rot_vel'].sub(lambda m: m.group(1) + f2(v['w_max']), text)
     text = _PARAM_RES['inflation'].sub(lambda m: m.group(1) + f2(v['inflation']), text)
     text = _PARAM_RES['goal_tol'].sub(lambda m: m.group(1) + f2(v['goal_tol']), text)
-    fp = (f'[[{hl:.2f}, {hw:.2f}], [{hl:.2f}, {-hw:.2f}], '
-          f'[{-hl:.2f}, {-hw:.2f}], [{-hl:.2f}, {hw:.2f}]]')
+    fp = (f'[[{fr:.2f}, {lf:.2f}], [{fr:.2f}, {-rt:.2f}], '
+          f'[{-rr:.2f}, {-rt:.2f}], [{-rr:.2f}, {lf:.2f}]]')
     text = _PARAM_RES['footprint'].sub(lambda m: f'{m.group(1)}"{fp}"', text)
-    fx = hl + FRONT_STOP_DEPTH
+    fx = fr + FRONT_STOP_DEPTH
     text = _PARAM_RES['front_stop'].sub(
-        lambda m: (f'{m.group(1)}[{fx:.2f}, {sw:.2f}, {fx:.2f}, {-sw:.2f}, '
-                   f'{hl:.2f}, {-sw:.2f}, {hl:.2f}, {sw:.2f}]'), text)
+        lambda m: (f'{m.group(1)}[{fx:.2f}, {sl:.2f}, {fx:.2f}, {-sr:.2f}, '
+                   f'{fr:.2f}, {-sr:.2f}, {fr:.2f}, {sl:.2f}]'), text)
+    return text
+
+
+_BOX_KEYS = ('min_x', 'max_x', 'min_y', 'max_y')
+_BOX_RES = {k: re.compile(r'^(\s*' + k + r':\s*)' + _NUM, re.M) for k in _BOX_KEYS}
+
+
+def laser_box_for(v):
+    """Self-hit box (laser_filter.yaml) for footprint edges v."""
+    m = LASER_BOX_MARGIN
+    return {'min_x': round(-(v['fp_rear'] + m), 2), 'max_x': round(v['fp_front'] + m, 2),
+            'min_y': round(-(v['fp_right'] + m), 2), 'max_y': round(v['fp_left'] + m, 2)}
+
+
+def read_laser_box(text):
+    for k, rx in _BOX_RES.items():
+        if len(rx.findall(text)) != 1:
+            raise ValueError(f'laser_filter.yaml: expected 1 x {k}')
+    return {k: float(rx.search(text).group(2)) for k, rx in _BOX_RES.items()}
+
+
+def write_laser_box(text, v):
+    read_laser_box(text)
+    for k, val in laser_box_for(v).items():
+        text = _BOX_RES[k].sub(lambda m, val=val: m.group(1) + f'{val:.2f}', text)
     return text
 
 
@@ -464,8 +503,15 @@ EN = {
     'บันทึกแล้ว: ': 'Saved: ',
     'บันทึกแผนที่ไม่สำเร็จ': 'Map save failed',
     ' อยู่แล้ว - ใช้ชื่ออื่น': ' exists - use another name',
-    'Footprint ยาว': 'Footprint length',
-    'Footprint กว้าง': 'Footprint width',
+    'กลางรถ→ขอบหน้า (+x)': 'Centre→front (+x)',
+    'กลางรถ→ขอบหลัง (-x)': 'Centre→rear (-x)',
+    'กลางรถ→ขอบซ้าย (+y)': 'Centre→left (+y)',
+    'กลางรถ→ขอบขวา (-y)': 'Centre→right (-y)',
+    'กล่องกรอง LiDAR (self-hit)': 'LiDAR self-hit box',
+    'Footprint รวม': 'Footprint overall',
+    'Footprint = ระยะจากกลางรถ (กลางล้อขับ) ถึงขอบนอกสุด ของรถหรือ payload ที่ยื่นมากกว่า - ไม่ใช่ระยะที่ยื่นออกจากตัวรถ':
+        'Footprint = distance from robot centre (drive-wheel midpoint) to the outermost edge of '
+        'robot or payload - not how far the payload sticks out',
     'บันทึกลงไฟล์': 'Save to file',
     'คืนค่าจากไฟล์': 'Revert',
     'อ่านไฟล์ไม่ได้ - แก้ผ่านไฟล์เท่านั้น': 'Cannot parse file - edit the file directly',
@@ -2139,7 +2185,7 @@ class AmrControlPanel(tk.Tk):
         self._param_edit = {}
         self._param_widgets = {}
         for r, (key, label, unit, lo, hi, step, fmt) in enumerate(NAV_PARAM_SPECS):
-            self._label(left, label, anchor='w', width=17).grid(row=r, column=0, sticky='w')
+            self._label(left, label, anchor='w', width=20).grid(row=r, column=0, sticky='w')
             row, minus, val, plus = self._stepper(
                 left, '', '', lambda k=key, st=step: self._adjust_param(k, -st),
                 lambda k=key, st=step: self._adjust_param(k, st), width=7)
@@ -2202,12 +2248,20 @@ class AmrControlPanel(tk.Tk):
             lines.append(T('อ่านไฟล์ไม่ได้ - แก้ผ่านไฟล์เท่านั้น') + f'\n{self._param_error}')
         e = self._param_edit
         if ok and e:
-            corner = math.hypot(e['fp_len'] / 2, e['fp_wid'] / 2)
+            corner = max(math.hypot(x, y) for x in (e['fp_front'], e['fp_rear'])
+                         for y in (e['fp_left'], e['fp_right']))
             lines.append(T('รัศมีมุมหุ่น') + f' {corner:.2f} m')
             if e['inflation'] < corner:
                 lines.append(T('⚠ inflation น้อยกว่ารัศมีมุมหุ่น - หุ่นอาจวิ่งเฉียดสิ่งกีดขวางตอนหมุน'))
-            lines.append(T('FrontStop เริ่มที่หน้ากันชน') + f' {e["fp_len"] / 2:.2f} m '
+            lines.append(T('FrontStop เริ่มที่หน้ากันชน') + f' {e["fp_front"]:.2f} m '
                          + T('ลึก') + f' {FRONT_STOP_DEPTH:.2f} m')
+            lines.append(T('Footprint = ระยะจากกลางรถ (กลางล้อขับ) ถึงขอบนอกสุด '
+                           'ของรถหรือ payload ที่ยื่นมากกว่า - ไม่ใช่ระยะที่ยื่นออกจากตัวรถ'))
+            lines.append(T('Footprint รวม') + f' {e["fp_front"] + e["fp_rear"]:.2f} x '
+                         f'{e["fp_left"] + e["fp_right"]:.2f} m')
+            b = laser_box_for(e)
+            lines.append(T('กล่องกรอง LiDAR (self-hit)') + f' x {b["min_x"]:.2f}..{b["max_x"]:.2f}'
+                         + f' y {b["min_y"]:.2f}..{b["max_y"]:.2f} m')
             d_stop = e['v_max'] ** 2 / (2 * e['dec_lin']) + e['v_max'] * STOP_LATENCY_S
             lines.append(T('ระยะหยุดโดยประมาณที่ v_max') + f' {d_stop:.2f} m '
                          + T('(รวม latency') + f' {STOP_LATENCY_S:.1f} s)')
@@ -2238,10 +2292,16 @@ class AmrControlPanel(tk.Tk):
             new = write_nav_params(text, self._param_edit)
             if read_nav_params(new) != {k: round(v, 2) for k, v in self._param_edit.items()}:
                 raise ValueError('verify after write failed')
-            tmp = NAV2_PARAMS + '.tmp'
-            with open(tmp, 'w') as f:
-                f.write(new)
-            os.replace(tmp, NAV2_PARAMS)
+            with open(LASER_FILTER) as f:
+                box_new = write_laser_box(f.read(), self._param_edit)
+            if read_laser_box(box_new) != laser_box_for(self._param_edit):
+                raise ValueError('laser_filter.yaml verify after write failed')
+            # both verified before either is replaced, so the footprint and
+            # the self-hit box can't end up out of sync
+            for path, body in ((NAV2_PARAMS, new), (LASER_FILTER, box_new)):
+                with open(path + '.tmp', 'w') as f:
+                    f.write(body)
+                os.replace(path + '.tmp', path)
         except (OSError, ValueError) as e:
             messagebox.showerror('บันทึกไม่สำเร็จ', str(e))
             return
@@ -2249,7 +2309,7 @@ class AmrControlPanel(tk.Tk):
         self.set_git.config(text=git_describe())
         messagebox.showinfo(
             'บันทึกแล้ว',
-            'เขียน nav2_params.yaml แล้ว (git tree เป็น -dirty)\n'
+            'เขียน nav2_params.yaml + laser_filter.yaml แล้ว (git tree เป็น -dirty)\n'
             + ('ระบบกำลังทำงาน - ต้องปิดแล้วเริ่มใหม่เพื่อใช้ค่าใหม่'
                if self._proc is not None else 'ค่าใหม่มีผลเมื่อเริ่มระบบครั้งถัดไป'))
 
