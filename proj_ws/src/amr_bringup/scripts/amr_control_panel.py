@@ -938,6 +938,7 @@ class RosBridge:
         self.map_seq = 0
         self.watchdog = {}      # name -> (bool, t)
         self.hook_state = None  # latest /hook/state text (hook_bridge.py)
+        self.battery = None     # (BatteryState, monotonic time) from hook_bridge.py
         self.rates = {'scan': collections.deque(maxlen=60),
                       'odom': collections.deque(maxlen=120),
                       'imu': collections.deque(maxlen=400)}
@@ -1045,6 +1046,13 @@ class RosBridge:
         def on_hook(m):
             self.hook_state = m.data
         node.create_subscription(String, '/hook/state', on_hook, gate_qos)
+
+        # KG-F coulometer via the Mega (~1 Hz). Display only.
+        from sensor_msgs.msg import BatteryState
+
+        def on_battery(m):
+            self.battery = (m, time.monotonic())
+        node.create_subscription(BatteryState, '/battery/state', on_battery, 10)
 
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(node)
@@ -2836,6 +2844,31 @@ class AmrControlPanel(tk.Tk):
         else:  # IDLE: between the limits
             self.pill_hook.config(text='Hook mid', bg=AMBER_DARK, fg='white')
 
+    def _update_batt_pill(self):
+        b = self.ros.battery
+        if not b or time.monotonic() - b[1] > 5.0:
+            self.pill_batt.config(text='Batt —', bg=SURFACE_2, fg=TEXT_MUTED)
+            return
+        m = b[0]
+        charging = m.power_supply_status == 1   # POWER_SUPPLY_STATUS_CHARGING
+        pct = m.percentage
+        txt = 'Batt '
+        if charging:
+            txt += '⚡'
+        if math.isfinite(pct):
+            txt += f'{pct * 100:.0f}% '
+        txt += f'{m.voltage:.1f}V {m.current:+.1f}A'
+        if not math.isfinite(pct):
+            bg = SURFACE_2
+        elif pct < 0.20:
+            bg = RED
+        elif pct < 0.40:
+            bg = AMBER_DARK
+        else:
+            bg = GREEN_DARK
+        self.pill_batt.config(text=txt, bg=bg,
+                              fg=TEXT_MAIN if bg == SURFACE_2 else 'white')
+
     def _tick(self):
         try:
             self._tick_inner()
@@ -2873,6 +2906,7 @@ class AmrControlPanel(tk.Tk):
         else:
             self.pill_safety.config(text='SENSOR FAULT', bg=RED, fg='white')
         self._update_hook_pill()
+        self._update_batt_pill()
 
         page = self._page
         pose = self.ros.pose()
