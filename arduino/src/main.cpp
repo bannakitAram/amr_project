@@ -77,7 +77,7 @@ const uint32_t LIGHT_TIMEOUT_MS = 2000;   // Jetson resends every 500 ms
 
 // ACS712 current sensors (5 V supply, output ratiometric to Vcc).
 // mV per A: ACS712-05B 185, -20A 100, -30A 66. Set from the chip marking.
-const float    CUR_MV_PER_A      = 100.0;
+const float    CUR_MV_PER_A      = 100.0;   // ACS712-20A (confirmed on the robot)
 // ADC count at 0 A (ideal 512 = Vcc/2). Calibrate with motors stopped:
 // read the CUR value, offset_counts = 512 + A * CUR_MV_PER_A / 4.883.
 const float    CUR_ZERO_LEFT     = 512.0;
