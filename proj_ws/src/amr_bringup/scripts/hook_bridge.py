@@ -87,6 +87,17 @@ class HookBridge(Node):
         self.poll_period_s = self.declare_parameter('poll_period_s', 1.0).value
         # > poll period + Mega boot time after a DTR reset
         self.timeout_s = self.declare_parameter('timeout_s', 3.0).value
+        # Nothing is sent until the Mega has said something after the open
+        # (or boot_hold_s passed): bytes arriving while the Mega2560's
+        # stk500v2 bootloader runs (~1 s after the DTR reset) can keep it in
+        # the bootloader, so the sketch never starts (seen 2026-11-12:
+        # "opened" but no "Mega (re)booted", every other bringup).
+        self.boot_hold_s = self.declare_parameter('boot_hold_s', 2.5).value
+        # Port open but silent this long -> close and reopen (DTR reset
+        # again), so a stuck boot recovers by itself.
+        self.reopen_after_s = self.declare_parameter('reopen_after_s', 6.0).value
+        self.open_time = None
+        self.rx_since_open = False
         self.reconnect_period_s = self.declare_parameter('reconnect_period_s', 2.0).value
         self.light_period_s = self.declare_parameter('light_period_s', 0.5).value
         # < the Mega's LIGHT_TIMEOUT_MS (2 s) minus one resend
@@ -165,6 +176,8 @@ class HookBridge(Node):
         with self.lock:
             self.ser = ser
         self.last_rx = self.now_s()  # start the timeout from the open (Mega reboots)
+        self.open_time = self.now_s()
+        self.rx_since_open = False
         self.get_logger().info('opened %s @ %d' % (self.port, self.baud))
 
     def close(self, reason):
@@ -183,6 +196,8 @@ class HookBridge(Node):
         with self.lock:
             if self.ser is None:
                 return False
+            if not self.rx_since_open and self.now_s() - self.open_time < self.boot_hold_s:
+                return False            # Mega bootloader window, see boot_hold_s
             try:
                 self.ser.write((cmd + '\n').encode('ascii'))
                 return True
@@ -209,6 +224,7 @@ class HookBridge(Node):
             if not line:
                 continue
             self.last_rx = self.now_s()
+            self.rx_since_open = True
             if line.startswith('STATE '):
                 self.publish_state(line[len('STATE '):].strip())
             elif line.startswith('CUR '):
@@ -315,6 +331,9 @@ class HookBridge(Node):
     def on_watchdog(self):
         if self.ser is None or self.last_rx is None:
             self.publish_state('UNKNOWN')
+        elif self.now_s() - self.last_rx > self.reopen_after_s:
+            self.close('no answer for %.0f s - reopening (resets the Mega)'
+                       % self.reopen_after_s)
         elif self.now_s() - self.last_rx > self.timeout_s:
             self.publish_state('UNKNOWN')
 
@@ -340,7 +359,7 @@ class HookBridge(Node):
             return
         cmd = 'O' + parts[0] + on[parts[1]]
         if not self.send(cmd):
-            self.get_logger().error('/relay/cmd "%s" not sent: port closed' % msg.data)
+            self.get_logger().error('/relay/cmd "%s" not sent: Mega not connected/ready' % msg.data)
 
     def on_cmd(self, msg):
         cmd = msg.data.strip().upper()
@@ -348,7 +367,7 @@ class HookBridge(Node):
             self.get_logger().warn('ignored /hook/cmd "%s" (use U/D/S/R/?)' % msg.data)
             return
         if not self.send(cmd):
-            self.get_logger().error('/hook/cmd "%s" not sent: port closed' % cmd)
+            self.get_logger().error('/hook/cmd "%s" not sent: Mega not connected/ready' % cmd)
 
 
 def main():
