@@ -37,6 +37,13 @@ Topics:
                current checked on the robot; charge scale/direction still to
                be checked against the meter display. Our own ":R50" command
                echoed back is ignored.
+  /relay/cmd   std_msgs/String in: general-purpose relays on the Mega D30/D31/
+               D32, "<n> <on|off>" with n = 1..3 (also "<n> 1" / "<n> 0").
+  /relay/state std_msgs/String out, transient_local: "<r1><r2><r3>", e.g.
+               "100" = relay 1 on. All OFF after a Mega reset (also on every
+               port reopen), "UNKNOWN" while the Mega does not answer.
+               Non-safety loads only: no watchdog, a relay stays as
+               commanded if ROS dies.
   /light/cmd   std_msgs/String in: tower light pattern from light_state_node.py
                (IDLE / AUTO / MANUAL / OBSTACLE / FAULT), forwarded as L<n>
                every `light_period_s`. Stops forwarding if /light/cmd goes
@@ -101,6 +108,9 @@ class HookBridge(Node):
         self.create_subscription(Odometry, '/wheel/odom', self.on_odom, 10)
         self.cur_left_pub = self.create_publisher(Float32, '/motor_current/left', 10)
         self.cur_right_pub = self.create_publisher(Float32, '/motor_current/right', 10)
+        self.relay_pub = self.create_publisher(String, '/relay/state', latched)
+        self.create_subscription(String, '/relay/cmd', self.on_relay_cmd, 10)
+        self.relay_pub.publish(String(data='UNKNOWN'))
         self.bat_raw_pub = self.create_publisher(String, '/battery/raw', 10)
         self.bat_seen = False
         # 2 x 12 V 33 Ah in series = 24 V 33 Ah
@@ -136,6 +146,7 @@ class HookBridge(Node):
             self.get_logger().error('hook %s' % state)
         elif state == 'UNKNOWN':
             self.get_logger().warn('hook state UNKNOWN (no answer on %s)' % self.port)
+            self.relay_pub.publish(String(data='UNKNOWN'))
         else:
             self.get_logger().info('hook %s' % state)
         self.state = state
@@ -202,6 +213,11 @@ class HookBridge(Node):
                 self.publish_state(line[len('STATE '):].strip())
             elif line.startswith('CUR '):
                 self.on_current(line)
+            elif line.startswith('OUT '):
+                bits = line[4:].strip()
+                if len(bits) == 3 and set(bits) <= {'0', '1'}:
+                    self.get_logger().info('relays %s' % bits)
+                    self.relay_pub.publish(String(data=bits))
             elif line.startswith('BAT '):
                 if not self.bat_seen:
                     self.get_logger().info('first coulometer reply: %s' % line[4:])
@@ -315,6 +331,16 @@ class HookBridge(Node):
         if self.light is None or self.now_s() - self.light_rx > self.light_timeout_s:
             return  # silence -> Mega shows link-lost (red blink) by itself
         self.send('L%d' % self.light)
+
+    def on_relay_cmd(self, msg):
+        parts = msg.data.strip().lower().split()
+        on = {'on': '1', '1': '1', 'off': '0', '0': '0'}
+        if len(parts) != 2 or parts[0] not in ('1', '2', '3') or parts[1] not in on:
+            self.get_logger().warn('ignored /relay/cmd "%s" (use "<1-3> on|off")' % msg.data)
+            return
+        cmd = 'O' + parts[0] + on[parts[1]]
+        if not self.send(cmd):
+            self.get_logger().error('/relay/cmd "%s" not sent: port closed' % msg.data)
 
     def on_cmd(self, msg):
         cmd = msg.data.strip().upper()

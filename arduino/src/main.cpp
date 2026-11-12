@@ -9,6 +9,10 @@
 //          L2 manual      yellow blink 2.5 Hz (joystick driving)
 //          L3 obstacle    yellow steady (collision_monitor holding it)
 //          L4 fault       red steady (sensor watchdog, ...)
+//   O<n><0|1> = general-purpose relay n (1..3 = D30/D31/D32) off/on,
+//          replies OUT <r1><r2><r3> (e.g. OUT 100). All OFF at boot.
+//          Not safety-related loads only (lights, fan, ...): no link
+//          watchdog - a relay stays as commanded if the Jetson goes away.
 // Replies (one line): STATE <IDLE|UP|DOWN|MOVING_UP|MOVING_DOWN|FAULT> [reason]
 // Unsolicited every CURRENT_PERIOD_MS:  CUR <left_A> <right_A>
 //   drive wheel motor current from ACS712 sensors on A2 (left) / A3 (right),
@@ -59,6 +63,7 @@ const uint8_t PIN_SW4 = 25;
 const uint8_t PIN_LAMP_RED    = 26;
 const uint8_t PIN_LAMP_YELLOW = 27;
 const uint8_t PIN_LAMP_GREEN  = 28;
+const uint8_t PIN_OUT[3] = {30, 31, 32};   // general-purpose relays O1..O3
 const uint8_t PIN_CUR_LEFT  = A2;
 const uint8_t PIN_CUR_RIGHT = A3;
 
@@ -358,6 +363,20 @@ void handleCommand(char c) {
   }
 }
 
+// ---- General-purpose relays (D30..D32) -------------------------------
+bool outOn[3] = {false, false, false};
+
+void reportOut() {
+  Serial.print(F("OUT "));
+  for (uint8_t i = 0; i < 3; i++) Serial.print(outOn[i] ? '1' : '0');
+  Serial.println();
+}
+
+void setOut(uint8_t i, bool on) {
+  outOn[i] = on;
+  digitalWrite(PIN_OUT[i], on ? RELAY_ON : RELAY_OFF);
+}
+
 void readSerial() {
   while (Serial.available()) {
     char c = Serial.read();
@@ -369,6 +388,12 @@ void readSerial() {
         lightCmd = rxBuf[1] - '0';
         lightCmdMs = millis();
         lightCmdSeen = true;
+      }
+      else if (rxLen == 3 && toupper(rxBuf[0]) == 'O' &&
+               rxBuf[1] >= '1' && rxBuf[1] <= '3' &&
+               (rxBuf[2] == '0' || rxBuf[2] == '1')) {
+        setOut(rxBuf[1] - '1', rxBuf[2] == '1');
+        reportOut();
       }
       else if (rxLen > 1) Serial.println(F("ERR unknown command"));
       rxLen = 0;
@@ -388,6 +413,10 @@ void setup() {
   pinMode(PIN_SW3, OUTPUT);
   pinMode(PIN_SW4, OUTPUT);
   relaysOff();
+  for (uint8_t i = 0; i < 3; i++) {  // level first, then OUTPUT (see above)
+    setOut(i, false);
+    pinMode(PIN_OUT[i], OUTPUT);
+  }
   lamps(false, false, false);  // level first, then OUTPUT (see above)
   pinMode(PIN_LAMP_RED, OUTPUT);
   pinMode(PIN_LAMP_YELLOW, OUTPUT);
@@ -407,6 +436,7 @@ void setup() {
   state = restingState();
   Serial.println(F("HOOK READY"));
   report();
+  reportOut();
 }
 
 void loop() {
