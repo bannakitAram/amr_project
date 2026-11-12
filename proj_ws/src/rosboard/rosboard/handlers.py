@@ -283,6 +283,14 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
                 return
             self.node.on_bag_cmd(argv[1].get("action"), argv[1].get("topics", []))
 
+        # client sent a door edit (goal_picker: set door at robot pose / delete)
+        elif argv[0] == ROSBoardSocketHandler.MSG_DOOR:
+            if len(argv) != 2 or type(argv[1]) is not dict:
+                print("error: door: bad: %s" % message)
+                return
+            self.node.on_door_cmd(argv[1].get("action"), argv[1].get("name", ""),
+                                  argv[1].get("relay"))
+
         # client wants to unsubscribe from topic
         elif argv[0] == ROSBoardSocketHandler.MSG_UNSUB:
             if len(argv) != 2 or type(argv[1]) is not dict:
@@ -315,6 +323,7 @@ ROSBoardSocketHandler.MSG_INITIAL_POSE = "i";
 ROSBoardSocketHandler.MSG_MAPPING = "k";
 ROSBoardSocketHandler.MSG_TELEOP_CFG = "x";
 ROSBoardSocketHandler.MSG_BAG = "b";
+ROSBoardSocketHandler.MSG_DOOR = "d";
 
 ROSBoardSocketHandler.PING_SEQ = "s";
 ROSBoardSocketHandler.PONG_SEQ = "s";

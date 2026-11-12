@@ -28,6 +28,7 @@ install(PROGRAMS
   scripts/hook_bridge.py
   scripts/light_state_node.py
   scripts/joy_teleop_node.py
+  scripts/door_manager_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -102,6 +102,11 @@ class WebSocketV1Transport {
       this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_MAPPING, {action: action, name: name || ""}]));
     }
 
+    doorCmd({action, name, relay}) {
+      if (!this.isConnected()) return;
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_DOOR, {action: action, name: name || "", relay: relay}]));
+    }
+
     bagCmd({action, topics}) {
       if (!this.isConnected()) return;
       this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_BAG, {action: action, topics: topics || []}]));
@@ -130,6 +135,7 @@ class WebSocketV1Transport {
   WebSocketV1Transport.MSG_MAPPING = "k";
   WebSocketV1Transport.MSG_TELEOP_CFG = "x";
   WebSocketV1Transport.MSG_BAG = "b";
+  WebSocketV1Transport.MSG_DOOR = "d";
 
   WebSocketV1Transport.PING_SEQ= "s";
   WebSocketV1Transport.PONG_SEQ = "s";

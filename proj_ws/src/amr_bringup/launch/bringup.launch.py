@@ -318,6 +318,15 @@ def generate_launch_description():
         condition=IfCondition(use_hook),
     )
 
+    # 9c) Doors on the nav map: set from goal_picker, relay pulse on pass
+    door_manager_node = Node(
+        package='amr_bringup',
+        executable='door_manager_node.py',
+        name='door_manager',
+        output='screen',
+        condition=IfCondition(use_hook),
+    )
+
     # 10) USB gamepad teleop (Manual mode)
     joy_node = Node(
         package='joy',
@@ -377,6 +386,7 @@ def generate_launch_description():
         depth_camera_launch,
         hook_bridge_node,
         light_state_node,
+        door_manager_node,
         joy_node,
         joy_teleop_node,
     ])

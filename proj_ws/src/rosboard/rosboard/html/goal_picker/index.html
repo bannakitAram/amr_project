@@ -116,6 +116,18 @@
     padding: 10px; z-index: 22; max-height: 55vh; overflow-y: auto; font-size: 13px;
   }
   #bag-panel[hidden] { display: none; }
+  /* doors: set at the robot's pose / delete - see renderDoorPanel(). */
+  #door-panel {
+    position: absolute; left: 10px; right: 10px; bottom: 66px;
+    background: rgba(20,20,20,0.92); color: #eee; border-radius: 10px;
+    padding: 10px; z-index: 22; max-height: 55vh; overflow-y: auto; font-size: 13px;
+  }
+  #door-panel[hidden] { display: none; }
+  #door-panel .title { font-size: 12px; color: #aaa; margin-bottom: 6px; }
+  #door-panel .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+  #door-panel input, #door-panel select { font-size: 16px; padding: 6px; border-radius: 6px;
+    border: 1px solid #555; background: #222; color: #eee; }
+  #door-panel input { flex: 1; min-width: 120px; }
   #bag-panel .title { font-size: 12px; color: #aaa; margin-bottom: 6px; }
   #bag-panel .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
   #bag-panel label { display: block; padding: 5px 2px; word-break: break-all; }
@@ -181,6 +193,7 @@
 
   <div id="station-panel" hidden></div>
   <div id="bag-panel" hidden></div>
+  <div id="door-panel" hidden></div>
   <div id="log-panel" hidden></div>
   <div id="bag-badge" hidden></div>
 
@@ -190,6 +203,7 @@
     <button class="btn" id="mode-path">ลากเส้นทาง</button>
     <button class="btn" id="mode-initpose">ตั้งตำแหน่งเริ่มต้น</button>
     <button class="btn" id="btn-stations">Station</button>
+    <button class="btn" id="btn-doors">ประตู</button>
     <button class="btn" id="btn-bag">บันทึก Bag</button>
     <button class="btn" id="btn-log">Log</button>
     <button class="btn" id="btn-refit">พอดีจอ</button>
@@ -289,6 +303,7 @@ function onAuthResult(result) {
     transport.subscribe({topicName: '/plan', maxUpdateRate: 2.0});
     transport.subscribe({topicName: '/mppi_local_plan', maxUpdateRate: 5.0});
     transport.subscribe({topicName: '/amr_stations', maxUpdateRate: 1.0});
+    transport.subscribe({topicName: '/amr_doors', maxUpdateRate: 1.0});
     transport.subscribe({topicName: '/rosboard_bag_state', maxUpdateRate: 2.0});
     transport.subscribe({topicName: '/nav_alert', maxUpdateRate: 2.0});
     transport.subscribe({topicName: '/rosout', maxUpdateRate: 30.0});
@@ -323,6 +338,7 @@ function onRosMsg(msg) {
   else if (msg._topic_name === '/plan') handlePlan(msg);
   else if (msg._topic_name === '/mppi_local_plan') handleLocalPlan(msg);
   else if (msg._topic_name === '/amr_stations') handleStations(msg);
+  else if (msg._topic_name === '/amr_doors') handleDoors(msg);
   else if (msg._topic_name === '/rosboard_bag_state') handleBagState(msg);
   else if (msg._topic_name === '/nav_alert') handleNavAlert(msg);
   else if (msg._topic_name === '/rosout') handleLog(msg);
@@ -412,7 +428,7 @@ setInterval(() => updateLogLines(false), 500);
 
 btnLog.addEventListener('click', () => {
   if (logPanel.hidden) {
-    hideConfirm(); stationPanel.hidden = true; bagPanel.hidden = true;
+    hideConfirm(); stationPanel.hidden = true; bagPanel.hidden = true; doorPanel.hidden = true;
     logPanel.hidden = false; renderLogPanel();
   } else logPanel.hidden = true;
 });
@@ -779,6 +795,7 @@ function redraw() {
   if (robotPose) drawRobot(robotPose);
 
   drawStations();
+  drawDoors();
   if (activeGoal) drawGoalPin(activeGoal);
   if ((mode === 'goal' || mode === 'initpose') && goalDraft) drawGoalDraft(goalDraft, mode === 'initpose');
   if (mode === 'path' && pathDraft) drawPathDraft(pathDraft.points);
@@ -1082,8 +1099,116 @@ function sendToStation(s) {
 }
 
 document.getElementById('btn-stations').addEventListener('click', () => {
-  if (stationPanel.hidden) { hideConfirm(); bagPanel.hidden = true; logPanel.hidden = true; renderStationPanel(); stationPanel.hidden = false; }
+  if (stationPanel.hidden) { hideConfirm(); bagPanel.hidden = true; logPanel.hidden = true; doorPanel.hidden = true; renderStationPanel(); stationPanel.hidden = false; }
   else stationPanel.hidden = true;
+});
+
+// ---------- doors (amr_bringup door_manager_node.py, /amr_doors) ----------
+// {map, doors: [{name, x, y, radius, relay, pulse_s}]} at 1 Hz. A door is set
+// at the robot's CURRENT pose (drive there first); the browser only sends the
+// name and relay. In Auto the robot pulses the door's relay when it enters
+// the circle; it does not stop for the door.
+var doors = [];   // var: redraw() may run before this line
+var doorsMap = '';
+var doorsAt = 0;
+const doorPanel = document.getElementById('door-panel');
+
+function handleDoors(msg) {
+  try {
+    const d = JSON.parse(msg.data);
+    const list = (d.doors || []).filter(
+      (o) => o && isFinite(o.x) && isFinite(o.y) && isFinite(o.radius) && typeof o.name === 'string');
+    const changed = JSON.stringify(list) !== JSON.stringify(doors) || d.map !== doorsMap;
+    doors = list; doorsMap = d.map || ''; doorsAt = Date.now();
+    if (changed) { if (!doorPanel.hidden) renderDoorPanel(); redraw(); }
+  } catch (e) {}
+}
+
+function drawDoors() {
+  if (!doors || !doorsAt || Date.now() - doorsAt > 5000) return;
+  for (const o of doors) {
+    const p = worldToScreen(o.x, o.y);
+    const e = worldToScreen(o.x + o.radius, o.y);
+    const r = Math.max(4, Math.hypot(e.x - p.x, e.y - p.y));
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = 'rgba(255,152,0,0.18)'; ctx.strokeStyle = '#ff9800'; ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#ff9800';
+    ctx.fillRect(p.x - 5, p.y - 8, 10, 16);
+    ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center';
+    ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    const label = '🚪 ' + o.name + ' (R' + o.relay + ')';
+    ctx.strokeText(label, p.x, p.y - 12); ctx.fillStyle = 'white'; ctx.fillText(label, p.x, p.y - 12);
+    ctx.restore();
+  }
+}
+
+function renderDoorPanel() {
+  doorPanel.innerHTML = '';
+  const fresh = Date.now() - doorsAt < 5000 && doorsMap;
+  const title = document.createElement('div');
+  title.className = 'title';
+  title.textContent = !fresh ? 'ไม่มีข้อมูลประตู (เปิดโหมด Navigation ที่ AMR control panel)'
+    : 'ประตูในแผนที่ ' + doorsMap + ' - ขับหุ่นไปจอดกลางช่องประตูก่อน แล้วกดตั้ง';
+  doorPanel.appendChild(title);
+  if (!fresh) return;
+
+  const row = document.createElement('div');
+  row.className = 'row';
+  const name = document.createElement('input');
+  name.placeholder = 'ชื่อประตู เช่น A';
+  name.maxLength = 24;
+  const relay = document.createElement('select');
+  for (const n of [1, 2, 3]) {
+    const o = document.createElement('option');
+    o.value = n; o.textContent = 'Relay ' + n + ' (D' + (29 + n) + ')';
+    relay.appendChild(o);
+  }
+  const add = document.createElement('button');
+  add.className = 'btn primary';
+  add.textContent = 'ตั้งประตูที่ตำแหน่งหุ่นตอนนี้';
+  add.onclick = () => {
+    const n = name.value.trim().replace(/[^\p{L}\p{M}\p{N}_\- ]/gu, '');
+    if (!n) { alert('ใส่ชื่อประตูก่อน'); return; }
+    const pose = tfLookup('map', 'base_footprint');
+    if (!pose) { alert('ยังไม่รู้ตำแหน่งหุ่น (ไม่มี TF map -> base_footprint)'); return; }
+    const exists = doors.some((o) => o.name === n);
+    if (!confirm((exists ? 'ย้าย' : 'ตั้ง') + 'ประตู "' + n + '" ที่ตำแหน่งหุ่นตอนนี้ (' +
+        pose.x.toFixed(2) + ', ' + pose.y.toFixed(2) + ') ม. ใช้ Relay ' + relay.value + '?')) return;
+    transport.doorCmd({action: 'add', name: n, relay: parseInt(relay.value, 10)});
+  };
+  row.appendChild(name); row.appendChild(relay); row.appendChild(add);
+  doorPanel.appendChild(row);
+
+  if (!doors.length) {
+    const d = document.createElement('div');
+    d.textContent = 'ยังไม่มีประตู';
+    doorPanel.appendChild(d);
+  }
+  for (const o of doors) {
+    const r = document.createElement('div');
+    r.className = 'row';
+    const t = document.createElement('span');
+    t.style.flex = '1';
+    t.textContent = o.name + '  Relay ' + o.relay + '  (' + o.x.toFixed(2) + ', ' + o.y.toFixed(2) +
+      ') r=' + o.radius + ' ม.';
+    const del = document.createElement('button');
+    del.className = 'btn danger';
+    del.textContent = 'ลบ';
+    del.onclick = () => { if (confirm('ลบประตู "' + o.name + '"?')) transport.doorCmd({action: 'delete', name: o.name}); };
+    r.appendChild(t); r.appendChild(del);
+    doorPanel.appendChild(r);
+  }
+}
+
+document.getElementById('btn-doors').addEventListener('click', () => {
+  if (doorPanel.hidden) {
+    hideConfirm(); stationPanel.hidden = true; bagPanel.hidden = true; logPanel.hidden = true;
+    renderDoorPanel(); doorPanel.hidden = false;
+  } else doorPanel.hidden = true;
 });
 
 // ---------- rosbag recorder ----------
@@ -1259,7 +1384,7 @@ function renderBagPanel() {
 }
 
 btnBag.addEventListener('click', () => {
-  if (bagPanel.hidden) { hideConfirm(); stationPanel.hidden = true; logPanel.hidden = true; renderBagPanel(); bagPanel.hidden = false; }
+  if (bagPanel.hidden) { hideConfirm(); stationPanel.hidden = true; logPanel.hidden = true; doorPanel.hidden = true; renderBagPanel(); bagPanel.hidden = false; }
   else bagPanel.hidden = true;
 });
 

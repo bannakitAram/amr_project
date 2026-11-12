@@ -195,6 +195,8 @@ class ROSBoardNode(object):
         # name are forwarded; the AMR Control panel is the only consumer and
         # owns the actual slam_toolbox pause and map_saver calls.
         self.mapping_cmd_pub = rospy.Publisher("/rosboard_mapping_cmd", String, queue_size=5)
+        # door edits from goal_picker -> amr_bringup door_manager_node.py
+        self.door_cmd_pub = rospy.Publisher("/rosboard_door_cmd", String, queue_size=5)
         # route_* = fixed route / planner switch for station goals, same consumer
         self.MAPPING_ACTIONS = ("start", "pause", "save", "finish", "route_fixed", "route_planner")
 
@@ -309,6 +311,24 @@ class ROSBoardNode(object):
             return
         name = re.sub(r"[^A-Za-z0-9_\-]", "", str(name or "").strip().replace(" ", "_"))[:40]
         self.mapping_cmd_pub.publish(String(data=json.dumps({"action": action, "name": name})))
+
+    def on_door_cmd(self, action, name, relay):
+        """Forward a validated door edit as JSON on /rosboard_door_cmd. The
+        door position is the robot's pose, taken by door_manager_node.py,
+        never from the browser."""
+        if action not in ("add", "delete"):
+            print("error: door: bad action %r" % (action,))
+            return
+        name = re.sub(r"[\x00-\x1f\x7f\"'\\/<>:;{}\[\]]", "", str(name or "")).strip()[:24]
+        if not name:
+            return
+        cmd = {"action": action, "name": name}
+        if action == "add":
+            if relay not in (1, 2, 3):
+                print("error: door: bad relay %r" % (relay,))
+                return
+            cmd["relay"] = relay
+        self.door_cmd_pub.publish(String(data=json.dumps(cmd, ensure_ascii=False)))
 
     def on_bag_cmd(self, action, topics):
         """Start/stop `ros2 bag record` for the goal_picker page. Only
