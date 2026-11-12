@@ -15,7 +15,9 @@ Topics:
   /motor_current/left, /motor_current/right
                std_msgs/Float32 out, A: drive wheel motor current from the
                Mega's ACS712 sensors ("CUR <left> <right>", 5 Hz). Monitor
-               only - nothing acts on it.
+               only - nothing acts on it. The right motor is mirrored, so
+               its raw value is negative when driving forward; it is multiplied
+               by `current_right_sign` (-1) so + = driving forward on both.
   /light/cmd   std_msgs/String in: tower light pattern from light_state_node.py
                (IDLE / AUTO / MANUAL / OBSTACLE / FAULT), forwarded as L<n>
                every `light_period_s`. Stops forwarding if /light/cmd goes
@@ -63,6 +65,8 @@ class HookBridge(Node):
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.state_pub = self.create_publisher(String, '/hook/state', latched)
         self.create_subscription(String, '/hook/cmd', self.on_cmd, 10)
+        self.current_right_sign = float(
+            self.declare_parameter('current_right_sign', -1.0).value)
         self.cur_left_pub = self.create_publisher(Float32, '/motor_current/left', 10)
         self.cur_right_pub = self.create_publisher(Float32, '/motor_current/right', 10)
         self.create_subscription(String, '/light/cmd', self.on_light, 10)
@@ -173,7 +177,7 @@ class HookBridge(Node):
                                    throttle_duration_sec=10.0)
             return
         self.cur_left_pub.publish(Float32(data=left))
-        self.cur_right_pub.publish(Float32(data=right))
+        self.cur_right_pub.publish(Float32(data=right * self.current_right_sign))
 
     # ---- timers / callbacks ---------------------------------------------
     def on_poll(self):
