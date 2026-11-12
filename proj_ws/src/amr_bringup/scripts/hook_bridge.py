@@ -26,8 +26,12 @@ Topics:
                standstill - auto-zero would hide that up to the clamp).
   /battery/raw std_msgs/String out: raw reply line of the Junctek KG-F
                coulometer ("BAT <reply>", ~1 Hz, RS485 on the Mega's Serial1).
-               Field decoding to be added once the reply is checked against
-               the meter's display. Monitor only.
+               Monitor only.
+  /battery/state sensor_msgs/BatteryState out, decoded from ":r50=" replies:
+               field 3 = voltage x0.01 V, field 4 = current x0.01 A (as
+               measured, sign not applied yet). Other fields (Ah, %, temp,
+               direction) are NaN/unknown until checked against the meter
+               display. Our own ":R50" command echoed back is ignored.
   /light/cmd   std_msgs/String in: tower light pattern from light_state_node.py
                (IDLE / AUTO / MANUAL / OBSTACLE / FAULT), forwarded as L<n>
                every `light_period_s`. Stops forwarding if /light/cmd goes
@@ -54,6 +58,7 @@ import rclpy.executors
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Float32, String
 import serial
 
@@ -93,6 +98,7 @@ class HookBridge(Node):
         self.cur_right_pub = self.create_publisher(Float32, '/motor_current/right', 10)
         self.bat_raw_pub = self.create_publisher(String, '/battery/raw', 10)
         self.bat_seen = False
+        self.bat_pub = self.create_publisher(BatteryState, '/battery/state', 10)
         self.create_subscription(String, '/light/cmd', self.on_light, 10)
         self.light = None       # latest light code
         self.light_rx = None    # time of the latest /light/cmd
@@ -193,6 +199,7 @@ class HookBridge(Node):
                     self.get_logger().info('first coulometer reply: %s' % line[4:])
                     self.bat_seen = True
                 self.bat_raw_pub.publish(String(data=line[4:]))
+                self.on_battery(line[4:])
             elif line == 'HOOK READY':
                 self.get_logger().info('Mega (re)booted')
             else:
@@ -210,6 +217,31 @@ class HookBridge(Node):
         right -= self.zero[1]
         self.cur_left_pub.publish(Float32(data=left))
         self.cur_right_pub.publish(Float32(data=right * self.current_right_sign))
+
+    def on_battery(self, reply):
+        if not reply.startswith(':r50='):
+            return                      # own command echoed back, or noise
+        try:
+            f = [int(v) for v in reply[5:].strip(',').split(',')]
+            voltage, current = f[2] * 0.01, f[3] * 0.01
+        except (ValueError, IndexError):
+            self.get_logger().warn('bad coulometer reply "%s"' % reply,
+                                   throttle_duration_sec=10.0)
+            return
+        msg = BatteryState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.voltage = voltage
+        msg.current = current
+        msg.temperature = float('nan')
+        msg.charge = float('nan')
+        msg.capacity = float('nan')
+        msg.design_capacity = float('nan')
+        msg.percentage = float('nan')
+        msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_UNKNOWN
+        msg.power_supply_health = BatteryState.POWER_SUPPLY_HEALTH_UNKNOWN
+        msg.power_supply_technology = BatteryState.POWER_SUPPLY_TECHNOLOGY_UNKNOWN
+        msg.present = True
+        self.bat_pub.publish(msg)
 
     def on_odom(self, msg):
         now = time.monotonic()
