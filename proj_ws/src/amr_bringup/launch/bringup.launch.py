@@ -42,7 +42,57 @@ def _software_version():
     except Exception as e:  # not a git checkout, git missing, ...
         return 'unknown (%s)' % e.__class__.__name__
 
+
+def _wait_for_time_sync():
+    """Block until the system clock is NTP-synchronised (or timeout).
+
+    The Jetson has no RTC battery: it boots with the last saved time and
+    systemd-timesyncd later steps the clock forward (seen: +16 h). If that
+    jump happens while ROS is running, TF/AMCL/costmaps get stale stamps and
+    Nav2 hangs in "Activating planner_server" (station goals ignored), and
+    collision_monitor may drop sensor data. So wait before starting nodes.
+
+    Env: AMR_TIME_SYNC_TIMEOUT (s, default 120; 0 = skip the check).
+    Returns a status string for the launch log.
+    """
+    import time
+    timeout = float(os.environ.get('AMR_TIME_SYNC_TIMEOUT', '120'))
+    if timeout <= 0:
+        return 'check skipped (AMR_TIME_SYNC_TIMEOUT=0)'
+
+    def synced():
+        try:
+            out = subprocess.run(
+                ['timedatectl', 'show', '-p', 'NTPSynchronized', '--value'],
+                capture_output=True, text=True, timeout=5).stdout.strip()
+            return out == 'yes'
+        except Exception:
+            return None  # cannot tell (no timedatectl)
+
+    t0 = time.monotonic()
+    state = synced()
+    if state is None:
+        return 'unknown (timedatectl unavailable)'
+    if not state:
+        print('[bringup] waiting for NTP time sync (max %.0f s) ...' % timeout,
+              flush=True)
+    while not state and time.monotonic() - t0 < timeout:
+        time.sleep(2.0)
+        state = synced()
+    waited = time.monotonic() - t0
+    if state:
+        return 'synchronized (waited %.0f s)' % waited
+    print('\n' + '!' * 70 +
+          '\n[bringup] WARNING: clock NOT NTP-synchronised after %.0f s.'
+          '\n  If it syncs later the clock will jump and Nav2/TF will break:'
+          '\n  restart bringup after `timedatectl` shows synchronized: yes.'
+          '\n  NOT for line use in this state.\n' % waited + '!' * 70,
+          flush=True)
+    return 'NOT synchronized after %.0f s' % waited
+
+
 def generate_launch_description():
+    time_sync_status = _wait_for_time_sync()
     pkg_description = get_package_share_directory('amr_description')
     pkg_slam = get_package_share_directory('amr_slam')
     pkg_navigation = get_package_share_directory('amr_navigation')
@@ -56,6 +106,7 @@ def generate_launch_description():
     use_depth_camera = LaunchConfiguration('depth_camera')
     use_slam = LaunchConfiguration('slam')
     use_hook = LaunchConfiguration('hook')
+    use_joystick = LaunchConfiguration('joystick')
     hook_port = LaunchConfiguration('hook_port')
     use_navigation = LaunchConfiguration('navigation')
     nav_map = LaunchConfiguration('map')
@@ -81,11 +132,16 @@ def generate_launch_description():
                      'for Nav2 obstacle avoidance; set false if the camera is unplugged')
     declare_use_hook = DeclareLaunchArgument(
         'hook', default_value='true',
-        description='Launch hook_bridge (Arduino Mega hook lift <-> /hook/state, /hook/cmd); '
+        description='Launch hook_bridge + light_state (Arduino Mega: hook lift <-> /hook/state, '
+                    '/hook/cmd; tower light <- /light/cmd); '
                     'set false if the hook controller is unplugged')
     declare_hook_port = DeclareLaunchArgument(
         'hook_port', default_value='/dev/hook',
         description='Serial port of the hook Mega (udev/99-amr-hook.rules)')
+    declare_use_joystick = DeclareLaunchArgument(
+        'joystick', default_value='false',
+        description='Launch joy_node + joy_teleop (USB gamepad -> /cmd_vel, hold LB to '
+                    'drive). AMR Control panel Manual mode only: bypasses collision_monitor')
     declare_use_slam = DeclareLaunchArgument(
         'slam', default_value='true',
         description='Launch slam_toolbox for mapping. Mutually exclusive with navigation '
@@ -252,6 +308,32 @@ def generate_launch_description():
         output='screen',
         condition=IfCondition(use_hook),
     )
+    # 9b) Tower light pattern -> /light/cmd -> hook_bridge -> Mega (same
+    #     board as the hook, so same on/off switch)
+    light_state_node = Node(
+        package='amr_bringup',
+        executable='light_state_node.py',
+        name='light_state',
+        output='screen',
+        condition=IfCondition(use_hook),
+    )
+
+    # 10) USB gamepad teleop (Manual mode)
+    joy_node = Node(
+        package='joy',
+        executable='joy_node',
+        name='joy_node',
+        parameters=[{'deadzone': 0.1, 'autorepeat_rate': 20.0}],
+        output='screen',
+        condition=IfCondition(use_joystick),
+    )
+    joy_teleop_node = Node(
+        package='amr_bringup',
+        executable='joy_teleop_node.py',
+        name='joy_teleop',
+        output='screen',
+        condition=IfCondition(use_joystick),
+    )
 
     version = _software_version()
     version_log = LogInfo(msg='AMR software version: ' + version + (
@@ -267,6 +349,9 @@ def generate_launch_description():
     return LaunchDescription([
         fastdds_profile,
         version_log,
+        LogInfo(msg='System clock (NTP): ' + time_sync_status + (
+            '' if time_sync_status.startswith(('synchronized', 'check skipped'))
+            else '  ** clock may jump - not for line use **')),
         declare_use_sim_time,
         declare_use_rviz,
         declare_use_foxglove,
@@ -278,6 +363,7 @@ def generate_launch_description():
         declare_slam_start_scanning,
         declare_use_hook,
         declare_hook_port,
+        declare_use_joystick,
         description_launch,
         micro_ros_agent_node,
         wheel_joint_state_publisher_node,
@@ -290,4 +376,7 @@ def generate_launch_description():
         foxglove_launch,
         depth_camera_launch,
         hook_bridge_node,
+        light_state_node,
+        joy_node,
+        joy_teleop_node,
     ])
