@@ -10,6 +10,10 @@
 //          L3 obstacle    yellow steady (collision_monitor holding it)
 //          L4 fault       red steady (sensor watchdog, ...)
 // Replies (one line): STATE <IDLE|UP|DOWN|MOVING_UP|MOVING_DOWN|FAULT> [reason]
+// Unsolicited every CURRENT_PERIOD_MS:  CUR <left_A> <right_A>
+//   drive wheel motor current from ACS712 sensors on A2 (left) / A3 (right),
+//   mean over the period (smooths PWM ripple), signed (sign = direction).
+//   Monitor only - nothing in this firmware acts on it.
 //
 // Tower light (24 V, R/Y/G) via a 3-channel relay module on D26/D27/D28.
 // Local states override the Jetson's pattern:
@@ -49,6 +53,8 @@ const uint8_t PIN_SW4 = 25;
 const uint8_t PIN_LAMP_RED    = 26;
 const uint8_t PIN_LAMP_YELLOW = 27;
 const uint8_t PIN_LAMP_GREEN  = 28;
+const uint8_t PIN_CUR_LEFT  = A2;
+const uint8_t PIN_CUR_RIGHT = A3;
 
 // ---- Config -----------------------------------------------------------
 // NC switch to GND (recommended, fail-safe): pressed or broken wire = HIGH.
@@ -68,6 +74,16 @@ const uint32_t DEBOUNCE_MS      = 15;
 const uint32_t BUTTON_HOLD_MS   = 1000;
 const uint32_t SERIAL_BAUD      = 115200;
 const uint32_t LIGHT_TIMEOUT_MS = 2000;   // Jetson resends every 500 ms
+
+// ACS712 current sensors (5 V supply, output ratiometric to Vcc).
+// mV per A: ACS712-05B 185, -20A 100, -30A 66. Set from the chip marking.
+const float    CUR_MV_PER_A      = 100.0;
+// ADC count at 0 A (ideal 512 = Vcc/2). Calibrate with motors stopped:
+// read the CUR value, offset_counts = 512 + A * CUR_MV_PER_A / 4.883.
+const float    CUR_ZERO_LEFT     = 512.0;
+const float    CUR_ZERO_RIGHT    = 512.0;
+const uint32_t CUR_SAMPLE_MS     = 2;
+const uint32_t CUR_PERIOD_MS     = 200;   // CUR line rate 5 Hz
 
 // ---- State ------------------------------------------------------------
 enum State { IDLE, AT_UP, AT_DOWN, MOVING_UP, MOVING_DOWN, FAULT };
@@ -96,6 +112,10 @@ enum LightCmd { L_IDLE, L_AUTO, L_MANUAL, L_OBSTACLE, L_FAULT, L_COUNT };
 uint8_t lightCmd = L_IDLE;
 uint32_t lightCmdMs = 0;
 bool lightCmdSeen = false;      // none yet since boot -> link-lost pattern
+
+uint32_t curSumL = 0, curSumR = 0;
+uint16_t curCount = 0;
+uint32_t curSampleMs = 0, curReportMs = 0;
 
 char rxBuf[16];
 uint8_t rxLen = 0;
@@ -206,6 +226,28 @@ void updateLights(uint32_t now) {
     case L_OBSTACLE: lamps(false, true, false);             break;
     case L_FAULT:    lamps(true, false, false);             break;
     default:         lamps(false, false, true);             break;  // L_IDLE
+  }
+}
+
+// ---- Wheel motor current (monitor only) -------------------------------
+void updateCurrent(uint32_t now) {
+  if (now - curSampleMs >= CUR_SAMPLE_MS) {
+    curSampleMs = now;
+    curSumL += analogRead(PIN_CUR_LEFT);
+    curSumR += analogRead(PIN_CUR_RIGHT);
+    curCount++;
+  }
+  if (now - curReportMs >= CUR_PERIOD_MS && curCount > 0) {
+    curReportMs = now;
+    const float aPerCount = (5000.0 / 1024.0) / CUR_MV_PER_A;
+    float left  = ((float)curSumL / curCount - CUR_ZERO_LEFT)  * aPerCount;
+    float right = ((float)curSumR / curCount - CUR_ZERO_RIGHT) * aPerCount;
+    curSumL = curSumR = 0;
+    curCount = 0;
+    Serial.print(F("CUR "));
+    Serial.print(left, 2);
+    Serial.print(' ');
+    Serial.println(right, 2);
   }
 }
 
@@ -340,6 +382,7 @@ void loop() {
   // was taken (motorRun blocks for the dead time); re-read so the timeout
   // check below cannot underflow.
   now = millis();
+  updateCurrent(now);
 
   if (limitUp.stable && limitDown.stable) {
     if (state != FAULT) enterFault("BOTH_LIMITS");

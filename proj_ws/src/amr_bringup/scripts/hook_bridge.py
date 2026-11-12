@@ -12,6 +12,10 @@ Topics:
                "FAULT TIMEOUT_UP". "UNKNOWN" when the port is not open or
                the Mega has not answered for `timeout_s`.
   /hook/cmd    std_msgs/String in: "U", "D", "S", "R" or "?" (case-insensitive)
+  /motor_current/left, /motor_current/right
+               std_msgs/Float32 out, A: drive wheel motor current from the
+               Mega's ACS712 sensors ("CUR <left> <right>", 5 Hz). Monitor
+               only - nothing acts on it.
   /light/cmd   std_msgs/String in: tower light pattern from light_state_node.py
                (IDLE / AUTO / MANUAL / OBSTACLE / FAULT), forwarded as L<n>
                every `light_period_s`. Stops forwarding if /light/cmd goes
@@ -35,7 +39,7 @@ import rclpy
 import rclpy.executors
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
-from std_msgs.msg import String
+from std_msgs.msg import Float32, String
 import serial
 
 VALID_CMDS = {'U', 'D', 'S', 'R', '?'}
@@ -59,6 +63,8 @@ class HookBridge(Node):
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.state_pub = self.create_publisher(String, '/hook/state', latched)
         self.create_subscription(String, '/hook/cmd', self.on_cmd, 10)
+        self.cur_left_pub = self.create_publisher(Float32, '/motor_current/left', 10)
+        self.cur_right_pub = self.create_publisher(Float32, '/motor_current/right', 10)
         self.create_subscription(String, '/light/cmd', self.on_light, 10)
         self.light = None       # latest light code
         self.light_rx = None    # time of the latest /light/cmd
@@ -152,10 +158,22 @@ class HookBridge(Node):
             self.last_rx = self.now_s()
             if line.startswith('STATE '):
                 self.publish_state(line[len('STATE '):].strip())
+            elif line.startswith('CUR '):
+                self.on_current(line)
             elif line == 'HOOK READY':
                 self.get_logger().info('Mega (re)booted')
             else:
                 self.get_logger().warn('Mega: %s' % line)
+
+    def on_current(self, line):
+        try:
+            left, right = (float(v) for v in line.split()[1:3])
+        except ValueError:
+            self.get_logger().warn('bad CUR line "%s"' % line,
+                                   throttle_duration_sec=10.0)
+            return
+        self.cur_left_pub.publish(Float32(data=left))
+        self.cur_right_pub.publish(Float32(data=right))
 
     # ---- timers / callbacks ---------------------------------------------
     def on_poll(self):
