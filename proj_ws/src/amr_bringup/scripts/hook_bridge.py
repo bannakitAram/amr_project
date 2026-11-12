@@ -12,6 +12,11 @@ Topics:
                "FAULT TIMEOUT_UP". "UNKNOWN" when the port is not open or
                the Mega has not answered for `timeout_s`.
   /hook/cmd    std_msgs/String in: "U", "D", "S", "R" or "?" (case-insensitive)
+  /light/cmd   std_msgs/String in: tower light pattern from light_state_node.py
+               (IDLE / AUTO / MANUAL / OBSTACLE / FAULT), forwarded as L<n>
+               every `light_period_s`. Stops forwarding if /light/cmd goes
+               quiet for `light_timeout_s`, so the Mega's own link watchdog
+               turns the tower red-blink when light_state_node dies too.
 
 The Mega only reports on change, so the bridge sends '?' every
 `poll_period_s`; any line received counts as alive. Opening the port
@@ -34,6 +39,8 @@ from std_msgs.msg import String
 import serial
 
 VALID_CMDS = {'U', 'D', 'S', 'R', '?'}
+# must match LightCmd in arduino/src/main.cpp
+LIGHT_CODES = {'IDLE': 0, 'AUTO': 1, 'MANUAL': 2, 'OBSTACLE': 3, 'FAULT': 4}
 
 
 class HookBridge(Node):
@@ -45,10 +52,16 @@ class HookBridge(Node):
         # > poll period + Mega boot time after a DTR reset
         self.timeout_s = self.declare_parameter('timeout_s', 3.0).value
         self.reconnect_period_s = self.declare_parameter('reconnect_period_s', 2.0).value
+        self.light_period_s = self.declare_parameter('light_period_s', 0.5).value
+        # < the Mega's LIGHT_TIMEOUT_MS (2 s) minus one resend
+        self.light_timeout_s = self.declare_parameter('light_timeout_s', 1.5).value
 
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.state_pub = self.create_publisher(String, '/hook/state', latched)
         self.create_subscription(String, '/hook/cmd', self.on_cmd, 10)
+        self.create_subscription(String, '/light/cmd', self.on_light, 10)
+        self.light = None       # latest light code
+        self.light_rx = None    # time of the latest /light/cmd
 
         self.ser = None
         self.lock = threading.Lock()  # guards self.ser writes / close
@@ -57,6 +70,7 @@ class HookBridge(Node):
         self.publish_state('UNKNOWN')
 
         self.create_timer(self.poll_period_s, self.on_poll)
+        self.create_timer(self.light_period_s, self.on_light_timer)
         self.create_timer(0.2, self.on_watchdog)
         self.create_timer(self.reconnect_period_s, self.ensure_open)
         self.ensure_open()
@@ -152,6 +166,20 @@ class HookBridge(Node):
             self.publish_state('UNKNOWN')
         elif self.now_s() - self.last_rx > self.timeout_s:
             self.publish_state('UNKNOWN')
+
+    def on_light(self, msg):
+        code = LIGHT_CODES.get(msg.data.strip().upper())
+        if code is None:
+            self.get_logger().warn('ignored /light/cmd "%s"' % msg.data,
+                                   throttle_duration_sec=10.0)
+            return
+        self.light = code
+        self.light_rx = self.now_s()
+
+    def on_light_timer(self):
+        if self.light is None or self.now_s() - self.light_rx > self.light_timeout_s:
+            return  # silence -> Mega shows link-lost (red blink) by itself
+        self.send('L%d' % self.light)
 
     def on_cmd(self, msg):
         cmd = msg.data.strip().upper()

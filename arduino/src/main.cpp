@@ -2,7 +2,21 @@
 //
 // Serial (115200, newline-terminated) from the Jetson:
 //   U = raise   D = lower   S = stop   R = reset fault   ? = report state
+//   L<n> = tower light pattern from the Jetson (light_state_node.py via
+//          hook_bridge.py), resent every 0.5 s:
+//          L0 idle        green steady
+//          L1 auto        yellow blink 1 Hz (Nav2 goal active / moving)
+//          L2 manual      yellow blink 2.5 Hz (joystick driving)
+//          L3 obstacle    yellow steady (collision_monitor holding it)
+//          L4 fault       red steady (sensor watchdog, ...)
 // Replies (one line): STATE <IDLE|UP|DOWN|MOVING_UP|MOVING_DOWN|FAULT> [reason]
+//
+// Tower light (24 V, R/Y/G) via a 3-channel relay module on D26/D27/D28.
+// Local states override the Jetson's pattern:
+//   hook FAULT           -> red steady
+//   no L<n> for LIGHT_TIMEOUT_MS (Jetson/ROS hung, cable out, after boot)
+//                        -> red blink 1 Hz
+//   hook moving          -> yellow + green blink 1 Hz
 //
 // Limit switches on A1 (top) / A0 (bottom), INPUT_PULLUP.
 // Local push button on D4 to board GND (0V), INPUT_PULLUP:
@@ -32,6 +46,9 @@ const uint8_t PIN_SW1 = 22;
 const uint8_t PIN_SW2 = 23;
 const uint8_t PIN_SW3 = 24;
 const uint8_t PIN_SW4 = 25;
+const uint8_t PIN_LAMP_RED    = 26;
+const uint8_t PIN_LAMP_YELLOW = 27;
+const uint8_t PIN_LAMP_GREEN  = 28;
 
 // ---- Config -----------------------------------------------------------
 // NC switch to GND (recommended, fail-safe): pressed or broken wire = HIGH.
@@ -50,6 +67,7 @@ const uint32_t MOVE_TIMEOUT_MS  = 8000;   // normal travel time + margin
 const uint32_t DEBOUNCE_MS      = 15;
 const uint32_t BUTTON_HOLD_MS   = 1000;
 const uint32_t SERIAL_BAUD      = 115200;
+const uint32_t LIGHT_TIMEOUT_MS = 2000;   // Jetson resends every 500 ms
 
 // ---- State ------------------------------------------------------------
 enum State { IDLE, AT_UP, AT_DOWN, MOVING_UP, MOVING_DOWN, FAULT };
@@ -73,6 +91,11 @@ Debounced button    = {PIN_BUTTON,     LOW,                false, false, 0};
 bool lastMoveUp = false;        // direction of the last move started
 uint32_t buttonPressedMs = 0;
 bool buttonHandled = false;     // one action per press; release to re-arm
+
+enum LightCmd { L_IDLE, L_AUTO, L_MANUAL, L_OBSTACLE, L_FAULT, L_COUNT };
+uint8_t lightCmd = L_IDLE;
+uint32_t lightCmdMs = 0;
+bool lightCmdSeen = false;      // none yet since boot -> link-lost pattern
 
 char rxBuf[16];
 uint8_t rxLen = 0;
@@ -154,6 +177,38 @@ State restingState() {
   return IDLE;
 }
 
+// ---- Tower light ------------------------------------------------------
+// Same active level as the motor relays (RELAY_ON). Lamps are not part of
+// the H-bridge, so no dead time is needed.
+void lamps(bool red, bool yellow, bool green) {
+  digitalWrite(PIN_LAMP_RED,    red    ? RELAY_ON : RELAY_OFF);
+  digitalWrite(PIN_LAMP_YELLOW, yellow ? RELAY_ON : RELAY_OFF);
+  digitalWrite(PIN_LAMP_GREEN,  green  ? RELAY_ON : RELAY_OFF);
+}
+
+// period_ms on/off 50 %, phase from millis() so no state is needed.
+bool blink(uint32_t now, uint32_t period_ms) {
+  return (now % period_ms) < period_ms / 2;
+}
+
+void updateLights(uint32_t now) {
+  bool linkOk = lightCmdSeen && now - lightCmdMs <= LIGHT_TIMEOUT_MS;
+  if (state == FAULT) { lamps(true, false, false); return; }
+  if (!linkOk) { lamps(blink(now, 1000), false, false); return; }
+  if (state == MOVING_UP || state == MOVING_DOWN) {
+    bool on = blink(now, 1000);
+    lamps(false, on, on);
+    return;
+  }
+  switch (lightCmd) {
+    case L_AUTO:     lamps(false, blink(now, 1000), false); break;
+    case L_MANUAL:   lamps(false, blink(now, 400), false);  break;
+    case L_OBSTACLE: lamps(false, true, false);             break;
+    case L_FAULT:    lamps(true, false, false);             break;
+    default:         lamps(false, false, true);             break;  // L_IDLE
+  }
+}
+
 // ---- Moves ------------------------------------------------------------
 void startUp() {
   if (state == FAULT) { report(); return; }
@@ -229,6 +284,13 @@ void readSerial() {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       if (rxLen == 1) handleCommand(toupper(rxBuf[0]));
+      else if (rxLen == 2 && toupper(rxBuf[0]) == 'L' &&
+               rxBuf[1] >= '0' && rxBuf[1] < '0' + L_COUNT) {
+        // silent (no reply): sent every 0.5 s, would flood the STATE stream
+        lightCmd = rxBuf[1] - '0';
+        lightCmdMs = millis();
+        lightCmdSeen = true;
+      }
       else if (rxLen > 1) Serial.println(F("ERR unknown command"));
       rxLen = 0;
     } else if (rxLen < sizeof(rxBuf)) {
@@ -247,6 +309,10 @@ void setup() {
   pinMode(PIN_SW3, OUTPUT);
   pinMode(PIN_SW4, OUTPUT);
   relaysOff();
+  lamps(false, false, false);  // level first, then OUTPUT (see above)
+  pinMode(PIN_LAMP_RED, OUTPUT);
+  pinMode(PIN_LAMP_YELLOW, OUTPUT);
+  pinMode(PIN_LAMP_GREEN, OUTPUT);
 
   pinMode(PIN_LIMIT_UP, INPUT_PULLUP);
   pinMode(PIN_LIMIT_DOWN, INPUT_PULLUP);
@@ -277,6 +343,7 @@ void loop() {
 
   if (limitUp.stable && limitDown.stable) {
     if (state != FAULT) enterFault("BOTH_LIMITS");
+    updateLights(now);
     return;
   }
 
@@ -297,4 +364,5 @@ void loop() {
       setState(restingState());
       break;
   }
+  updateLights(now);
 }
