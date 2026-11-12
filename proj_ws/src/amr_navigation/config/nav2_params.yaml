@@ -149,9 +149,10 @@ bt_navigator:
 controller_server:
   ros__parameters:
     use_sim_time: false
-    # Matches MPPI's model_dt (0.05s) below - Nav2 warns if the controller
-    # period is shorter than the model's prediction step.
     controller_frequency: 20.0
+    # Default "odom" has no publisher: the controller saw 0 velocity forever, so
+    # RPP's in-place turn was stuck at max_angular_accel * dt = 0.015 rad/s
+    odom_topic: "/odometry/filtered"
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.5
     min_theta_velocity_threshold: 0.001
@@ -162,8 +163,10 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      # In-place turns don't count as progress and take >10 s at this speed
+      # (was 0.5 m / 10 s)
+      required_movement_radius: 0.25
+      movement_time_allowance: 20.0
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
@@ -173,114 +176,42 @@ controller_server:
       xy_goal_tolerance: 0.10
       yaw_goal_tolerance: 6.28
 
-    # MPPI (Model Predictive Path Integral) - sampling-based predictive
-    # controller: rolls out `batch_size` random velocity trajectories over a
-    # `time_steps`*`model_dt` horizon, scores each with the critics below,
-    # and averages toward the lowest-cost ones each control cycle. Reacts to
-    # dynamic obstacles better than DWB's fixed velocity grid, at the cost of
-    # more CPU per cycle.
+    # Regulated Pure Pursuit: follows the planner's path at a constant
+    # desired_linear_vel on straights (MPPI's sampling made the speed wander).
+    # It does not steer around obstacles - it stops and the BT replans.
+    # Slows only for tight curves and the goal; slip limit (/speed_limit)
+    # still applies. Protective stops stay in collision_monitor.
     FollowPath:
-      plugin: "nav2_mppi_controller::MPPIController"
-      time_steps: 56
-      model_dt: 0.05
-      batch_size: 2000
-      vx_std: 0.1    # was 0.2 (= vx_max): smoother launch; Humble MPPI has no ax_max
-      vy_std: 0.0
-      wz_std: 0.2    # was 0.25 (0.4 before wz_max cut) - less jerky turn-in
-      vx_max: 0.30
-      # 0.0, not negative: normal path-following (FollowPath/MPPI) never
-      # plans a reversing trajectory. The BackUp recovery behavior (see
-      # recovery_plugins below) is untouched and still backs up on its own
-      # when the robot gets stuck - that's a separate, deliberate escape
-      # action, not everyday driving.
-      vx_min: 0.0
-      vy_max: 0.0
-      wz_max: 0.50    # was 1.0 - wheels slip badly when turning fast
-      iteration_count: 1
-      prune_distance: 1.7
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      desired_linear_vel: 0.30
+      lookahead_dist: 0.6
+      use_velocity_scaled_lookahead_dist: false
+      min_lookahead_dist: 0.3
+      max_lookahead_dist: 0.9
+      lookahead_time: 1.5
       transform_tolerance: 0.2
-      temperature: 0.3
-      gamma: 0.015
-      motion_model: "DiffDrive"
-      # true: publish /trajectories for local_plan_relay_node.py (goal_picker
-      # local trajectory overlay). Costs CPU - see TrajectoryVisualizer below.
-      visualize: true
-      reset_period: 1.0
-      regenerate_noises: false
-      TrajectoryVisualizer:
-        # Only the optimal trajectory is used (goal_picker); publish just 4
-        # of the 2000 candidates (every 500th) to keep the cost down, and
-        # every time step so the optimal path is full resolution.
-        trajectory_step: 500
-        time_step: 1
-      AckermannConstraints:
-        min_turning_r: 0.2
-      critics:
-        [
-          "ConstraintCritic",
-          "CostCritic",
-          "GoalCritic",
-          "GoalAngleCritic",
-          "PathAlignCritic",
-          "PathFollowCritic",
-          "PathAngleCritic",
-          "PreferForwardCritic",
-        ]
-      ConstraintCritic:
-        enabled: true
-        cost_power: 1
-        cost_weight: 4.0
-      GoalCritic:
-        enabled: true
-        cost_power: 1
-        cost_weight: 5.0
-        threshold_to_consider: 1.4
-      GoalAngleCritic:
-        # off: goal heading is ignored (yaw_goal_tolerance 6.28), so don't
-        # make MPPI turn toward it near the goal
-        enabled: false
-        cost_power: 1
-        cost_weight: 3.0
-        threshold_to_consider: 0.5
-      PreferForwardCritic:
-        enabled: true
-        cost_power: 1
-        cost_weight: 5.0
-        threshold_to_consider: 0.5
-      CostCritic:
-        enabled: true
-        cost_power: 1
-        cost_weight: 3.81
-        critical_cost: 300.0
-        # true: collision-check the actual chassis footprint polygon
-        # (set on local_costmap/global_costmap above) instead of a circle.
-        consider_footprint: true
-        collision_cost: 1000000.0
-        near_goal_distance: 1.0
-        trajectory_point_step: 2
-      PathAlignCritic:
-        enabled: true
-        cost_power: 1
-        cost_weight: 14.0
-        max_path_occupancy_ratio: 0.05
-        trajectory_point_step: 4
-        threshold_to_consider: 0.3   # was 0.5 - keep aligning closer to goal
-        offset_from_furthest: 10     # was 20 - align also on curves/start
-        use_path_orientations: false
-      PathFollowCritic:
-        enabled: true
-        cost_power: 1
-        cost_weight: 8.0    # was 5.0 - robot drifted off a stable plan
-        offset_from_furthest: 5
-        threshold_to_consider: 1.4
-      PathAngleCritic:
-        enabled: true
-        cost_power: 1
-        cost_weight: 2.0
-        offset_from_furthest: 4
-        threshold_to_consider: 0.5
-        max_angle_to_furthest: 1.0
-        mode: 0
+      use_interpolation: true
+      allow_reversing: false
+      # Below ~0.07 m/s the body doesn't follow wheel differential (bag
+      # 20261020_155840), so both speed floors stay above that.
+      min_approach_linear_velocity: 0.08
+      approach_velocity_scaling_dist: 0.6
+      use_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 0.9
+      regulated_linear_scaling_min_speed: 0.10
+      # off: would slow down whenever the path runs through inflation,
+      # i.e. speed changes along corridors
+      use_cost_regulated_linear_velocity_scaling: false
+      use_collision_detection: true
+      max_allowed_time_to_collision_up_to_carrot: 1.5
+      use_rotate_to_heading: true
+      rotate_to_heading_min_angle: 0.785
+      rotate_to_heading_angular_vel: 0.50
+      # RPP limits w to measured w + accel * dt. Stationary: 0.30 * 0.05 =
+      # 0.015 rad/s, too small to start turning, so measured w stays 0 and the
+      # turn never starts. High enough to reach full w from rest in one cycle;
+      # velocity_smoother (open loop) does the real ramp: max_accel[2].
+      max_angular_accel: 10.0
 
 local_costmap:
   local_costmap:
@@ -471,7 +402,7 @@ behavior_server:
     robot_base_frame: base_footprint
     transform_tolerance: 0.2
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.50   # was 1.0 - match MPPI wz_max
+    max_rotational_vel: 0.50   # was 1.0 - match RPP rotate_to_heading_angular_vel
     min_rotational_vel: 0.4
     rotational_acc_lim: 1.0   # was 2.0 - reduce slip during Spin recovery
 
@@ -497,7 +428,7 @@ velocity_smoother:
     # Lowered to reduce wheel slip on start/stop (was 1.0/2.0: 0 -> 0.2 m/s
     # in 0.2 s). Decel kept steeper than accel so stopping distance stays
     # short: 0.2 m/s -> 0 in 0.4 s (~4 cm).
-    max_accel: [0.20, 0.0, 0.40]
+    max_accel: [0.15, 0.0, 0.30]
     max_decel: [-0.50, 0.0, -1.00]
     odom_topic: "/odometry/filtered"
     odom_duration: 0.1
