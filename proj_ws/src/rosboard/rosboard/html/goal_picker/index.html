@@ -1096,6 +1096,10 @@ const btnBag = document.getElementById('btn-bag');
 // topics stop_distance_from_bag.py needs (stop-distance test preset)
 const STOP_TOPICS = ['/cmd_vel', '/cmd_vel_smoothed', '/cmd_vel_nav', '/odometry/filtered',
                      '/wheel/odom', '/scan_filtered', '/tf_static'];
+// motor current + battery V/A log (one-tap button); /cmd_vel and
+// /wheel/odom give the speed the current belongs to
+const POWER_TOPICS = ['/motor_current/left', '/motor_current/right', '/battery/state',
+                      '/cmd_vel', '/wheel/odom'];
 // big topics: warn, they can fill the disk / load the Jetson
 const BAG_HEAVY_TYPES = /PointCloud2|Image|OccupancyGrid/;
 let allTopics = {};   // name -> type, from rosboard's topic list
@@ -1149,6 +1153,8 @@ function renderBagStatus() {
   const stop = document.getElementById('bag-stop');
   const rec = fresh && bagState.recording;
   if (start) start.disabled = rec || bagSelected.size === 0;
+  const power = document.getElementById('bag-power');
+  if (power) power.disabled = rec;
   if (stop) stop.disabled = !rec;
   const ana = document.getElementById('bag-stopdist');
   const busy = fresh && bagState.stop_busy;
@@ -1206,6 +1212,17 @@ function renderBagPanel() {
     STOP_TOPICS.filter(t => t in allTopics).forEach(t => bagSelected.add(t));
     saveBagSelection(); renderBagPanel();
     if (missing.length) alert('ไม่พบ topic: ' + missing.join(', ') + '\nเปิด Navigation ก่อน');
+  });
+  mk2('bag-power', 'primary', 'บันทึก A มอเตอร์ + V/A แบต', () => {
+    const topics = POWER_TOPICS.filter(t => t in allTopics);
+    const missing = POWER_TOPICS.filter(t => !(t in allTopics));
+    if (!topics.some(t => t.startsWith('/motor_current') || t === '/battery/state')) {
+      alert('ไม่พบ /motor_current หรือ /battery/state - hook_bridge (Mega) ทำงานอยู่ไหม?');
+      return;
+    }
+    if (missing.length && !confirm('ไม่พบ topic: ' + missing.join(', ') + '\nบันทึกเท่าที่มี?')) return;
+    bagSelected = new Set(topics); saveBagSelection(); renderBagPanel();
+    transport.bagCmd({action: 'start', topics: topics});
   });
   mk2('bag-stopdist', 'primary', 'วิเคราะห์ระยะหยุด', () => transport.bagCmd({action: 'stop_dist'}));
   bagPanel.appendChild(row2);
