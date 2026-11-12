@@ -28,10 +28,14 @@ Topics:
                coulometer ("BAT <reply>", ~1 Hz, RS485 on the Mega's Serial1).
                Monitor only.
   /battery/state sensor_msgs/BatteryState out, decoded from ":r50=" replies:
-               field 3 = voltage x0.01 V, field 4 = current x0.01 A (as
-               measured, sign not applied yet). Other fields (Ah, %, temp,
-               direction) are NaN/unknown until checked against the meter
-               display. Our own ":R50" command echoed back is ignored.
+               field 3 = voltage x0.01 V, field 4 = current x0.01 A,
+               field 5 = remaining charge x0.001 Ah, field 12 = direction
+               (1 = charging). current is negative while discharging (ROS
+               convention); percentage = charge / `battery_capacity_ah`
+               (0..1). Layout from the Junctek KL110F protocol, voltage and
+               current checked on the robot; charge scale/direction still to
+               be checked against the meter display. Our own ":R50" command
+               echoed back is ignored.
   /light/cmd   std_msgs/String in: tower light pattern from light_state_node.py
                (IDLE / AUTO / MANUAL / OBSTACLE / FAULT), forwarded as L<n>
                every `light_period_s`. Stops forwarding if /light/cmd goes
@@ -98,6 +102,9 @@ class HookBridge(Node):
         self.cur_right_pub = self.create_publisher(Float32, '/motor_current/right', 10)
         self.bat_raw_pub = self.create_publisher(String, '/battery/raw', 10)
         self.bat_seen = False
+        # 2 x 12 V 33 Ah in series = 24 V 33 Ah
+        self.battery_capacity_ah = float(
+            self.declare_parameter('battery_capacity_ah', 33.0).value)
         self.bat_pub = self.create_publisher(BatteryState, '/battery/state', 10)
         self.create_subscription(String, '/light/cmd', self.on_light, 10)
         self.light = None       # latest light code
@@ -224,6 +231,8 @@ class HookBridge(Node):
         try:
             f = [int(v) for v in reply[5:].strip(',').split(',')]
             voltage, current = f[2] * 0.01, f[3] * 0.01
+            charge = f[4] * 0.001
+            charging = f[11] == 1
         except (ValueError, IndexError):
             self.get_logger().warn('bad coulometer reply "%s"' % reply,
                                    throttle_duration_sec=10.0)
@@ -231,13 +240,15 @@ class HookBridge(Node):
         msg = BatteryState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.voltage = voltage
-        msg.current = current
+        msg.current = current if charging else -current
         msg.temperature = float('nan')
-        msg.charge = float('nan')
-        msg.capacity = float('nan')
-        msg.design_capacity = float('nan')
-        msg.percentage = float('nan')
-        msg.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_UNKNOWN
+        msg.charge = charge
+        msg.capacity = self.battery_capacity_ah
+        msg.design_capacity = self.battery_capacity_ah
+        msg.percentage = (max(0.0, min(1.0, charge / self.battery_capacity_ah))
+                          if self.battery_capacity_ah > 0 else float('nan'))
+        msg.power_supply_status = (BatteryState.POWER_SUPPLY_STATUS_CHARGING if charging
+                                   else BatteryState.POWER_SUPPLY_STATUS_DISCHARGING)
         msg.power_supply_health = BatteryState.POWER_SUPPLY_HEALTH_UNKNOWN
         msg.power_supply_technology = BatteryState.POWER_SUPPLY_TECHNOLOGY_UNKNOWN
         msg.present = True
