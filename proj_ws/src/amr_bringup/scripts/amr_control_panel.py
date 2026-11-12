@@ -301,6 +301,85 @@ def save_stations(map_name, stations):
         yaml.safe_dump({'stations': stations}, f, sort_keys=False)
 
 
+# Fixed routes (nav_goal_executor follows them instead of Nav2's planner).
+ROUTE_STEP_M = 0.05       # m between recorded points
+ROUTE_MAX_GAP_M = 0.6     # m - bigger jump between samples = localization jump
+ROUTE_MIN_LEN_M = 0.3     # m
+ROUTE_END_TOL_M = 0.5     # m - start/end must be this close to their stations
+ROUTE_MAX_REVERSE_M = 0.1  # m - the controller can't reverse along a route
+
+
+def routes_path(map_name):
+    return os.path.join(MAPS_DIR, f'{map_name}_routes.yaml')
+
+
+def load_routes(map_name):
+    """Routes saved for a map: list of {from, to, poses: [[x, y, yaw], ...]}."""
+    try:
+        with open(routes_path(map_name)) as f:
+            return (yaml.safe_load(f) or {}).get('routes', [])
+    except (OSError, yaml.YAMLError):
+        return []
+
+
+def routes_enabled(map_name):
+    """False = operator chose the planner although the map has routes."""
+    try:
+        with open(routes_path(map_name)) as f:
+            return (yaml.safe_load(f) or {}).get('use_routes', True) is not False
+    except (OSError, yaml.YAMLError):
+        return True
+
+
+def save_routes(map_name, routes, enabled=None):
+    path = routes_path(map_name)
+    if not routes:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    use = routes_enabled(map_name) if enabled is None else enabled
+    with open(path, 'w') as f:
+        yaml.safe_dump({'use_routes': use, 'routes': routes}, f, sort_keys=False,
+                       default_flow_style=None)
+
+
+def route_from_samples(samples, start, end):
+    """Check recorded (x, y, yaw) samples against the route rules and smooth
+    them. Returns (poses, None), or (None, Thai reason) if unusable."""
+    if len(samples) < 3:
+        return None, 'เส้นทางสั้นเกินไป'
+    length = reverse = 0.0
+    for (x0, y0, yaw0), (x1, y1, _) in zip(samples, samples[1:]):
+        d = math.hypot(x1 - x0, y1 - y0)
+        if d > ROUTE_MAX_GAP_M:
+            return None, f'ตำแหน่งกระโดด {d:.2f} ม. (AMCL) ระหว่างบันทึก'
+        length += d
+        if (x1 - x0) * math.cos(yaw0) + (y1 - y0) * math.sin(yaw0) < 0:
+            reverse += d
+    if length < ROUTE_MIN_LEN_M:
+        return None, 'เส้นทางสั้นเกินไป'
+    if reverse > ROUTE_MAX_REVERSE_M:
+        return None, f'มีการถอยหลัง {reverse:.2f} ม. - ต้องขับเดินหน้าตลอดเส้น'
+    if math.hypot(samples[0][0] - start['x'], samples[0][1] - start['y']) > ROUTE_END_TOL_M:
+        return None, f'จุดเริ่มห่างจาก {start["name"]} เกิน {ROUTE_END_TOL_M} ม.'
+    if math.hypot(samples[-1][0] - end['x'], samples[-1][1] - end['y']) > ROUTE_END_TOL_M:
+        return None, f'จุดจบห่างจาก {end["name"]} เกิน {ROUTE_END_TOL_M} ม.'
+    # moving average removes AMCL jitter; the ends stay where they were driven
+    n = len(samples)
+    xy = []
+    for i in range(n):
+        w = min(2, i, n - 1 - i)
+        xy.append((sum(s[0] for s in samples[i - w:i + w + 1]) / (2 * w + 1),
+                   sum(s[1] for s in samples[i - w:i + w + 1]) / (2 * w + 1)))
+    poses = []
+    for i, (x, y) in enumerate(xy):
+        nx, ny = xy[min(i + 1, n - 1)]
+        px, py = xy[i - 1] if i == n - 1 else (x, y)
+        ax, ay = (nx, ny) if i < n - 1 else (x, y)
+        poses.append([round(x, 3), round(y, 3), round(math.atan2(ay - py, ax - px), 3)])
+    return poses, None
+
+
 def load_map_image(yaml_path):
     """(meta, RGB PIL image) of a saved map_server map, in the panel's map
     colours (same thresholds as map_server's trinary mode)."""
@@ -320,7 +399,7 @@ def load_map_image(yaml_path):
 
 # Nav2 parameters editable from Settings > Parameters. Each is edited as
 # text in nav2_params.yaml (comments kept) and every related copy is kept in
-# sync: speed -> MPPI + velocity_smoother (+ behavior_server for w);
+# sync: speed -> RPP + velocity_smoother (+ behavior_server for w);
 # inflation -> local + global; footprint -> local + global + the
 # collision_monitor FrontStop polygon, which starts at the front bumper,
 # + the laser_filter.yaml self-hit box (footprint + LASER_BOX_MARGIN).
@@ -337,7 +416,7 @@ NAV_PARAM_SPECS = [
     # footprint edges, distance from base_footprint (wheel axle centre).
     # Lower bounds = bare chassis (0.49 / 0.26): smaller would cut the
     # self-hit box into the body and re-expose its returns. Upper bounds:
-    # local costmap is 3 x 3 m, so edges past ~1.0 m leave MPPI too little
+    # local costmap is 3 x 3 m, so edges past ~1.0 m leave RPP too little
     # window ahead - grow width/height there first if more is needed.
     ('fp_front', 'กลางรถ→ขอบหน้า (+x)', 'm', 0.49, 1.00, 0.01, '{:.2f}'),
     ('fp_rear', 'กลางรถ→ขอบหลัง (-x)', 'm', 0.49, 1.00, 0.01, '{:.2f}'),
@@ -367,8 +446,8 @@ LASER_BOX_MARGIN = 0.01   # m self-hit box beyond the footprint (laser_filter.ya
 
 _NUM = r'(-?\d+(?:\.\d+)?)'
 _PARAM_RES = {
-    'vx_max': re.compile(r'^(\s*vx_max:\s*)' + _NUM, re.M),
-    'wz_max': re.compile(r'^(\s*wz_max:\s*)' + _NUM, re.M),
+    'vx_max': re.compile(r'^(\s*desired_linear_vel:\s*)' + _NUM, re.M),
+    'wz_max': re.compile(r'^(\s*rotate_to_heading_angular_vel:\s*)' + _NUM, re.M),
     'max_vel': re.compile(r'^(\s*max_velocity:\s*\[)' + _NUM + r',\s*' + _NUM + r',\s*' + _NUM + r'\]', re.M),
     'min_vel': re.compile(r'^(\s*min_velocity:\s*\[)' + _NUM + r',\s*' + _NUM + r',\s*' + _NUM + r'\]', re.M),
     'rot_vel': re.compile(r'^(\s*max_rotational_vel:\s*)' + _NUM, re.M),
@@ -585,8 +664,8 @@ EN = {
     'ตรวจสอบเส้นทางว่าไม่มีคน/สิ่งกีดขวางก่อนยืนยัน (ISO 3691-4)':
         'Check the route is clear of people/obstacles before confirming (ISO 3691-4)',
     # Manual
-    'Manual Override - ควบคุมด้วยรีโมท/จอยภายนอก ขับช้าและมองเส้นทางตลอดเวลา':
-        'Manual Override - external remote/joystick in control; drive slowly and watch the path',
+    'Manual Override - กด LB ค้าง + โยกสติ๊กซ้าย (หรือจอยมือถือ) ขับช้าและมองเส้นทางตลอดเวลา':
+        'Manual Override - hold LB + move the left stick (or phone joystick); drive slowly and watch the path',
     'Controller: ACTIVE (มีคำสั่ง)': 'Controller: ACTIVE (input)',
     'เริ่มระบบ Manual': 'Start Manual',
     'QR มือถือ': 'Phone QR',
@@ -617,6 +696,12 @@ EN = {
     '＋ บันทึกตำแหน่งนี้เป็น Station': '＋ Save current pose as station',
     'ลบ Station...': 'Delete station...',
     'ลบ Station': 'Delete station',
+    'เส้นทาง: คิดเอง (ยังไม่มีเส้น Fix)': 'Route: planner (no fixed routes yet)',
+    'เส้นทาง: เส้น Fix (กดเพื่อเปลี่ยน)': 'Route: fixed (tap to change)',
+    'เส้นทาง: คิดเอง (กดเพื่อเปลี่ยน)': 'Route: planner (tap to change)',
+    '⏺ บันทึกเส้นทาง...': '⏺ Record route...',
+    '⏹ จบการบันทึกเส้นทาง': '⏹ Finish recording route',
+    'ลบเส้นทาง...': 'Delete route...',
     'QR ตั้งจุดหมายจากมือถือ': 'Phone QR: set goal',
     'Planner (อ่านอย่างเดียว - แก้ใน nav2_params.yaml)': 'Planner (read-only - edit nav2_params.yaml)',
     'เฉพาะ WARN/ERROR': 'WARN/ERROR only',
@@ -1031,6 +1116,9 @@ class RosBridge:
         if self.ok:
             self.stations_pub.publish(self._String(data=json.dumps(
                 {'map': map_name or '',
+                 'routes_file': routes_path(map_name) if map_name else '',
+                 'has_routes': bool(map_name and load_routes(map_name)),
+                 'use_routes': bool(map_name and routes_enabled(map_name)),
                  'stations': [dict(st, color=station_color(i))
                               for i, st in enumerate(stations)]})))
 
@@ -1272,6 +1360,7 @@ class AmrControlPanel(tk.Tk):
         self._stations = []
         self._selected_station = None
         self._stations_pub_t = 0.0
+        self._route_rec = None  # {'map', 'start', 'end', 'samples'} while recording
         self._mission = None  # {'station', 'state': active|paused|arrived, 'd0'}
         self._nav_goal = None  # last goal sent from the Nav-test map (x, y, th)
 
@@ -1718,6 +1807,8 @@ class AmrControlPanel(tk.Tk):
         st_card = self._card(right)
         st_card.pack(fill='both', expand=True, pady=px(8))
         self._section_title(st_card, 'จุดหมาย (Destination)').pack(fill='x', padx=px(10), pady=(px(8), px(2)))
+        self.btn_route_mode = self._btn(st_card, 'เส้นทาง: -', self._on_route_mode)
+        self.btn_route_mode.pack(fill='x', padx=px(8), pady=(px(0), px(6)))
         self.station_grid = tk.Frame(st_card, bg=SURFACE)
         self.station_grid.pack(fill='both', expand=True, padx=px(8), pady=(px(0), px(8)))
 
@@ -1742,7 +1833,25 @@ class AmrControlPanel(tk.Tk):
                                             self._on_mission_cancel, kind='danger')
         self.btn_mission_cancel.grid(row=0, column=2, sticky='nsew', padx=(px(4), px(0)))
 
+    def _refresh_route_mode(self):
+        name = self._nav_map_name
+        if not name or not load_routes(name):
+            text, state = 'เส้นทาง: คิดเอง (ยังไม่มีเส้น Fix)', 'disabled'
+        elif routes_enabled(name):
+            text, state = 'เส้นทาง: เส้น Fix (กดเพื่อเปลี่ยน)', 'normal'
+        else:
+            text, state = 'เส้นทาง: คิดเอง (กดเพื่อเปลี่ยน)', 'normal'
+        self.btn_route_mode.config(text=T(text), state=state)
+
+    def _on_route_mode(self):
+        name = self._nav_map_name
+        routes = load_routes(name) if name else []
+        if routes:
+            save_routes(name, routes, enabled=not routes_enabled(name))
+        self._refresh_route_mode()
+
     def _refresh_stations(self):
+        self._refresh_route_mode()
         for w in self.station_grid.winfo_children():
             w.destroy()
         self._stations = load_stations(self._nav_map_name) if self._nav_map_name else []
@@ -1865,7 +1974,7 @@ class AmrControlPanel(tk.Tk):
         p.rowconfigure(1, weight=1)
 
         self.manual_banner = tk.Label(
-            p, text='Manual Override - ควบคุมด้วยรีโมท/จอยภายนอก ขับช้าและมองเส้นทางตลอดเวลา',
+            p, text='Manual Override - กด LB ค้าง + โยกสติ๊กซ้าย (หรือจอยมือถือ) ขับช้าและมองเส้นทางตลอดเวลา',
             font=self.f_button_sub, bg=AMBER, fg='#1a1a1a', pady=px(8))
         self.manual_banner.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(px(0), px(8)))
 
@@ -1902,6 +2011,7 @@ class AmrControlPanel(tk.Tk):
         self._launch([
             'ros2', 'launch', 'amr_bringup', 'bringup.launch.py',
             'rviz:=false', 'foxglove:=true', 'slam:=false', 'navigation:=false',
+            'joystick:=true',
         ], mode='manual', label='โหมดควบคุมเอง (Manual)')
         threading.Thread(target=self._ensure_monitors_then_show_qr,
                          daemon=True).start()
@@ -2189,12 +2299,16 @@ class AmrControlPanel(tk.Tk):
         self.btn_add_station.pack(fill='x', padx=px(10), pady=px(4))
         self.btn_del_station = self._btn(t_goal, 'ลบ Station...', self._on_del_station)
         self.btn_del_station.pack(fill='x', padx=px(10), pady=px(4))
+        self.btn_route_rec = self._btn(t_goal, '⏺ บันทึกเส้นทาง...', self._on_route_record)
+        self.btn_route_rec.pack(fill='x', padx=px(10), pady=px(4))
+        self._btn(t_goal, 'ลบเส้นทาง...', self._on_del_route
+                  ).pack(fill='x', padx=px(10), pady=px(4))
         self._btn(t_goal, 'QR ตั้งจุดหมายจากมือถือ', lambda: threading.Thread(
             target=self._ensure_nav_monitors_then_show_qr, daemon=True).start()
         ).pack(fill='x', padx=px(10), pady=px(4))
         self._section_title(t_goal, 'Planner (อ่านอย่างเดียว - แก้ใน nav2_params.yaml)'
                             ).pack(fill='x', padx=px(10), pady=(px(10), px(0)))
-        self._label(t_goal, 'Global: NavFn   ·   Local: MPPI', font=self.f_small
+        self._label(t_goal, 'Global: NavFn   ·   Local: RPP', font=self.f_small
                     ).pack(anchor='w', padx=px(10))
         # imu_watchdog_node runs only with Navigation, so it is shown here
         # rather than on the Mapping page.
@@ -2358,6 +2472,75 @@ class AmrControlPanel(tk.Tk):
             del stations[pick]
             save_stations(self._nav_map_name, stations)
             self._refresh_stations()
+
+    def _on_route_record(self):
+        rec = self._route_rec
+        if rec is not None:
+            self._route_rec = None
+            self.btn_route_rec.config(text='⏺ บันทึกเส้นทาง...')
+            poses, why = route_from_samples(rec['samples'], rec['start'], rec['end'])
+            if poses is None:
+                messagebox.showwarning('ไม่ได้บันทึกเส้นทาง', why)
+                return
+            routes = load_routes(rec['map'])
+            key = (rec['start']['name'], rec['end']['name'])
+            old = [r for r in routes if (r['from'], r['to']) == key]
+            if old and not messagebox.askyesno('เส้นทางซ้ำ', f'ทับเส้นทาง {key[0]} → {key[1]} เดิม?'):
+                return
+            routes = [r for r in routes if (r['from'], r['to']) != key]
+            routes.append({'from': key[0], 'to': key[1], 'poses': poses})
+            save_routes(rec['map'], routes)
+            messagebox.showinfo('บันทึกแล้ว', f'{key[0]} → {key[1]} ({len(poses)} จุด)\n'
+                                              'ทดสอบเส้นนี้ก่อนใช้งานจริง')
+            return
+        if not self._nav_map_name:
+            return
+        pose = self.ros.pose()
+        if pose is None:
+            messagebox.showwarning('ไม่พบตำแหน่ง', 'ยังไม่มี TF map → base_footprint (AMCL)')
+            return
+        stations = load_stations(self._nav_map_name)
+        if len(stations) < 2:
+            messagebox.showinfo('ไม่มี Station', 'ต้องมีอย่างน้อย 2 Station')
+            return
+        start = min(stations, key=lambda s: math.hypot(s['x'] - pose[0], s['y'] - pose[1]))
+        if math.hypot(start['x'] - pose[0], start['y'] - pose[1]) > ROUTE_END_TOL_M:
+            messagebox.showwarning('อยู่นอก Station',
+                                   f'ขับไปจอดที่ Station ต้นทางก่อน (ไม่เกิน {ROUTE_END_TOL_M} ม.)')
+            return
+        others = [s for s in stations if s['name'] != start['name']]
+        pick = self._show_list_picker(f'จาก {start["name"]} ไปที่', [s['name'] for s in others])
+        if pick is None:
+            return
+        self._route_rec = {'map': self._nav_map_name, 'start': start, 'end': others[pick],
+                           'samples': [tuple(pose)]}
+        self.btn_route_rec.config(text='⏹ จบการบันทึกเส้นทาง')
+        messagebox.showinfo('เริ่มบันทึก', f'ขับเดินหน้าจาก {start["name"]} ไป {others[pick]["name"]} '
+                                           'แล้วกดจบการบันทึก\nช่วงท้ายขับตรงเข้า Station ตามทิศของ Station')
+
+    def _sample_route(self):
+        rec = self._route_rec
+        if self._mode != 'navigation':
+            self._route_rec = None
+            self.btn_route_rec.config(text='⏺ บันทึกเส้นทาง...')
+            return
+        pose = self.ros.pose()
+        if pose is not None and math.hypot(pose[0] - rec['samples'][-1][0],
+                                           pose[1] - rec['samples'][-1][1]) >= ROUTE_STEP_M:
+            rec['samples'].append(tuple(pose))
+
+    def _on_del_route(self):
+        if not self._nav_map_name:
+            return
+        routes = load_routes(self._nav_map_name)
+        if not routes:
+            messagebox.showinfo('ไม่มีเส้นทาง', 'แผนที่นี้ยังไม่มีเส้นทาง')
+            return
+        names = [f"{r['from']} → {r['to']}" for r in routes]
+        pick = self._show_list_picker('ลบเส้นทาง', names)
+        if pick is not None and messagebox.askyesno('ลบเส้นทาง', f'ลบ {names[pick]}?'):
+            del routes[pick]
+            save_routes(self._nav_map_name, routes)
 
     def _render_log(self):
         warn = self._log_warn_only.get()
@@ -2663,6 +2846,8 @@ class AmrControlPanel(tk.Tk):
 
     def _tick_inner(self):
         self._handle_mapping_cmds()
+        if self._route_rec is not None:
+            self._sample_route()
         if self._mode == 'mapping' and time.monotonic() - self._mapping_state_t > 1.0:
             self.ros.publish_mapping_state(self._mapping_state())
             self._mapping_state_t = time.monotonic()
@@ -2836,6 +3021,14 @@ class AmrControlPanel(tk.Tk):
             except ValueError:
                 continue
             action = cmd.get('action')
+            if action in ('route_fixed', 'route_planner'):
+                name = self._mode == 'navigation' and self._nav_map_name
+                routes = load_routes(name) if name else []
+                if routes:
+                    save_routes(name, routes, enabled=action == 'route_fixed')
+                    self._refresh_route_mode()
+                    self._stations_pub_t = 0.0  # phone sees the new mode now
+                continue
             if self._mode != 'mapping':
                 continue
             if action == 'start':

@@ -156,6 +156,10 @@ def cmd_to_pgm(args):
     if os.path.exists(st):
         shutil.copy(st, os.path.join(src, name + '_stations.yaml'))
         print(f'copied stations -> {name}_stations.yaml')
+    rt = os.path.join(src, stem + '_routes.yaml')
+    if os.path.exists(rt):
+        shutil.copy(rt, os.path.join(src, name + '_routes.yaml'))
+        print(f'copied routes -> {name}_routes.yaml')
     print('Test-drive every route on the new map before line use.')
 
 

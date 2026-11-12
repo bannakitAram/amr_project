@@ -195,7 +195,8 @@ class ROSBoardNode(object):
         # name are forwarded; the AMR Control panel is the only consumer and
         # owns the actual slam_toolbox pause and map_saver calls.
         self.mapping_cmd_pub = rospy.Publisher("/rosboard_mapping_cmd", String, queue_size=5)
-        self.MAPPING_ACTIONS = ("start", "pause", "save", "finish")
+        # route_* = fixed route / planner switch for station goals, same consumer
+        self.MAPPING_ACTIONS = ("start", "pause", "save", "finish", "route_fixed", "route_planner")
 
         # rosbag recording from the phone: rosboard runs `ros2 bag record`
         # itself on the topics ticked on the goal_picker page. Topics must

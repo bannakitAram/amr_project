@@ -982,6 +982,8 @@ setInterval(() => {
 let stations = [];
 let stationsMap = '';
 let stationsAt = 0;
+let hasRoutes = false;
+let useRoutes = false;
 const stationPanel = document.getElementById('station-panel');
 
 function handleStations(msg) {
@@ -989,7 +991,10 @@ function handleStations(msg) {
     const d = JSON.parse(msg.data);
     const list = (d.stations || []).filter(
       (s) => s && isFinite(s.x) && isFinite(s.y) && typeof s.name === 'string');
-    const changed = JSON.stringify(list) !== JSON.stringify(stations) || d.map !== stationsMap;
+    const changed = JSON.stringify(list) !== JSON.stringify(stations) || d.map !== stationsMap ||
+      !!d.has_routes !== hasRoutes || !!d.use_routes !== useRoutes;
+    hasRoutes = !!d.has_routes;
+    useRoutes = !!d.use_routes;
     stations = list;
     stationsMap = d.map || '';
     stationsAt = Date.now();
@@ -1037,6 +1042,15 @@ function renderStationPanel() {
     : 'แผนที่ ' + stationsMap + ' ยังไม่มี Station';
   stationPanel.appendChild(title);
   if (!fresh) return;
+  if (hasRoutes) {
+    // state comes back on /amr_stations, so this always shows what the robot will use
+    const m = document.createElement('button');
+    m.className = 'btn';
+    m.style.width = '100%';
+    m.textContent = (useRoutes ? 'เส้นทาง: เส้น Fix' : 'เส้นทาง: คิดเอง') + ' (กดเพื่อเปลี่ยน)';
+    m.onclick = () => transport.mappingCmd({action: useRoutes ? 'route_planner' : 'route_fixed'});
+    stationPanel.appendChild(m);
+  }
   for (const s of stations) {
     const b = document.createElement('button');
     b.className = 'btn primary';
@@ -1049,7 +1063,8 @@ function renderStationPanel() {
 
 function sendToStation(s) {
   stationPanel.hidden = true;
-  showConfirm('ส่งหุ่นยนต์ไปที่ Station "' + s.name + '" (' + s.x.toFixed(2) + ', ' + s.y.toFixed(2) + ') ม.?',
+  showConfirm('ส่งหุ่นยนต์ไปที่ Station "' + s.name + '" (' + s.x.toFixed(2) + ', ' + s.y.toFixed(2) + ') ม.?' +
+    (hasRoutes ? (useRoutes ? ' ใช้เส้น Fix' : ' ใช้เส้นที่คิดเอง') : ''),
     null,
     () => {
       if (!confirm('ยืนยันส่งหุ่นยนต์ไปยัง Station "' + s.name + '"?\n\n' +
