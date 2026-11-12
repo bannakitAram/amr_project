@@ -2,13 +2,17 @@
 """USB gamepad -> /cmd_vel for Manual mode (hold-to-run).
 
 Hold LB and move the left stick: up/down = linear.x, left/right = angular.z.
-Limits match the rosboard phone joystick (0.10 m/s, 0.15 rad/s, 0.2 m/s^2),
-which drives the same way: straight to /cmd_vel, so collision_monitor is NOT
+Normal max 0.30 m/s (= Nav2 max_velocity), 0.15 rad/s, 0.2 m/s^2. Drives
+like the rosboard phone joystick: straight to /cmd_vel, so collision_monitor is NOT
 in this path. The operator must keep the path in sight.
 
 Stops (zero Twist burst, then silent so the phone joystick can still drive):
   - LB released
   - /joy older than joy_timeout_s (gamepad unplugged, joy_node died)
+Speed: every press starts in Slow (0.10 m/s, 0.05 rad/s). Press RB while
+holding LB to toggle Slow <-> Normal (max_linear / max_angular). Releasing LB
+or any other stop drops back to Slow. Slow can only be lower than Normal.
+
 LB pressed with the stick off-centre does not move the robot until the stick
 has been centred once, so a stuck or knocked stick cannot start it.
 
@@ -38,8 +42,10 @@ class JoyTeleop(Node):
         self.expected_buttons = self.declare_parameter('expected_buttons', 15).value
         self.axis_linear = self.declare_parameter('axis_linear', 1).value
         self.axis_angular = self.declare_parameter('axis_angular', 0).value
-        self.max_linear = self.declare_parameter('max_linear', 0.10).value
+        self.max_linear = self.declare_parameter('max_linear', 0.30).value
         self.max_angular = self.declare_parameter('max_angular', 0.15).value
+        self.speed_button = self.declare_parameter('speed_button', 7).value  # RB
+        self.slow_scale = min(1.0, max(0.0, self.declare_parameter('slow_scale', 1.0 / 3.0).value))
         self.max_accel = self.declare_parameter('max_accel', 0.2).value
         self.joy_timeout_s = self.declare_parameter('joy_timeout_s', 0.5).value
 
@@ -48,13 +54,16 @@ class JoyTeleop(Node):
         self.armed = False          # stick seen centred since LB went down
         self.out_linear = 0.0
         self.zeros_left = 0
+        self.normal = False         # False = Slow
+        self.speed_button_prev = 0
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.create_subscription(Joy, '/joy', self.on_joy, 10)
         self.create_timer(1.0 / RATE_HZ, self.tick)
 
     def on_joy(self, msg):
         needed_axes = max(self.axis_linear, self.axis_angular)
-        if len(msg.axes) <= needed_axes or len(msg.buttons) != self.expected_buttons:
+        if (len(msg.axes) <= needed_axes or len(msg.buttons) != self.expected_buttons
+                or max(self.deadman_button, self.speed_button) >= len(msg.buttons)):
             self.get_logger().error(
                 'Unexpected gamepad layout: %d axes, %d buttons'
                 % (len(msg.axes), len(msg.buttons)), throttle_duration_sec=5.0)
@@ -71,15 +80,26 @@ class JoyTeleop(Node):
             self.zeros_left = STOP_BURST
         self.armed = False
         self.out_linear = 0.0
+        if self.normal:
+            self.get_logger().info('Speed: Slow')
+        self.normal = False
 
     def tick(self):
         fresh = time.monotonic() - self.joy_time <= self.joy_timeout_s
         if not fresh or self.joy is None or not self.joy.buttons[self.deadman_button]:
             self.stop()
+            self.speed_button_prev = self.joy.buttons[self.speed_button] if fresh and self.joy else 0
             if self.zeros_left > 0:
                 self.zeros_left -= 1
                 self.pub.publish(Twist())
             return
+
+        pressed = self.joy.buttons[self.speed_button]
+        if pressed and not self.speed_button_prev:
+            self.normal = not self.normal
+            self.get_logger().info('Speed: ' + ('Normal' if self.normal else 'Slow'))
+        self.speed_button_prev = pressed
+        scale = 1.0 if self.normal else self.slow_scale
 
         linear = self.stick(self.axis_linear)
         angular = self.stick(self.axis_angular)
@@ -93,7 +113,7 @@ class JoyTeleop(Node):
 
         # Only speeding up is ramped; slowing down passes through at once
         # (same as the rosboard joystick).
-        target = linear * self.max_linear
+        target = linear * self.max_linear * scale
         step = self.max_accel / RATE_HZ
         if abs(target) > abs(self.out_linear) and target * self.out_linear >= 0.0:
             target = max(self.out_linear - step, min(self.out_linear + step, target))
@@ -101,7 +121,7 @@ class JoyTeleop(Node):
 
         cmd = Twist()
         cmd.linear.x = self.out_linear
-        cmd.angular.z = angular * self.max_angular
+        cmd.angular.z = angular * self.max_angular * scale
         self.pub.publish(cmd)
 
 
