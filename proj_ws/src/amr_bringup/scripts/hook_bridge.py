@@ -24,6 +24,10 @@ Topics:
                clamped to +/-`zero_max_a`; hitting the clamp is logged
                (sensor/wiring fault, or the driver really draws current at
                standstill - auto-zero would hide that up to the clamp).
+  /battery/raw std_msgs/String out: raw reply line of the Junctek KG-F
+               coulometer ("BAT <reply>", ~1 Hz, RS485 on the Mega's Serial1).
+               Field decoding to be added once the reply is checked against
+               the meter's display. Monitor only.
   /light/cmd   std_msgs/String in: tower light pattern from light_state_node.py
                (IDLE / AUTO / MANUAL / OBSTACLE / FAULT), forwarded as L<n>
                every `light_period_s`. Stops forwarding if /light/cmd goes
@@ -87,6 +91,8 @@ class HookBridge(Node):
         self.create_subscription(Odometry, '/wheel/odom', self.on_odom, 10)
         self.cur_left_pub = self.create_publisher(Float32, '/motor_current/left', 10)
         self.cur_right_pub = self.create_publisher(Float32, '/motor_current/right', 10)
+        self.bat_raw_pub = self.create_publisher(String, '/battery/raw', 10)
+        self.bat_seen = False
         self.create_subscription(String, '/light/cmd', self.on_light, 10)
         self.light = None       # latest light code
         self.light_rx = None    # time of the latest /light/cmd
@@ -182,6 +188,11 @@ class HookBridge(Node):
                 self.publish_state(line[len('STATE '):].strip())
             elif line.startswith('CUR '):
                 self.on_current(line)
+            elif line.startswith('BAT '):
+                if not self.bat_seen:
+                    self.get_logger().info('first coulometer reply: %s' % line[4:])
+                    self.bat_seen = True
+                self.bat_raw_pub.publish(String(data=line[4:]))
             elif line == 'HOOK READY':
                 self.get_logger().info('Mega (re)booted')
             else:

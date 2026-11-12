@@ -14,6 +14,12 @@
 //   drive wheel motor current from ACS712 sensors on A2 (left) / A3 (right),
 //   mean over the period (smooths PWM ripple), signed (sign = direction).
 //   Monitor only - nothing in this firmware acts on it.
+// Unsolicited:  BAT <raw reply>
+//   Junctek KG-F coulometer on RS485 via an auto-direction RS485-TTL module
+//   on Serial1 (D18 TX1 -> module TXD/DI, D19 RX1 <- module RXD/RO). The
+//   Mega sends BAT_POLL_CMD every BAT_PERIOD_MS and forwards the meter's
+//   reply line unparsed (hook_bridge.py decodes it), so field order can be
+//   fixed on the Jetson without reflashing. Monitor only.
 //
 // Tower light (24 V, R/Y/G) via a 3-channel relay module on D26/D27/D28.
 // Local states override the Jetson's pattern:
@@ -85,6 +91,11 @@ const float    CUR_ZERO_RIGHT    = 512.0;
 const uint32_t CUR_SAMPLE_MS     = 2;
 const uint32_t CUR_PERIOD_MS     = 200;   // CUR line rate 5 Hz
 
+// KG-F coulometer (RS485 on Serial1). Baud must match the meter's setting.
+const uint32_t BAT_BAUD          = 115200;
+const char     BAT_POLL_CMD[]    = ":R50=1,2,1,\r\n";   // read all, address 1
+const uint32_t BAT_PERIOD_MS     = 1000;
+
 // ---- State ------------------------------------------------------------
 enum State { IDLE, AT_UP, AT_DOWN, MOVING_UP, MOVING_DOWN, FAULT };
 const char *STATE_NAMES[] = {"IDLE", "UP", "DOWN", "MOVING_UP", "MOVING_DOWN", "FAULT"};
@@ -116,6 +127,9 @@ bool lightCmdSeen = false;      // none yet since boot -> link-lost pattern
 uint32_t curSumL = 0, curSumR = 0;
 uint16_t curCount = 0;
 uint32_t curSampleMs = 0, curReportMs = 0;
+char batBuf[128];
+uint8_t batLen = 0;
+uint32_t batPollMs = 0;
 
 char rxBuf[16];
 uint8_t rxLen = 0;
@@ -251,6 +265,29 @@ void updateCurrent(uint32_t now) {
   }
 }
 
+// ---- Battery coulometer (monitor only) ---------------------------------
+void updateBattery(uint32_t now) {
+  if (now - batPollMs >= BAT_PERIOD_MS) {
+    batPollMs = now;
+    Serial1.print(BAT_POLL_CMD);
+  }
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    if (c == '\n' || c == '\r') {
+      if (batLen > 0) {
+        batBuf[batLen] = '\0';
+        Serial.print(F("BAT "));
+        Serial.println(batBuf);
+        batLen = 0;
+      }
+    } else if (batLen < sizeof(batBuf) - 1) {
+      if (c >= 32 && c < 127) batBuf[batLen++] = c;   // printable only
+    } else {
+      batLen = 0;                                      // overlong: drop
+    }
+  }
+}
+
 // ---- Moves ------------------------------------------------------------
 void startUp() {
   if (state == FAULT) { report(); return; }
@@ -366,6 +403,7 @@ void setup() {
   buttonHandled = true;
 
   Serial.begin(SERIAL_BAUD);
+  Serial1.begin(BAT_BAUD);
   state = restingState();
   Serial.println(F("HOOK READY"));
   report();
@@ -383,6 +421,7 @@ void loop() {
   // check below cannot underflow.
   now = millis();
   updateCurrent(now);
+  updateBattery(now);
 
   if (limitUp.stable && limitDown.stable) {
     if (state != FAULT) enterFault("BOTH_LIMITS");
