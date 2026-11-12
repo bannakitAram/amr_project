@@ -354,9 +354,12 @@ def generate_launch_description():
     fastdds_profile = SetEnvironmentVariable(
         'FASTRTPS_DEFAULT_PROFILES_FILE',
         os.path.join(pkg_bringup, 'config', 'fastdds_shm_8mb.xml'))
+    # ROS on loopback only (the XML above also restricts its UDP transport)
+    localhost_only = SetEnvironmentVariable('ROS_LOCALHOST_ONLY', '1')
 
     return LaunchDescription([
         fastdds_profile,
+        localhost_only,
         version_log,
         LogInfo(msg='System clock (NTP): ' + time_sync_status + (
             '' if time_sync_status.startswith(('synchronized', 'check skipped'))

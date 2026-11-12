@@ -11,8 +11,9 @@
   collision_monitor ignored the depth source. With an 8 MB segment the same
   node delivered 8.27 Hz, max gap 0.126 s (measured 2026-10-19).
 
-  UDPv4 stays enabled so processes started outside this launch (rosboard
-  service, control panel, tools) still talk to these nodes.
+  UDPv4 stays enabled (loopback only) so processes started outside this
+  launch (rosboard service, control panel, tools) still talk to these
+  nodes; those run with ROS_LOCALHOST_ONLY=1.
 -->
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
   <transport_descriptors>
@@ -24,6 +25,10 @@
     <transport_descriptor>
       <transport_id>udp</transport_id>
       <type>UDPv4</type>
+      <!-- loopback only: no ROS traffic to/from the factory network
+           (2026-11-12 risk review). With useBuiltinTransports=false this
+           XML, not ROS_LOCALHOST_ONLY, decides the interfaces. -->
+      <interfaceWhiteList><address>127.0.0.1</address></interfaceWhiteList>
     </transport_descriptor>
   </transport_descriptors>
   <participant profile_name="amr_default" is_default_profile="true">

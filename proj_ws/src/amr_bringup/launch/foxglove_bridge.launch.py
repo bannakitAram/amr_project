@@ -6,9 +6,11 @@ connect over the network to visualize and teleop the AMR.
 Connect from Foxglove Studio: "Open connection" -> Foxglove WebSocket ->
 ws://<jetson-ip>:8765
 
-To drive the robot, add a "Teleop" panel in Foxglove Studio and set its
-publish topic to /cmd_vel (geometry_msgs/Twist) - client-side topic
-publishing is enabled by default below.
+View only: client publishing, parameter access and service calls are OFF
+(2026-11-12 risk review). With them on, anyone on the factory WiFi could
+publish /cmd_vel or motor/*/cmd (bypassing collision_monitor), change
+collision_monitor parameters or call Nav2 lifecycle services - foxglove_bridge
+has no authentication. Drive with the gamepad or the rosboard phone page.
 
 Usage:
     ros2 launch amr_bringup foxglove_bridge.launch.py
@@ -39,14 +41,13 @@ def generate_launch_description():
             'port': port,
             'address': '0.0.0.0',
             'use_sim_time': use_sim_time,
-            # Allow Foxglove panels (Teleop, Publish, Joystick) to publish,
-            # e.g. geometry_msgs/Twist on /cmd_vel, back into ROS.
-            'capabilities': ['clientPublish', 'parameters', 'parametersSubscribe',
-                              'services', 'connectionGraph', 'assets'],
-            'client_topic_whitelist': ['.*'],
+            # View only - see the module docstring. Do not add
+            # clientPublish / parameters / services without auth in front.
+            'capabilities': ['connectionGraph', 'assets'],
+            'client_topic_whitelist': ['^$'],
             'topic_whitelist': ['.*'],
-            'service_whitelist': ['.*'],
-            'param_whitelist': ['.*'],
+            'service_whitelist': ['^$'],
+            'param_whitelist': ['^$'],
         }],
     )
 
