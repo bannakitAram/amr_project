@@ -1159,26 +1159,82 @@ class RosBridge:
 
 
 # ======================================================================
-class MapPlaceholder(tk.Frame):
+class MapPlaceholder(tk.Canvas):
     """Stands in for MapView: the panel no longer draws the map (operator
     asked to watch it on the phone goal_picker page instead - also frees
     the CPU the 4 Hz map/overlay redraw took while Nav2 was missing its
     control rate). Same set_map/set_overlay API as MapView, as no-ops, so
-    the pages and _tick need no other change. Stations are still chosen
-    with the buttons; tap-to-goal is on the phone."""
+    the pages and _tick need no other change.
+
+    Shows a battery gauge instead (set_battery, from /battery/state):
+    fill = percentage, green >= 40 %, amber >= 20 %, red below (blinks
+    under 10 %). Display only."""
 
     def __init__(self, parent, on_tap=None, **kw):
         super().__init__(parent, bg='#1c222a', highlightthickness=1,
                          highlightbackground=BORDER, **kw)
-        tk.Label(self, text=T('แผนที่ดูบนมือถือ\n(ปุ่ม QR มือถือ → หน้า Goal Picker)'),
-                 bg='#1c222a', fg=TEXT_MUTED, font=('Sans', -px(16)),
-                 justify='center').place(relx=0.5, rely=0.5, anchor='center')
+        self._batt = None        # (percentage 0..1 or nan, V, A, charging) or None
+        self._blink = False
+        self.bind('<Configure>', lambda _e: self._draw())
 
     def set_map(self, *_a, **_k):
         pass
 
     def set_overlay(self, *_a, **_k):
         pass
+
+    def set_battery(self, value):
+        """value: (percentage, voltage, current, charging) or None (no data)."""
+        low = value is not None and math.isfinite(value[0]) and value[0] < 0.10
+        self._blink = (not self._blink) if low else False
+        if value != self._batt or low:
+            self._batt = value
+            self._draw()
+
+    def _draw(self):
+        self.delete('all')
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 50 or h < 50:
+            return
+        b = self._batt
+        pct = b[0] if b and math.isfinite(b[0]) else None
+        # battery body, landscape, centred, terminal cap on the right
+        bw = min(w * 0.70, h * 1.4)
+        bh = bw * 0.45
+        x0 = (w - bw) / 2 - bw * 0.03
+        y0 = h * 0.42 - bh / 2
+        cap_w, cap_h = bw * 0.06, bh * 0.36
+        line = TEXT_MUTED if pct is None else TEXT_MAIN
+        lw = max(3, int(bw * 0.025))
+        self.create_rectangle(x0, y0, x0 + bw, y0 + bh, outline=line, width=lw)
+        self.create_rectangle(x0 + bw, y0 + (bh - cap_h) / 2, x0 + bw + cap_w,
+                              y0 + (bh + cap_h) / 2, outline=line, fill=line, width=lw)
+        if pct is None:
+            msg = 'ไม่มีข้อมูลแบต' if b is None else 'แบต: ไม่ทราบ %'
+            self.create_text(w / 2, y0 + bh / 2, text=T(msg), fill=TEXT_MUTED,
+                             font=('Sans', -px(20), 'bold'))
+        else:
+            color = GREEN if pct >= 0.40 else (AMBER if pct >= 0.20 else RED)
+            pad = lw * 2
+            fill_w = (bw - 2 * pad) * max(0.0, min(1.0, pct))
+            if fill_w > 0 and not (pct < 0.10 and self._blink):
+                self.create_rectangle(x0 + pad, y0 + pad, x0 + pad + fill_w, y0 + bh - pad,
+                                      fill=color, width=0)
+            self.create_text(x0 + bw / 2, y0 + bh / 2, text=f'{pct * 100:.0f}%',
+                             fill='white', font=('Sans', -int(bh * 0.42), 'bold'))
+        if b is not None:
+            self.create_text(w / 2, y0 + bh + h * 0.09, text=f'{b[1]:.1f} V   {abs(b[2]):.1f} A',
+                             fill=TEXT_MAIN, font=('Sans', -px(22), 'bold'))
+            note, col = None, TEXT_MAIN
+            if b[3]:
+                note = '⚡ ' + T('กำลังชาร์จ')
+            elif pct is not None and pct < 0.20:
+                note, col = T('แบตต่ำ - ควรชาร์จ'), RED
+            if note:
+                self.create_text(w / 2, y0 + bh + h * 0.18, text=note, fill=col,
+                                 font=('Sans', -px(20), 'bold'))
+        self.create_text(w / 2, h - px(14), text=T('แผนที่ดูบนมือถือ (ปุ่ม QR มือถือ → Goal Picker)'),
+                         fill=TEXT_MUTED, font=('Sans', -px(12)))
 
 
 # ======================================================================
@@ -2907,6 +2963,14 @@ class AmrControlPanel(tk.Tk):
             self.pill_safety.config(text='SENSOR FAULT', bg=RED, fg='white')
         self._update_hook_pill()
         self._update_batt_pill()
+        bv = None
+        b = self.ros.battery
+        if b and time.monotonic() - b[1] <= 5.0:
+            m = b[0]
+            bv = (m.percentage, m.voltage, m.current, m.power_supply_status == 1)
+        for gauge in (self.auto_map, self.mapping_map, self.nav_map):
+            if gauge.winfo_ismapped():
+                gauge.set_battery(bv)
 
         page = self._page
         pose = self.ros.pose()
