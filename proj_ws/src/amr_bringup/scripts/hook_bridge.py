@@ -18,6 +18,12 @@ Topics:
                only - nothing acts on it. The right motor is mirrored, so
                its raw value is negative when driving forward; it is multiplied
                by `current_right_sign` (-1) so + = driving forward on both.
+               Auto-zero: after /wheel/odom has shown the robot still for
+               `zero_still_s`, the raw value is averaged (EMA, `zero_tau_s`)
+               into a per-wheel offset that is subtracted. The offset is
+               clamped to +/-`zero_max_a`; hitting the clamp is logged
+               (sensor/wiring fault, or the driver really draws current at
+               standstill - auto-zero would hide that up to the clamp).
   /light/cmd   std_msgs/String in: tower light pattern from light_state_node.py
                (IDLE / AUTO / MANUAL / OBSTACLE / FAULT), forwarded as L<n>
                every `light_period_s`. Stops forwarding if /light/cmd goes
@@ -35,12 +41,15 @@ Monitoring/command layer only - NOT a safety function (ISO 3691-4).
 "UP" means the top limit switch is closed, not that a cart is latched.
 Treat "UNKNOWN" as not-latched: never assume the last state held.
 """
+import math
 import threading
+import time
 
 import rclpy
 import rclpy.executors
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
+from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32, String
 import serial
 
@@ -67,6 +76,15 @@ class HookBridge(Node):
         self.create_subscription(String, '/hook/cmd', self.on_cmd, 10)
         self.current_right_sign = float(
             self.declare_parameter('current_right_sign', -1.0).value)
+        self.zero_still_s = self.declare_parameter('zero_still_s', 2.0).value
+        self.zero_tau_s = self.declare_parameter('zero_tau_s', 5.0).value
+        self.zero_max_a = self.declare_parameter('zero_max_a', 0.5).value
+        self.zero = [0.0, 0.0]          # learned raw offset, A (left, right)
+        self.zero_learned = False
+        self.zero_last = None           # time of the last offset update
+        self.still_since = None         # monotonic time odom went still
+        self.odom_rx = None
+        self.create_subscription(Odometry, '/wheel/odom', self.on_odom, 10)
         self.cur_left_pub = self.create_publisher(Float32, '/motor_current/left', 10)
         self.cur_right_pub = self.create_publisher(Float32, '/motor_current/right', 10)
         self.create_subscription(String, '/light/cmd', self.on_light, 10)
@@ -176,8 +194,48 @@ class HookBridge(Node):
             self.get_logger().warn('bad CUR line "%s"' % line,
                                    throttle_duration_sec=10.0)
             return
+        self.update_zero(left, right)
+        left -= self.zero[0]
+        right -= self.zero[1]
         self.cur_left_pub.publish(Float32(data=left))
         self.cur_right_pub.publish(Float32(data=right * self.current_right_sign))
+
+    def on_odom(self, msg):
+        now = time.monotonic()
+        self.odom_rx = now
+        t = msg.twist.twist
+        if abs(t.linear.x) < 1e-3 and abs(t.angular.z) < 1e-3:
+            if self.still_since is None:
+                self.still_since = now
+        else:
+            self.still_since = None
+
+    def update_zero(self, left, right):
+        now = time.monotonic()
+        still = (self.odom_rx is not None and now - self.odom_rx < 0.5
+                 and self.still_since is not None
+                 and now - self.still_since >= self.zero_still_s)
+        if not still:
+            self.zero_last = None
+            return
+        if not self.zero_learned:
+            new = [left, right]                     # first still: take it as-is
+        else:
+            dt = now - self.zero_last if self.zero_last else 0.2
+            a = 1.0 - math.exp(-dt / self.zero_tau_s)
+            new = [z + a * (v - z) for z, v in zip(self.zero, (left, right))]
+        for i, name in enumerate(('left', 'right')):
+            if abs(new[i]) > self.zero_max_a:
+                self.get_logger().warn(
+                    'motor_current/%s zero %.2f A at standstill exceeds %.2f A: '
+                    'check sensor wiring / driver idle current'
+                    % (name, new[i], self.zero_max_a), throttle_duration_sec=30.0)
+                new[i] = math.copysign(self.zero_max_a, new[i])
+        if not self.zero_learned:
+            self.get_logger().info('motor current zero learned: L %.3f A, R %.3f A' % tuple(new))
+        self.zero = new
+        self.zero_learned = True
+        self.zero_last = now
 
     # ---- timers / callbacks ---------------------------------------------
     def on_poll(self):
