@@ -30,8 +30,9 @@ Topics:
   /battery/state sensor_msgs/BatteryState out, decoded from ":r50=" replies:
                field 3 = voltage x0.01 V, field 4 = current x0.01 A,
                field 5 = remaining charge x0.001 Ah, field 12 = direction
-               (1 = charging). current is negative while discharging (ROS
-               convention); percentage = charge / `battery_capacity_ah`
+               (1 = charging). current is always >= 0 (magnitude, easier to
+               read in logs; not the ROS "negative = discharging" sign):
+               the direction is in power_supply_status. percentage = charge / `battery_capacity_ah`
                (0..1). Layout from the Junctek KL110F protocol, voltage and
                current checked on the robot; charge scale/direction still to
                be checked against the meter display. Our own ":R50" command
@@ -240,7 +241,7 @@ class HookBridge(Node):
         msg = BatteryState()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.voltage = voltage
-        msg.current = current if charging else -current
+        msg.current = abs(current)
         msg.temperature = float('nan')
         msg.charge = charge
         msg.capacity = self.battery_capacity_ah

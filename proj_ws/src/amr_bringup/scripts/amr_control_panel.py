@@ -2857,7 +2857,7 @@ class AmrControlPanel(tk.Tk):
             txt += '⚡'
         if math.isfinite(pct):
             txt += f'{pct * 100:.0f}% '
-        txt += f'{m.voltage:.1f}V {m.current:+.1f}A'
+        txt += f'{m.voltage:.1f}V {abs(m.current):.1f}A'
         if not math.isfinite(pct):
             bg = SURFACE_2
         elif pct < 0.20:
