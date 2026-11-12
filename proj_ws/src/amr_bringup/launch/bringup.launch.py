@@ -136,8 +136,8 @@ def generate_launch_description():
                     '/hook/cmd; tower light <- /light/cmd); '
                     'set false if the hook controller is unplugged')
     declare_hook_port = DeclareLaunchArgument(
-        'hook_port', default_value='/dev/hook',
-        description='Serial port of the hook Mega (udev/99-amr-hook.rules)')
+        'hook_port', default_value='/dev/ttyMega',
+        description='Serial port of the hook Mega. /dev/ttyMega = any CH340 (VID:PID only, keep one CH340 on the robot); /dev/hook = pinned to a USB port (udev/99-amr-hook.rules)')
     declare_use_joystick = DeclareLaunchArgument(
         'joystick', default_value='false',
         description='Launch joy_node + joy_teleop (USB gamepad -> /cmd_vel, hold LB to '

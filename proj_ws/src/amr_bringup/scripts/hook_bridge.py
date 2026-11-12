@@ -46,7 +46,7 @@ LIGHT_CODES = {'IDLE': 0, 'AUTO': 1, 'MANUAL': 2, 'OBSTACLE': 3, 'FAULT': 4}
 class HookBridge(Node):
     def __init__(self):
         super().__init__('hook_bridge')
-        self.port = self.declare_parameter('port', '/dev/hook').value
+        self.port = self.declare_parameter('port', '/dev/ttyMega').value
         self.baud = self.declare_parameter('baud', 115200).value
         self.poll_period_s = self.declare_parameter('poll_period_s', 1.0).value
         # > poll period + Mega boot time after a DTR reset
