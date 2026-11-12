@@ -80,8 +80,8 @@ const uint32_t LIGHT_TIMEOUT_MS = 2000;   // Jetson resends every 500 ms
 const float    CUR_MV_PER_A      = 100.0;   // ACS712-20A (confirmed on the robot)
 // ADC count at 0 A (ideal 512 = Vcc/2). Calibrate with motors stopped:
 // read the CUR value, offset_counts = 512 + A * CUR_MV_PER_A / 4.883.
-const float    CUR_ZERO_LEFT     = 512.0;
-const float    CUR_ZERO_RIGHT    = 512.0;
+const float    CUR_ZERO_LEFT     = 512.4;   // calibrated 2026-11-12, standstill 30 s (+0.021 A)
+const float    CUR_ZERO_RIGHT    = 516.3;   // calibrated 2026-11-12, standstill 30 s (+0.208 A)
 const uint32_t CUR_SAMPLE_MS     = 2;
 const uint32_t CUR_PERIOD_MS     = 200;   // CUR line rate 5 Hz
 
