@@ -111,6 +111,7 @@ def generate_launch_description():
     use_navigation = LaunchConfiguration('navigation')
     nav_map = LaunchConfiguration('map')
     slam_start_scanning = LaunchConfiguration('slam_start_scanning')
+    filter_operator_out = LaunchConfiguration('filter_operator_out')
 
     declare_use_sim_time = DeclareLaunchArgument('use_sim_time', default_value='false')
     declare_use_rviz = DeclareLaunchArgument(
@@ -150,6 +151,14 @@ def generate_launch_description():
         'navigation', default_value='false',
         description='Launch Nav2 (amr_navigation) for autonomous navigation on a saved '
                      'map. Requires map:=<path to map.yaml>. Set slam:=false when using this.')
+    declare_filter_operator_out = DeclareLaunchArgument(
+        'filter_operator_out', default_value='true',
+        description='slam:=true only - blank the rear +-60 deg of the SLAM scan '
+                    'so an operator walking behind is not mapped. false keeps '
+                    'the rear: needed along walls/corridors, where the rear wall '
+                    'is the only along-track feature (bag 20261113-11_08_01: '
+                    'odom 4.08 m, map 0.42 m). SLAM input only; /scan and '
+                    '/scan_filtered (Nav2, collision_monitor) are unchanged.')
     declare_slam_start_scanning = DeclareLaunchArgument(
         'slam_start_scanning', default_value='true',
         description='slam:=true only - false starts SLAM with its scan input gated '
@@ -236,7 +245,8 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(
             os.path.join(pkg_slam, 'launch', 'slam.launch.py')),
         launch_arguments={'use_sim_time': use_sim_time,
-                          'scan_gate_start_enabled': slam_start_scanning}.items(),
+                          'scan_gate_start_enabled': slam_start_scanning,
+                          'filter_operator_out': filter_operator_out}.items(),
         condition=IfCondition(use_slam),
     )
     delayed_slam_launch = TimerAction(
@@ -373,6 +383,7 @@ def generate_launch_description():
         declare_use_navigation,
         declare_nav_map,
         declare_slam_start_scanning,
+        declare_filter_operator_out,
         declare_use_hook,
         declare_hook_port,
         declare_use_joystick,

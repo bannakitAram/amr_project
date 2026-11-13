@@ -3057,6 +3057,9 @@ class AmrControlPanel(tk.Tk):
             'ros2', 'launch', 'amr_bringup', 'bringup.launch.py',
             'rviz:=false', 'foxglove:=true', 'slam:=true', 'navigation:=false',
             'slam_start_scanning:=false',
+            # Keep the rear sector in SLAM: drive by phone/gamepad from the
+            # side, not walking behind (rear wall = along-track feature).
+            'filter_operator_out:=false',
         ], mode='mapping', label='โหมดสร้างแผนที่ (Mapping)')
         self._slam_ready = False
         self._scanning = False
