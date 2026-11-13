@@ -174,6 +174,16 @@ class ROSBoardNode(object):
         self.TELEOP_MAX_ACCEL = 0.2      # m/s^2
         self.TELEOP_RAMP_DT_MAX = 0.15   # s - cap per step (first msg / gaps); joystick sends every 0.1 s
         self.teleop_out_linear = 0.0     # last published linear.x
+        # Phone commands arrive over WiFi every ~0.1 s but with 0.2-0.5 s
+        # gaps; the STM32 zeroes its target after CMD_TIMEOUT_MS = 200 ms,
+        # so the robot stopped and restarted (jerky driving, bag
+        # rosbag2_2026_11_13-10_38_41). Re-publish the last command at this
+        # period while it is younger than TELEOP_DEADMAN_TIMEOUT; after that
+        # the watchdog still sends zero (deadman unchanged).
+        self.TELEOP_REPUBLISH_PERIOD = 0.05  # s (20 Hz, same as Nav2)
+        self.teleop_last_twist = None    # last Twist from the phone (non-zero)
+        self.teleop_last_pub_time = 0.0
+        self.teleop_lock = threading.Lock()
         threading.Thread(target=self.teleop_watchdog_loop, daemon=True).start()
 
         # --- goal_picker page: navigation goal / path / cancel ---
@@ -478,10 +488,15 @@ class ROSBoardNode(object):
         twist = Twist()
         twist.linear.x = self.teleop_ramp(clamp(linear, self.teleop_effective_max_linear()))
         twist.angular.z = clamp(angular, self.TELEOP_MAX_ANGULAR)
-        if twist.linear.x != 0.0 or twist.angular.z != 0.0:
+        moving = twist.linear.x != 0.0 or twist.angular.z != 0.0
+        if moving:
             self.teleop_last_active = time.time()
-        self.teleop_pub.publish(twist)
-        self.teleop_last_cmd_time = time.time()
+        with self.teleop_lock:
+            self.teleop_pub.publish(twist)
+            now = time.time()
+            self.teleop_last_cmd_time = now
+            self.teleop_last_pub_time = now
+            self.teleop_last_twist = twist if moving else None
 
     def teleop_ramp(self, target):
         out = self.teleop_out_linear
@@ -564,13 +579,21 @@ class ROSBoardNode(object):
         the STM32 firmware's own /cmd_vel receive-timeout.
         """
         while True:
-            time.sleep(0.1)
-            if self.teleop_last_cmd_time == 0.0:
-                continue
-            if time.time() - self.teleop_last_cmd_time > self.TELEOP_DEADMAN_TIMEOUT:
-                self.teleop_pub.publish(Twist())
-                self.teleop_out_linear = 0.0
-                self.teleop_last_cmd_time = 0.0  # don't keep re-publishing zero every 100ms
+            time.sleep(self.TELEOP_REPUBLISH_PERIOD / 2.0)
+            with self.teleop_lock:
+                if self.teleop_last_cmd_time == 0.0:
+                    continue
+                now = time.time()
+                if now - self.teleop_last_cmd_time > self.TELEOP_DEADMAN_TIMEOUT:
+                    self.teleop_pub.publish(Twist())
+                    self.teleop_out_linear = 0.0
+                    self.teleop_last_twist = None
+                    self.teleop_last_cmd_time = 0.0  # don't keep re-publishing zero
+                elif (self.teleop_last_twist is not None and
+                        now - self.teleop_last_pub_time >= self.TELEOP_REPUBLISH_PERIOD):
+                    # hold the last command (STM32 timeout is 200 ms)
+                    self.teleop_pub.publish(self.teleop_last_twist)
+                    self.teleop_last_pub_time = now
 
     def start(self):
         try:
