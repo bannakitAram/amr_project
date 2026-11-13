@@ -67,14 +67,14 @@ const int L_HAL     = PD8;
 // ============================================================
 // ROBOT PARAMETERS
 // ============================================================
-// Per-wheel effective radius (m). Both default to the nominal 0.128 m
+// Per-wheel effective radius (m). Nominal 0.128 m
 // diameter, so behaviour is unchanged until calibrated: a common scale
 // error is fixed by moving both together, a left/right ratio (straight-line
 // drift) by moving them apart - see calib_straight_node.py. Use the loaded,
 // on-floor effective radius (tyre sag under payload shrinks it), not the
 // unloaded catalogue value. Do NOT compensate via ENCODER_PPR (ground truth).
-const float wheel_radius_l = 0.128f / 2.0f;
-const float wheel_radius_r = 0.128f / 2.0f;
+const float wheel_radius_l = 0.129f / 2.0f;  // was 0.128 (+1 mm, 2026-11-13)
+const float wheel_radius_r = 0.129f / 2.0f;  // was 0.128 (+1 mm, 2026-11-13)
 const float wheel_sep    = 0.472f;
 const float wheel_circumference_l = 2.0f * PI * wheel_radius_l;
 const float wheel_circumference_r = 2.0f * PI * wheel_radius_r;

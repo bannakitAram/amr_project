@@ -101,9 +101,9 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--run', nargs=4, action='append', required=True,
                     metavar=('DIR', 'REAL_M', 'ODOM_M', 'OFFSET_M'))
-    ap.add_argument('--radius-l', type=float, default=0.064,
+    ap.add_argument('--radius-l', type=float, default=0.0645,
                     help='current wheel_radius_l in firmware (m)')
-    ap.add_argument('--radius-r', type=float, default=0.064,
+    ap.add_argument('--radius-r', type=float, default=0.0645,
                     help='current wheel_radius_r in firmware (m)')
     ap.add_argument('--sep', type=float, default=0.472,
                     help='wheel_sep in firmware (m)')

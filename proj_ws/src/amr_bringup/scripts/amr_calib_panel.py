@@ -42,8 +42,8 @@ ROTATE_TURNS_DEFAULT = 2.0
 ROTATE_SPEED_DEFAULT = 0.3
 STRAIGHT_DISTANCE_DEFAULT = 3.0
 STRAIGHT_SPEED_DEFAULT = 0.15
-# Must match wheel_radius_l/_r in the STM32 firmware (nominal 0.128 m dia).
-WHEEL_RADIUS_NOMINAL = 0.064
+# Must match wheel_radius_l/_r in the STM32 firmware (0.129 m dia since 2026-11-13).
+WHEEL_RADIUS_NOMINAL = 0.0645
 # Must match GYRO_SCALE_Z in the STM32 firmware (1.0 = uncalibrated).
 GYRO_SCALE_Z_NOMINAL = 1.0084
 GYRO_MOTOR_TURNS_DEFAULT = 5.0

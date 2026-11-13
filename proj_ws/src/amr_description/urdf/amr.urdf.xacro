@@ -10,7 +10,7 @@
 </material>
 
 <!--Define dimension wheel-->
-<xacro:property name="wheel_diameter" value="0.128"/>
+<xacro:property name="wheel_diameter" value="0.129"/>
 <xacro:property name="wheel_radius" value="${wheel_diameter / 2}"/>
 <xacro:property name="wheel_separation" value="0.472"/>
 <xacro:property name="wheel_thick" value="0.04"/>
