@@ -1222,8 +1222,9 @@ const btnBag = document.getElementById('btn-bag');
 const STOP_TOPICS = ['/cmd_vel', '/cmd_vel_smoothed', '/cmd_vel_nav', '/odometry/filtered',
                      '/wheel/odom', '/scan_filtered', '/tf_static'];
 // motor current + battery V/A log (one-tap button); /cmd_vel and
-// /wheel/odom give the speed the current belongs to
-const POWER_TOPICS = ['/motor_current/left', '/motor_current/right', '/battery/state',
+// /wheel/odom give the speed the current belongs to; /nav_event marks
+// station trip start/arrived (nav_goal_executor_node)
+const POWER_TOPICS = ['/motor_current/left', '/motor_current/right', '/battery/state', '/nav_event',
                       '/cmd_vel', '/wheel/odom'];
 // big topics: warn, they can fill the disk / load the Jetson
 const BAG_HEAVY_TYPES = /PointCloud2|Image|OccupancyGrid/;
@@ -1340,7 +1341,8 @@ function renderBagPanel() {
   });
   mk2('bag-power', 'primary', 'บันทึก A มอเตอร์ + V/A แบต', () => {
     const topics = POWER_TOPICS.filter(t => t in allTopics);
-    const missing = POWER_TOPICS.filter(t => !(t in allTopics));
+    // /nav_event exists only in Navigation mode - optional, no warning
+    const missing = POWER_TOPICS.filter(t => !(t in allTopics) && t !== '/nav_event');
     if (!topics.some(t => t.startsWith('/motor_current') || t === '/battery/state')) {
       alert('ไม่พบ /motor_current หรือ /battery/state - hook_bridge (Mega) ทำงานอยู่ไหม?');
       return;

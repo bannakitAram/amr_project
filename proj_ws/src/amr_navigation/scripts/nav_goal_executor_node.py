@@ -459,6 +459,31 @@ def main():
         elif level == 'warn':
             navigator.get_logger().warn('nav_goal_executor_node: ' + text)
 
+    # station trip start/end events on /nav_event so a rosbag (goal_picker
+    # "record motor A + battery" preset) shows when each trip began/ended
+    event_pub = navigator.create_publisher(String, '/nav_event', 10)
+    trip = {'name': None, 't0': 0.0}
+
+    def station_name(goal):
+        px, py = goal.pose.position.x, goal.pose.position.y
+        return next((s['name'] for s in stations_info['stations']
+                     if math.hypot(s['x'] - px, s['y'] - py) < STATION_MATCH),
+                    '(%.2f, %.2f)' % (px, py))
+
+    def nav_event(kind, name=None):
+        now = time.time()
+        if kind == 'start':
+            trip['name'], trip['t0'] = name, now
+        elif trip['name'] is None:
+            return
+        d = {'event': kind, 'station': trip['name'],
+             'time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}
+        if kind != 'start':
+            d['duration_s'] = round(now - trip['t0'], 1)
+            trip['name'] = None
+        event_pub.publish(String(data=json.dumps(d, ensure_ascii=False)))
+        navigator.get_logger().info('nav_goal_executor_node: event ' + json.dumps(d, ensure_ascii=False))
+
     def cancel_and_wait(timeout=3.0):
         """Cancel the active Nav2 task and wait until bt_navigator has really
         finished it. A goal sent while the cancel is still being processed is
@@ -510,6 +535,10 @@ def main():
                 kind, msg = pending['value'][:2]
                 resume = len(pending['value']) > 2
                 pending['value'] = None
+                if not resume:  # operator command ends any station trip in progress
+                    nav_event('canceled' if kind == 'cancel' else 'interrupted')
+                    if kind == 'station':
+                        nav_event('start', station_name(msg))
 
                 if task_active['value']:
                     cancel_and_wait()
@@ -552,6 +581,7 @@ def main():
                     if use_route:
                         if points is None:
                             current['req'] = None
+                            nav_event('failed')
                             alert('error', 'ไม่มีเส้นทางจากตำแหน่งนี้ไป Station ที่เลือก '
                                            '- หุ่นยนต์ไม่ออกตัว')
                             continue
@@ -560,7 +590,8 @@ def main():
                             '%d points' % (msg.pose.position.x, msg.pose.position.y, len(points)))
                         station['value'] = msg
                         route_plan['value'] = route_to_path(points, navigator)
-                        sent(navigator.followPath(route_plan['value']), 'station route')
+                        if not sent(navigator.followPath(route_plan['value']), 'station route'):
+                            nav_event('failed')
                         continue
                     pre = pre_goal(msg)
                     navigator.get_logger().info(
@@ -568,7 +599,8 @@ def main():
                         % (msg.pose.position.x, msg.pose.position.y,
                            pre.pose.position.x, pre.pose.position.y))
                     station['value'] = msg
-                    sent(navigator.goToPose(restamp(pre, navigator)), 'station pre-goal')
+                    if not sent(navigator.goToPose(restamp(pre, navigator)), 'station pre-goal'):
+                        nav_event('failed')
                 elif kind == 'path':
                     if not msg.poses:
                         continue
@@ -649,6 +681,7 @@ def main():
                 alert('ok', '')
 
             if approach['value'] is not None and not approach['value'].step():
+                nav_event('arrived' if approach['value'].state == 'done' else 'failed')
                 approach['value'] = None
                 current['req'] = None
 
@@ -672,6 +705,7 @@ def main():
                         navigator.get_logger().warn(
                             'nav_goal_executor_node: pre-goal failed - station goal dropped')
                         current['req'] = None
+                        nav_event('failed')
                     continue
                 current['req'] = None
                 if result == TaskResult.SUCCEEDED:
