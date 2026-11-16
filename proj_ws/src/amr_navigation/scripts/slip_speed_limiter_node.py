@@ -13,6 +13,13 @@ MPPI's setSpeedLimit():
   - no /wheel/slip_detected for `stale_timeout_s` -> remove the limit and
     warn once (firmware/micro-ROS down: no data is not evidence of slip)
 
+Map speed zones: SpeedFilter (navigation.launch.py, when the map has a
+<map>_speed mask) publishes its limit on /zone_speed_limit instead of
+/speed_limit, and this node is the only publisher of /speed_limit: it sends
+the lower of the zone % and the slip % (0 = no limit). Two publishers on
+/speed_limit would overwrite each other (leaving a zone could clear the slip
+limit and the other way round).
+
 Monitoring/comfort only - NOT a safety function (ISO 3691-4): it depends
 on micro-ROS, the IMU and Nav2 all running. Protective stops must stay in
 hardware/firmware and collision_monitor.
@@ -34,6 +41,9 @@ class SlipSpeedLimiter(Node):
 
         self.pub = self.create_publisher(SpeedLimit, 'speed_limit', 10)
         self.create_subscription(Bool, '/wheel/slip_detected', self.on_slip, 10)
+        self.create_subscription(SpeedLimit, '/zone_speed_limit', self.on_zone, 10)
+        self.zone_percent = 0.0     # 0 = not in a speed zone
+        self.sent_percent = None
         self.create_timer(0.1, self.on_timer)
 
         self.limited = False
@@ -46,18 +56,37 @@ class SlipSpeedLimiter(Node):
     def now_s(self):
         return self.get_clock().now().nanoseconds * 1e-9
 
-    def publish_limit(self, limited):
+    def on_zone(self, msg):
+        if not msg.percentage:
+            self.get_logger().error('/zone_speed_limit not in % - ignored (speed mask type must be 1)')
+            return
+        value = float(msg.speed_limit)
+        value = 0.0 if value <= 0.0 or value >= 100.0 else value
+        if value != self.zone_percent:
+            self.get_logger().info('speed zone: %s' % ('%.0f%%' % value if value else 'left'))
+        self.zone_percent = value
+        self.send()
+
+    def send(self):
+        limits = [v for v in (self.zone_percent,
+                              float(self.slip_percent) if self.limited else 0.0) if v > 0.0]
         msg = SpeedLimit()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.percentage = True
-        msg.speed_limit = float(self.slip_percent) if limited else 0.0  # 0.0 = no limit
+        msg.speed_limit = min(limits) if limits else 0.0  # 0.0 = no limit
         self.pub.publish(msg)
-        if limited != self.limited:
+        self.sent_percent = msg.speed_limit
+        self.last_send_t = self.now_s()
+
+    def publish_limit(self, limited):
+        changed = limited != self.limited
+        self.limited = limited
+        self.send()
+        if changed:
             if limited:
                 self.get_logger().warn(f'wheel slip - limiting speed to {self.slip_percent:.0f}%')
             else:
                 self.get_logger().info('wheel slip cleared - speed limit removed')
-        self.limited = limited
 
     def on_slip(self, msg):
         t = self.now_s()
@@ -75,6 +104,9 @@ class SlipSpeedLimiter(Node):
 
     def on_timer(self):
         t = self.now_s()
+        # re-send at 1 Hz: a controller_server (re)started late still gets it
+        if t - getattr(self, 'last_send_t', 0.0) > 1.0 and self.sent_percent:
+            self.send()
         if self.last_msg_time is not None and t - self.last_msg_time > self.stale_timeout_s:
             if not self.stale_logged:
                 self.get_logger().warn('/wheel/slip_detected stale - slip limiting inactive')

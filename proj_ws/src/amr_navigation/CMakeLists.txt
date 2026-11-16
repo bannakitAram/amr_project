@@ -18,6 +18,7 @@ install(PROGRAMS
   scripts/imu_watchdog_node.py
   scripts/local_plan_relay_node.py
   scripts/map_edit.py
+  scripts/zone_info_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

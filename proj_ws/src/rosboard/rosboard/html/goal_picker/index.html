@@ -304,6 +304,7 @@ function onAuthResult(result) {
     transport.subscribe({topicName: '/mppi_local_plan', maxUpdateRate: 5.0});
     transport.subscribe({topicName: '/amr_stations', maxUpdateRate: 1.0});
     transport.subscribe({topicName: '/amr_doors', maxUpdateRate: 1.0});
+    transport.subscribe({topicName: '/amr_zones', maxUpdateRate: 1.0});
     transport.subscribe({topicName: '/rosboard_bag_state', maxUpdateRate: 2.0});
     transport.subscribe({topicName: '/nav_alert', maxUpdateRate: 2.0});
     transport.subscribe({topicName: '/rosout', maxUpdateRate: 30.0});
@@ -339,6 +340,7 @@ function onRosMsg(msg) {
   else if (msg._topic_name === '/mppi_local_plan') handleLocalPlan(msg);
   else if (msg._topic_name === '/amr_stations') handleStations(msg);
   else if (msg._topic_name === '/amr_doors') handleDoors(msg);
+  else if (msg._topic_name === '/amr_zones') handleZones(msg);
   else if (msg._topic_name === '/rosboard_bag_state') handleBagState(msg);
   else if (msg._topic_name === '/nav_alert') handleNavAlert(msg);
   else if (msg._topic_name === '/rosout') handleLog(msg);
@@ -778,6 +780,8 @@ function redraw() {
   mapOnlyCanvas.height = canvas.height;
   mapOnlyCtx.drawImage(canvas, 0, 0);
 
+  drawZones();
+
   // Grid drawn on top of the map (semi-transparent) rather than under it,
   // so it reads as a distance reference over the whole visible area
   // instead of only showing in the empty space outside the map's extent.
@@ -1103,11 +1107,71 @@ document.getElementById('btn-stations').addEventListener('click', () => {
   else stationPanel.hidden = true;
 });
 
+// ---------- map zones (amr_navigation zone_info_node.py, /amr_zones) ----------
+// {zones: [[x0, y0, x1, y1, kind], ...]} every 2 s, only while Navigation runs
+// on a map that has zone masks (keep-out / speed %). Display only: Nav2's
+// costmap filters are what keep the robot out / slow it down.
+var zones = [];   // var: redraw() may run before this line
+var zonesAt = 0;
+const ZONE_STYLE = {keepout: ['rgba(229,57,53,0.40)', '#e53935'],
+                    30: ['rgba(255,128,0,0.30)', '#ff8000'],
+                    50: ['rgba(255,214,0,0.28)', '#ffd600']};
+
+function handleZones(msg) {
+  try {
+    const d = JSON.parse(msg.data);
+    const list = (d.zones || []).filter((z) => Array.isArray(z) && z.length === 5 &&
+      z.slice(0, 4).every(isFinite));
+    const changed = list.length !== zones.length;
+    zones = list; zonesAt = Date.now();
+    if (changed) redraw();
+  } catch (e) {}
+}
+
+function zonesFresh() { return zonesAt && Date.now() - zonesAt < 6000; }
+
+function zoneAt(x, y) {
+  if (!zonesFresh()) return null;
+  for (const z of zones) {
+    if (x >= z[0] && x < z[2] && y >= z[1] && y < z[3]) return z[4];
+  }
+  return null;
+}
+
+function drawZones() {
+  if (!zonesFresh() || !zones.length) return;
+  ctx.save();
+  ctx.setTransform(screenMatrix());
+  for (const z of zones) {
+    const st = ZONE_STYLE[z[4]] || ['rgba(255,214,0,0.28)', '#ffd600'];
+    ctx.fillStyle = st[0];
+    // tiny overlap hides seams between runs
+    ctx.fillRect(z[0], z[1], z[2] - z[0] + 0.01, z[3] - z[1] + 0.01);
+  }
+  ctx.restore();
+  // one label per kind, at its first rectangle
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'left';
+  const seen = new Set();
+  for (const z of zones) {
+    if (seen.has(z[4])) continue;
+    seen.add(z[4]);
+    const p = worldToScreen(z[0], z[3]);
+    const label = z[4] === 'keepout' ? '⛔ ห้ามเข้า' : '🐢 ' + z[4] + '%';
+    ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.strokeText(label, p.x + 2, p.y - 4);
+    ctx.fillStyle = (ZONE_STYLE[z[4]] || ZONE_STYLE[50])[1];
+    ctx.fillText(label, p.x + 2, p.y - 4);
+  }
+  ctx.restore();
+}
+
 // ---------- doors (amr_bringup door_manager_node.py, /amr_doors) ----------
-// {map, doors: [{name, x, y, radius, relay, pulse_s}]} at 1 Hz. A door is set
-// at the robot's CURRENT pose (drive there first); the browser only sends the
-// name and relay. In Auto the robot pulses the door's relay when it enters
-// the circle; it does not stop for the door.
+// {map, doors: [{name, x, y, radius, relay, pulse_s, wait_s}]} at 1 Hz. A door
+// is set at the robot's CURRENT pose (drive there first); the browser only
+// sends the name and relay. In Auto the robot pulses the door's relay when it
+// enters the circle and stands still for wait_s (nav_goal_executor_node.py).
 var doors = [];   // var: redraw() may run before this line
 var doorsMap = '';
 var doorsAt = 0;
@@ -1674,8 +1738,10 @@ function finalizeGoalDraft() {
   }
 
   const s = worldToScreen(draft.ax, draft.ay);
-  const cls = classifyScreenPoint(s.x, s.y);
+  const zone = zoneAt(draft.ax, draft.ay);
+  const cls = zone === 'keepout' ? 'keepout' : classifyScreenPoint(s.x, s.y);
   const warnings = {
+    keepout: '⛔ จุดนี้อยู่ในโซนห้ามเข้า - Nav2 จะหาเส้นทางไม่ได้',
     obstacle: 'จุดนี้อยู่ในตำแหน่งสิ่งกีดขวางบนแผนที่',
     unmapped: 'จุดนี้อยู่นอกพื้นที่ที่สำรวจไว้',
     tight: 'บริเวณนี้ค่อนข้างแคบ/มืดในแผนที่ ตรวจสอบก่อนส่ง',
