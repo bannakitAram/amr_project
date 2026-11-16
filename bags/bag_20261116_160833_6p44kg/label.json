@@ -1,0 +1,18 @@
+{
+  "payload_kg": 6.44,
+  "note": "A02",
+  "bag": "bag_20261116_160833_6p44kg",
+  "start": "2026-11-16 16:08:33",
+  "duration_s": 37.4,
+  "topics": [
+    "/amcl_pose",
+    "/battery/state",
+    "/cmd_vel",
+    "/hook/state",
+    "/motor_current/left",
+    "/motor_current/right",
+    "/motor_current/stamped",
+    "/nav_event",
+    "/wheel/odom"
+  ]
+}
