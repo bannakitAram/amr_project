@@ -1,0 +1,9 @@
+stations:
+- name: HOME
+  x: 0.0
+  y: 0.0
+  theta: 0.0
+- name: Station_A
+  x: 36.013
+  y: 1.097
+  theta: -0.373
