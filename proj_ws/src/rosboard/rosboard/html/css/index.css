@@ -589,14 +589,16 @@ input, textarea, *[contenteditable=true] {
   position: fixed;
   left: 6px;
   bottom: 24px;
-  width: 76px;
   z-index: 1001;
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  flex-direction: row;
+  align-items: flex-end;
+  gap: 4px;
   font-family: sans-serif;
 }
 .mapping-bar[hidden] { display: none; }
+/* two columns so the whole bar stays under ~260px high (300px slice) */
+.mapping-col { width: 72px; display: flex; flex-direction: column; gap: 4px; }
 .mapping-bar-status {
   padding: 4px 2px;
   border-radius: 6px;
@@ -610,7 +612,7 @@ input, textarea, *[contenteditable=true] {
 .mapping-bar.scanning .mapping-bar-status { background: #2e9e48; color: #fff; }
 .mapping-bar.offline .mapping-bar-status { background: #777; color: #fff; }
 .mapping-btn {
-  min-height: 48px;
+  min-height: 44px;
   border: none;
   border-radius: 8px;
   font-size: 13px;
@@ -622,9 +624,14 @@ input, textarea, *[contenteditable=true] {
 }
 .mapping-btn-scan.scanning { background: #2e9e48; color: #fff; }
 .mapping-btn-save { background: #2f7fd8; color: #fff; }
+.mapping-btn-station { background: #e89a1c; color: #1a1a1a; font-size: 12px; }
 .mapping-btn-finish { background: #d93636; color: #fff; }
 .mapping-btn:disabled { opacity: 0.4; }
-body.mapping-active .joystick-panel { padding-left: 88px; }
+.mapping-remote-title { text-align: center; font-size: 11px; font-weight: bold; color: #ccc; }
+.mapping-remote { width: 52px; }
+.mapping-btn-remote { min-height: 44px; padding: 0; background: #7a4fd0; color: #fff; font-size: 18px; font-weight: bold; }
+.mapping-btn-remote.sent { background: #2e9e48; opacity: 1; }
+body.mapping-active .joystick-panel { padding-left: 140px; }
 .mapping-toast {
   position: fixed;
   left: 50%;

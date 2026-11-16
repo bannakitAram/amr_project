@@ -6,7 +6,7 @@
 // The AMR Control panel owns the real work (slam_toolbox pause toggle,
 // map_saver, stopping the bringup). This bar only sends one of four
 // commands over the websocket (MSG_MAPPING, validated again in
-// rosboard.py) and shows the panel's state from /amr_mapping_state
+// rosboard.py), plus Remote 1/2/3 relay pulses (MSG_DOOR action "pulse") and shows the panel's state from /amr_mapping_state
 // (std_msgs/String JSON, ~1 Hz while Mapping runs). The bar is hidden
 // unless the panel reports mode == "mapping".
 
@@ -32,15 +32,25 @@
   $(() => {
     const bar = $(`
       <div class="mapping-bar" hidden>
-        <div class="mapping-bar-status"></div>
-        <button class="mapping-btn mapping-btn-scan"></button>
-        <button class="mapping-btn mapping-btn-save">บันทึก<br>แผนที่</button>
-        <button class="mapping-btn mapping-btn-finish">สิ้นสุด</button>
+        <div class="mapping-col">
+          <div class="mapping-bar-status"></div>
+          <button class="mapping-btn mapping-btn-scan"></button>
+          <button class="mapping-btn mapping-btn-station">＋<br>Station</button>
+          <button class="mapping-btn mapping-btn-save">บันทึก<br>แผนที่</button>
+          <button class="mapping-btn mapping-btn-finish">สิ้นสุด</button>
+        </div>
+        <div class="mapping-col mapping-remote">
+          <div class="mapping-remote-title">Remote</div>
+          <button class="mapping-btn mapping-btn-remote" data-relay="1">R1</button>
+          <button class="mapping-btn mapping-btn-remote" data-relay="2">R2</button>
+          <button class="mapping-btn mapping-btn-remote" data-relay="3">R3</button>
+        </div>
       </div>
     `).appendTo("body");
     const statusEl = bar.find(".mapping-bar-status");
     const scanBtn = bar.find(".mapping-btn-scan");
     const saveBtn = bar.find(".mapping-btn-save");
+    const stationBtn = bar.find(".mapping-btn-station");
     const finishBtn = bar.find(".mapping-btn-finish");
 
     function render() {
@@ -55,6 +65,9 @@
       scanBtn.toggleClass("scanning", !!state.scanning);
       scanBtn.prop("disabled", !mapping || busy);
       saveBtn.prop("disabled", !mapping || state.saving);
+      stationBtn.prop("disabled", !mapping || !state.ready || state.saving);
+      const n = (state.stations || []).length;
+      stationBtn.html("＋<br>Station" + (n ? " (" + n + ")" : ""));
       finishBtn.prop("disabled", !mapping);
       bar.toggleClass("scanning", !!(mapping && state.scanning));
       bar.toggleClass("offline", !fresh);
@@ -63,7 +76,28 @@
       statusEl.attr("title", state.msg || "");
     }
 
+    // Remote 1/2/3: pulse relay 1-3 on the hook Mega (shuttle door remote),
+    // via door_manager_node.py. Disabled 1 s after a tap: one pulse per tap.
+    const remoteBtns = bar.find(".mapping-btn-remote");
+    remoteBtns.on("click", function () {
+      if (!currentTransport || !currentTransport.isConnected()) return;
+      const btn = $(this);
+      currentTransport.doorCmd({action: "pulse", name: "", relay: Number(btn.data("relay"))});
+      if (navigator.vibrate) navigator.vibrate(30);
+      btn.prop("disabled", true).addClass("sent");
+      setTimeout(() => btn.prop("disabled", false).removeClass("sent"), 1000);
+    });
+
     scanBtn.on("click", () => send(state && state.scanning ? "pause" : "start"));
+    // Station at the robot's current pose (panel reads TF map -> base_footprint);
+    // kept until the map is saved, then written to <map>_stations.yaml.
+    stationBtn.on("click", () => {
+      const names = new Set((state && state.stations) || []);
+      let def = "Station_" + ("ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("").find((c) => !names.has("Station_" + c)) || (names.size + 1));
+      const name = window.prompt("ชื่อ Station ที่ตำแหน่งนี้ (A-Z a-z 0-9 _ -)\nชื่อซ้ำ = ย้ายไปตำแหน่งนี้", def);
+      if (name === null) return;
+      send("station", name);
+    });
     saveBtn.on("click", () => {
       const name = window.prompt("ตั้งชื่อแผนที่ (A-Z a-z 0-9 _ -)", defaultName());
       if (name === null) return;

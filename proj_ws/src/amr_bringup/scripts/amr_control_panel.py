@@ -1435,6 +1435,9 @@ class AmrControlPanel(tk.Tk):
         self._map_saving = False
         self._mapping_msg = ''
         self._mapping_state_t = 0.0
+        # Stations marked from the phone while mapping: poses in the SLAM map
+        # frame, written to <map>_stations.yaml when the map is saved.
+        self._mapping_stations = []
 
         self._dev_unlocked = False
         self._pages = {}
@@ -3143,17 +3146,37 @@ class AmrControlPanel(tk.Tk):
                     self._mapping_msg = f'มีแผนที่ชื่อ "{name}" อยู่แล้ว - ใช้ชื่ออื่น'
                 else:
                     self._start_map_save(name, from_phone=True)
+            elif action == 'station':
+                self._mark_mapping_station(str(cmd.get('name') or ''))
             elif action == 'finish':
                 self._mapping_msg = 'ปิด Mapping จากมือถือ'
                 self._on_stop()
             self._refresh_mapping_ui()
+
+    def _mark_mapping_station(self, name):
+        """Phone 'station' button while mapping: remember the robot's pose
+        under this name (same name = move it). Saved with the next map save."""
+        pose = self.ros.pose()
+        if pose is None:
+            self._mapping_msg = 'บันทึก Station ไม่ได้: ยังไม่มีตำแหน่ง (TF map)'
+            return
+        names = {st['name'] for st in self._mapping_stations}
+        name = sanitize_map_name(name)[:24] or next(
+            (f'Station_{c}' for c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+             if f'Station_{c}' not in names), f'Station_{len(names) + 1}')
+        self._mapping_stations = [st for st in self._mapping_stations if st['name'] != name]
+        self._mapping_stations.append({'name': name, 'x': round(pose[0], 3),
+                                       'y': round(pose[1], 3), 'theta': round(pose[2], 3)})
+        self._mapping_msg = (f'Station {name} ({pose[0]:.2f}, {pose[1]:.2f}) '
+                             f'- บันทึกลงไฟล์ตอนบันทึกแผนที่')
 
     def _mapping_state(self):
         if self._mode == 'mapping' and self._slam_ready and self.ros.gate_open is not None:
             self._scanning = self.ros.gate_open
         return {'mode': self._mode or 'idle', 'ready': self._slam_ready,
                 'scanning': self._scanning, 'saving': self._map_saving,
-                'msg': self._mapping_msg}
+                'msg': self._mapping_msg,
+                'stations': [st['name'] for st in self._mapping_stations]}
 
     def _refresh_mapping_ui(self):
         mapping = self._mode == 'mapping'
@@ -3533,6 +3556,8 @@ class AmrControlPanel(tk.Tk):
 
     def _launch(self, cmd, mode, label):
         self._mode = mode
+        if mode == 'mapping':
+            self._mapping_stations = []
         self._set_status('starting', 'กำลังเริ่มระบบ...', label)
         self._set_running_ui(True, mode)
         env = os.environ.copy()
@@ -3915,6 +3940,13 @@ class AmrControlPanel(tk.Tk):
     def _after_save(self, ok, name, from_phone=False):
         self._map_saving = False
         self._mapping_msg = (f'บันทึกแล้ว: {name}' if ok else 'บันทึกแผนที่ไม่สำเร็จ')
+        if ok and self._mapping_stations:
+            # new map name (save refuses existing names), so no file to merge
+            try:
+                save_stations(name, list(self._mapping_stations))
+                self._mapping_msg += f' + {len(self._mapping_stations)} station'
+            except OSError:
+                self._mapping_msg += ' (บันทึก station ไม่สำเร็จ)'
         self._refresh_mapping_ui()
         self._set_btn_state(self.btn_save_map, self._mode == 'mapping')
         self.btn_save_map.config(text=T('SAVE MAP (บันทึกแผนที่)'))

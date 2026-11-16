@@ -14,6 +14,9 @@ In:
                  {"action": "add", "name": "A", "relay": 1}  door at the
                      robot's current pose (TF map -> base_footprint)
                  {"action": "delete", "name": "A"}
+                 {"action": "pulse", "relay": 1}  pulse that relay now
+                     (Remote 1/2/3 buttons on the phone's Mapping bar;
+                     works in any mode, no map needed)
   /amr_stations std_msgs/String JSON {map, routes_file, ...} from the panel
   /cmd_vel_nav  geometry_msgs/Twist: Nav2/executor output, used to tell Auto
                driving (recent non-zero) from Manual
@@ -140,6 +143,9 @@ class DoorManager(Node):
             action = c.get('action')
         except (ValueError, AttributeError):
             return
+        if action == 'pulse':
+            self.manual_pulse(c.get('relay'))
+            return
         if not (self.map_name and self.maps_dir):
             self.get_logger().warn('door cmd ignored: Navigation not running on a map')
             return
@@ -178,6 +184,19 @@ class DoorManager(Node):
         except OSError as e:
             self.get_logger().error('save %s failed: %s' % (self.doors_path(), e))
         self.publish_doors()
+
+    def manual_pulse(self, relay):
+        """Remote 1/2/3 button on the phone (Mapping bar): pulse one relay now,
+        in any mode, no map or door needed. Ignored while that relay's
+        previous pulse is still on, so a double tap gives one pulse."""
+        if relay not in (1, 2, 3):
+            self.get_logger().warn('pulse ignored: relay must be 1-3')
+            return
+        if any(r == relay for _, r in self.pending_off):
+            return
+        self.get_logger().info('remote button: pulse relay %d' % relay)
+        self.relay_pub.publish(String(data='%d on' % relay))
+        self.pending_off.append((time.monotonic() + self.default_pulse_s, relay))
 
     # ---- outputs --------------------------------------------------------
     def publish_doors(self):

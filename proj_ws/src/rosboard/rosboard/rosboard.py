@@ -208,7 +208,7 @@ class ROSBoardNode(object):
         # door edits from goal_picker -> amr_bringup door_manager_node.py
         self.door_cmd_pub = rospy.Publisher("/rosboard_door_cmd", String, queue_size=5)
         # route_* = fixed route / planner switch for station goals, same consumer
-        self.MAPPING_ACTIONS = ("start", "pause", "save", "finish", "route_fixed", "route_planner")
+        self.MAPPING_ACTIONS = ("start", "pause", "save", "finish", "station", "route_fixed", "route_planner")
 
         # rosbag recording from the phone: rosboard runs `ros2 bag record`
         # itself on the topics ticked on the goal_picker page. Topics must
@@ -326,6 +326,13 @@ class ROSBoardNode(object):
         """Forward a validated door edit as JSON on /rosboard_door_cmd. The
         door position is the robot's pose, taken by door_manager_node.py,
         never from the browser."""
+        if action == "pulse":
+            # manual remote button (phone, Mapping bar): one relay pulse, no door
+            if relay not in (1, 2, 3):
+                print("error: door: bad relay %r" % (relay,))
+                return
+            self.door_cmd_pub.publish(String(data=json.dumps({"action": "pulse", "relay": relay})))
+            return
         if action not in ("add", "delete"):
             print("error: door: bad action %r" % (action,))
             return
