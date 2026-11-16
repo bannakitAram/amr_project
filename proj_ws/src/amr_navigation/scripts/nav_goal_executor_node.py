@@ -51,6 +51,12 @@ once the way is clear. Each retry still goes through collision_monitor.
 Operator cancel or a new goal ends the wait. StationApproach is not covered;
 it keeps its own timeout.
 
+Door wait (/door_hold from amr_bringup door_manager_node.py, JSON at 10 Hz):
+while hold is true the running request is stopped (task cancelled, robot
+standing) and re-sent when hold goes false or its messages stop for
+DOOR_HOLD_STALE_S. A fixed-time wait only - a door still closed is left to
+collision_monitor and the blocked-wait above. Operator cancel/new goal ends it.
+
 Fixed routes: if the map has a <map>_routes.yaml (recorded from the control
 panel; path in /amr_stations) a station goal follows the recorded route to
 that station with FollowPath, from the route point nearest the robot, in
@@ -86,6 +92,7 @@ def restamp(pose_stamped, navigator):
 
 
 SLIP_FAULT_S = 6.0       # s of continuous slip before the robot is stopped (was 3.0: stopped too often)
+DOOR_HOLD_STALE_S = 1.0  # s without /door_hold = no door wait (door_manager gone)
 SLIP_RESUME_S = 3.0      # s slip-free before the stopped request is resent
 
 BLOCK_S = 2.0            # s of commanded motion stopped by collision_monitor = blocked
@@ -365,6 +372,7 @@ def main():
     current = {'req': None}  # running request (kind, msg) for a slip retry
     held = {'value': None}       # request stopped by slip, waiting to be resent
     slip = {'since': None, 'clear_since': None}
+    door = {'hold': False, 'name': '', 't': 0.0, 'req': None}  # door wait, see docstring
     station = {'value': None}   # station PoseStamped while Nav2 drives to its pre-goal
     approach = {'value': None}  # StationApproach while the final approach runs
 
@@ -447,6 +455,15 @@ def main():
             if slip['clear_since'] is None:
                 slip['clear_since'] = t
 
+    def on_door_hold(msg):
+        try:
+            d = json.loads(msg.data)
+        except ValueError:
+            return
+        door['hold'] = bool(d.get('hold'))
+        door['name'] = str(d.get('door', ''))
+        door['t'] = time.time()
+
     alert_pub = navigator.create_publisher(String, '/nav_alert', 10)
     last_alert = {'data': json.dumps({'level': 'ok', 'text': ''}), 't': 0.0}
 
@@ -522,6 +539,7 @@ def main():
     navigator.create_subscription(Empty, '/rosboard_nav_cancel', on_cancel, 10)
     navigator.create_subscription(PoseStamped, '/rosboard_nav_station', on_station, 10)
     navigator.create_subscription(Bool, '/slip_localization/slipping', on_slipping, 10)
+    navigator.create_subscription(String, '/door_hold', on_door_hold, 10)
     navigator.create_subscription(String, '/amr_stations', on_stations, 10)
     navigator.create_subscription(Twist, '/cmd_vel_smoothed', on_smoothed, 10)
     navigator.create_subscription(Twist, '/cmd_vel', on_output, 10)
@@ -553,6 +571,7 @@ def main():
                     blocked['req'] = None
                     blocked['alerted'] = False
                     held['value'] = None
+                    door['req'] = None
                     alert('ok', '')
                 current['req'] = (kind, msg) if kind != 'cancel' else None
 
@@ -660,6 +679,20 @@ def main():
             if blocked['req'] is not None and time.time() > blocked['resend_at']:
                 pending['value'] = blocked['req'] + (True,)
                 blocked['req'] = None
+
+            # door wait: stand still while door_manager holds, then carry on
+            door_holding = door['hold'] and time.time() - door['t'] < DOOR_HOLD_STALE_S
+            if door_holding and (task_active['value'] or approach['value'] is not None):
+                stop_all()
+                if current['req'] is not None:
+                    door['req'] = current['req']
+                current['req'] = None
+                alert('warn', 'รอประตู %s เปิด - จอดรอ แล้วจะไปต่ออัตโนมัติ' % door['name'])
+            if door['req'] is not None and not door_holding:
+                navigator.get_logger().info('nav_goal_executor_node: door wait over - resending request')
+                pending['value'] = door['req'] + (True,)
+                door['req'] = None
+                alert('ok', '')
 
             # sustained wheel slip: stop, then resend when it clears
             busy = task_active['value'] or approach['value'] is not None

@@ -6,7 +6,7 @@ stations file; the map name and folder come from the control panel's
 /amr_stations, so doors exist only while Navigation runs on a map):
 
   doors:
-    - {name: A, x: 3.20, y: -1.50, radius: 1.0, relay: 1, pulse_s: 0.5}
+    - {name: A, x: 3.20, y: -1.50, radius: 1.0, relay: 1, pulse_s: 0.5, wait_s: 5.0}
 
 In:
   /rosboard_door_cmd std_msgs/String JSON from rosboard (goal_picker), checked
@@ -23,10 +23,17 @@ In:
 Out:
   /amr_doors   std_msgs/String JSON {map, doors: [...]} at 1 Hz
   /relay/cmd   std_msgs/String "<n> on" then "<n> off" after pulse_s
+  /door_hold   std_msgs/String JSON {"hold": bool, "door": name, "left_s": s}
+               at 10 Hz; hold = true for wait_s after a door was triggered.
+               nav_goal_executor_node.py stops the running task while it is
+               true and re-sends it when it goes false (or goes stale).
 
 Trigger: when the robot enters a door's radius while driving in Auto, the
-door's relay is pulsed once; it re-arms after the robot has left the zone
-(radius + 0.3 m hysteresis). The robot does NOT stop or wait for the door.
+door's relay is pulsed once and the robot is held still for the door's
+wait_s (0 = drive on) so the door has time to open; it re-arms after the
+robot has left the zone (radius + 0.3 m hysteresis). The wait is a fixed
+time: nothing checks that the door opened - a door still closed after the
+wait is an obstacle for collision_monitor (the executor then waits for it).
 
 Convenience function only - NOT a safety function (ISO 3691-4). A door that
 does not open is an obstacle for collision_monitor; nothing here checks that
@@ -59,6 +66,7 @@ class DoorManager(Node):
         super().__init__('door_manager')
         self.default_radius = float(self.declare_parameter('radius', 1.0).value)
         self.default_pulse_s = float(self.declare_parameter('pulse_s', 0.5).value)
+        self.default_wait_s = float(self.declare_parameter('wait_s', 5.0).value)
         self.robot_frame = self.declare_parameter('robot_frame', 'base_footprint').value
 
         self.map_name = ''
@@ -67,11 +75,14 @@ class DoorManager(Node):
         self.inside = set()          # door names the robot is in (armed off)
         self.pending_off = []        # (monotonic time, relay)
         self.nav_moving_t = 0.0
+        self.hold_until = 0.0        # monotonic end of the current door wait
+        self.hold_door = ''
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.doors_pub = self.create_publisher(String, '/amr_doors', 10)
         self.relay_pub = self.create_publisher(String, '/relay/cmd', 10)
+        self.hold_pub = self.create_publisher(String, '/door_hold', 10)
         self.create_subscription(String, '/amr_stations', self.on_stations, 10)
         self.create_subscription(String, '/rosboard_door_cmd', self.on_cmd, 10)
         self.create_subscription(Twist, '/cmd_vel_nav', self.on_nav_cmd, 10)
@@ -92,7 +103,8 @@ class DoorManager(Node):
                     'name': str(d['name']), 'x': float(d['x']), 'y': float(d['y']),
                     'radius': float(d.get('radius', self.default_radius)),
                     'relay': int(d['relay']),
-                    'pulse_s': float(d.get('pulse_s', self.default_pulse_s))})
+                    'pulse_s': float(d.get('pulse_s', self.default_pulse_s)),
+                    'wait_s': min(60.0, max(0.0, float(d.get('wait_s', self.default_wait_s))))})
         except FileNotFoundError:
             pass
         except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as e:
@@ -168,7 +180,8 @@ class DoorManager(Node):
                 return
             self.doors.append({'name': name, 'x': round(xy[0], 3), 'y': round(xy[1], 3),
                                'radius': self.default_radius, 'relay': relay,
-                               'pulse_s': self.default_pulse_s})
+                               'pulse_s': self.default_pulse_s,
+                               'wait_s': self.default_wait_s})
             # being at the door when it is set must not tick it at once
             self.inside.add(name)
             self.get_logger().info('door %s set at (%.2f, %.2f) relay %d'
@@ -208,6 +221,10 @@ class DoorManager(Node):
         for t, relay in [p for p in self.pending_off if p[0] <= now]:
             self.relay_pub.publish(String(data='%d off' % relay))
         self.pending_off = [p for p in self.pending_off if p[0] > now]
+        left = self.hold_until - now
+        self.hold_pub.publish(String(data=json.dumps(
+            {'hold': left > 0, 'door': self.hold_door, 'left_s': round(max(0.0, left), 1)},
+            ensure_ascii=False)))
         if not self.doors:
             return
         xy = self.robot_xy()
@@ -225,6 +242,10 @@ class DoorManager(Node):
                     self.get_logger().info('door %s: pulse relay %d' % (d['name'], d['relay']))
                     self.relay_pub.publish(String(data='%d on' % d['relay']))
                     self.pending_off.append((now + d['pulse_s'], d['relay']))
+                    if d['wait_s'] > 0:
+                        self.hold_until = now + d['wait_s']
+                        self.hold_door = d['name']
+                        self.get_logger().info('door %s: hold %.1f s' % (d['name'], d['wait_s']))
 
 
 def main():
