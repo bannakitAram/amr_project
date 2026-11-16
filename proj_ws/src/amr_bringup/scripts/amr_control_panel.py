@@ -278,6 +278,10 @@ def is_port_open(host, port, timeout=0.5):
         s.close()
 
 
+MAP_SIDE_FILES = ('_stations.yaml', '_routes.yaml', '_doors.yaml',
+                  '_keepout.yaml', '_speed.yaml')
+
+
 def stations_path(map_name):
     return os.path.join(MAPS_DIR, f'{map_name}_stations.yaml')
 
@@ -3453,7 +3457,8 @@ class AmrControlPanel(tk.Tk):
     def _show_map_picker(self, title='เลือกแผนที่สำหรับนำทาง', ok_text='เลือกแผนที่นี้'):
         yamls = sorted(glob.glob(os.path.join(MAPS_DIR, '*.yaml')),
                        key=os.path.getmtime, reverse=True)
-        yamls = [p for p in yamls if not p.endswith('_stations.yaml')]
+        # side files of a map (stations, routes, doors, zone masks) are not maps
+        yamls = [p for p in yamls if not p.endswith(MAP_SIDE_FILES)]
         names = [os.path.splitext(os.path.basename(p))[0] for p in yamls]
 
         result = {'path': None}
