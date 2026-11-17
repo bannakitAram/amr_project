@@ -93,8 +93,12 @@ const float    CUR_MV_PER_A      = 100.0;   // ACS712-20A (confirmed on the robo
 // read the CUR value, offset_counts = 512 + A * CUR_MV_PER_A / 4.883.
 const float    CUR_ZERO_LEFT     = 512.0;
 const float    CUR_ZERO_RIGHT    = 512.0;
-const uint32_t CUR_SAMPLE_MS     = 2;
-const uint32_t CUR_PERIOD_MS     = 200;   // CUR line rate 5 Hz
+// Sample both channels every 1 ms (2 x analogRead ~0.22 ms) and send the
+// mean every 50 ms: 20 Hz = /wheel/odom rate, so the 0->0.3 m/s ramp
+// (~2 s at 0.15 m/s^2) gives ~40 points for payload estimation; each line
+// is still a ~50-sample mean (PWM ripple smoothed). ~16 B x 20/s on 115200.
+const uint32_t CUR_SAMPLE_MS     = 1;
+const uint32_t CUR_PERIOD_MS     = 50;    // CUR line rate 20 Hz
 
 // KG-F coulometer (RS485 on Serial1). Baud must match the meter's setting.
 const uint32_t BAT_BAUD          = 115200;

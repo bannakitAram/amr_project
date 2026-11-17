@@ -14,7 +14,7 @@ Topics:
   /hook/cmd    std_msgs/String in: "U", "D", "S", "R" or "?" (case-insensitive)
   /motor_current/left, /motor_current/right
                std_msgs/Float32 out, A: drive wheel motor current from the
-               Mega's ACS712 sensors ("CUR <left> <right>", 5 Hz). Monitor
+               Mega's ACS712 sensors ("CUR <left> <right>", 20 Hz). Monitor
                only - nothing acts on it. The right motor is mirrored, so
                its raw value is negative when driving forward; it is multiplied
                by `current_right_sign` (-1) so + = driving forward on both.
@@ -24,6 +24,13 @@ Topics:
                clamped to +/-`zero_max_a`; hitting the clamp is logged
                (sensor/wiring fault, or the driver really draws current at
                standstill - auto-zero would hide that up to the clamp).
+  /motor_current/stamped
+               geometry_msgs/Vector3Stamped out, A: the same zeroed and
+               sign-corrected values in one message, x = left, y = right,
+               z = 0. header.stamp = Jetson clock when the CUR line was read
+               off the serial port (frame_id "base_link"), so a bag can sync
+               it with /wheel/odom by stamp instead of by receive time. Use
+               this one for logging / ML; the Float32 topics stay for the UI.
   /battery/raw std_msgs/String out: raw reply line of the Junctek KG-F
                coulometer ("BAT <reply>", ~1 Hz, RS485 on the Mega's Serial1).
                Monitor only.
@@ -69,6 +76,7 @@ import rclpy
 import rclpy.executors
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
+from geometry_msgs.msg import Vector3Stamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import BatteryState
 from std_msgs.msg import Float32, String
@@ -119,6 +127,8 @@ class HookBridge(Node):
         self.create_subscription(Odometry, '/wheel/odom', self.on_odom, 10)
         self.cur_left_pub = self.create_publisher(Float32, '/motor_current/left', 10)
         self.cur_right_pub = self.create_publisher(Float32, '/motor_current/right', 10)
+        self.cur_stamped_pub = self.create_publisher(
+            Vector3Stamped, '/motor_current/stamped', 10)
         self.relay_pub = self.create_publisher(String, '/relay/state', latched)
         self.create_subscription(String, '/relay/cmd', self.on_relay_cmd, 10)
         self.relay_pub.publish(String(data='UNKNOWN'))
@@ -228,7 +238,7 @@ class HookBridge(Node):
             if line.startswith('STATE '):
                 self.publish_state(line[len('STATE '):].strip())
             elif line.startswith('CUR '):
-                self.on_current(line)
+                self.on_current(line, self.get_clock().now().to_msg())
             elif line.startswith('OUT '):
                 bits = line[4:].strip()
                 if len(bits) == 3 and set(bits) <= {'0', '1'}:
@@ -245,7 +255,7 @@ class HookBridge(Node):
             else:
                 self.get_logger().warn('Mega: %s' % line)
 
-    def on_current(self, line):
+    def on_current(self, line, stamp):
         try:
             left, right = (float(v) for v in line.split()[1:3])
         except ValueError:
@@ -255,8 +265,15 @@ class HookBridge(Node):
         self.update_zero(left, right)
         left -= self.zero[0]
         right -= self.zero[1]
+        right *= self.current_right_sign
         self.cur_left_pub.publish(Float32(data=left))
-        self.cur_right_pub.publish(Float32(data=right * self.current_right_sign))
+        self.cur_right_pub.publish(Float32(data=right))
+        msg = Vector3Stamped()
+        msg.header.stamp = stamp
+        msg.header.frame_id = 'base_link'
+        msg.vector.x = left
+        msg.vector.y = right
+        self.cur_stamped_pub.publish(msg)
 
     def on_battery(self, reply):
         if not reply.startswith(':r50='):
