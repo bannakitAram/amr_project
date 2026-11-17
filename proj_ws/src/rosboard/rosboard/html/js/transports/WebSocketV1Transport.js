@@ -107,9 +107,17 @@ class WebSocketV1Transport {
       this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_DOOR, {action: action, name: name || "", relay: relay}]));
     }
 
-    bagCmd({action, topics}) {
+    zoneCmd({action, kind, shape, points, width}) {
       if (!this.isConnected()) return;
-      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_BAG, {action: action, topics: topics || []}]));
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_ZONE,
+        {action: action, kind: kind, shape: shape, points: points, width: width}]));
+    }
+
+    bagCmd({action, topics, label}) {
+      if (!this.isConnected()) return;
+      const msg = {action: action, topics: topics || []};
+      if (label) msg.label = label;  // {payload_kg, note} - power log training label
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_BAG, msg]));
     }
 
     initialPose({x, y, theta}) {
@@ -136,6 +144,7 @@ class WebSocketV1Transport {
   WebSocketV1Transport.MSG_TELEOP_CFG = "x";
   WebSocketV1Transport.MSG_BAG = "b";
   WebSocketV1Transport.MSG_DOOR = "d";
+  WebSocketV1Transport.MSG_ZONE = "z";
 
   WebSocketV1Transport.PING_SEQ= "s";
   WebSocketV1Transport.PONG_SEQ = "s";

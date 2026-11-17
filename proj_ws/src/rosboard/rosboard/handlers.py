@@ -281,7 +281,8 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
             if len(argv) != 2 or type(argv[1]) is not dict:
                 print("error: bag: bad: %s" % message)
                 return
-            self.node.on_bag_cmd(argv[1].get("action"), argv[1].get("topics", []))
+            self.node.on_bag_cmd(argv[1].get("action"), argv[1].get("topics", []),
+                                 argv[1].get("label"))
 
         # client sent a door edit (goal_picker: set door at robot pose / delete)
         elif argv[0] == ROSBoardSocketHandler.MSG_DOOR:
@@ -290,6 +291,13 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
                 return
             self.node.on_door_cmd(argv[1].get("action"), argv[1].get("name", ""),
                                   argv[1].get("relay"))
+
+        # client sent a map zone edit (goal_picker: rectangle add / erase)
+        elif argv[0] == ROSBoardSocketHandler.MSG_ZONE:
+            if len(argv) != 2 or type(argv[1]) is not dict:
+                print("error: zone: bad: %s" % message)
+                return
+            self.node.on_zone_cmd(argv[1])
 
         # client wants to unsubscribe from topic
         elif argv[0] == ROSBoardSocketHandler.MSG_UNSUB:
@@ -324,6 +332,7 @@ ROSBoardSocketHandler.MSG_MAPPING = "k";
 ROSBoardSocketHandler.MSG_TELEOP_CFG = "x";
 ROSBoardSocketHandler.MSG_BAG = "b";
 ROSBoardSocketHandler.MSG_DOOR = "d";
+ROSBoardSocketHandler.MSG_ZONE = "z";
 
 ROSBoardSocketHandler.PING_SEQ = "s";
 ROSBoardSocketHandler.PONG_SEQ = "s";

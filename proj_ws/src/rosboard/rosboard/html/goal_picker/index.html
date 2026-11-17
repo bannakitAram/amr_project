@@ -83,6 +83,10 @@
   }
   #confirm-panel[hidden] { display: none; }
   #confirm-panel .warn { color: #ffb300; }
+  /* zone mode: the zone panel sits where the confirm bar normally is, so
+     the confirm bar moves to the top, under the status bar */
+  body.zone-mode #confirm-panel { top: 44px; bottom: auto; z-index: 23;
+    border: 2px solid #2196f3; font-size: 15px; }
 
   #station-panel {
     position: absolute; left: 10px; right: 10px; bottom: 66px;
@@ -123,6 +127,24 @@
     padding: 10px; z-index: 22; max-height: 55vh; overflow-y: auto; font-size: 13px;
   }
   #door-panel[hidden] { display: none; }
+  /* map zones: pick a kind, then drag a rectangle on the map - see zone mode. */
+  #zone-panel {
+    position: absolute; left: 10px; right: 10px; bottom: 66px;
+    background: rgba(20,20,20,0.92); color: #eee; border-radius: 10px;
+    padding: 8px 10px; z-index: 22; font-size: 13px;
+  }
+  #zone-panel[hidden] { display: none; }
+  #zone-panel .title { font-size: 12px; color: #aaa; margin-bottom: 6px; }
+  #zone-panel .row { display: flex; gap: 6px; flex-wrap: wrap; }
+  #zone-panel .zk { flex: 1; min-width: 70px; padding: 10px 4px; border-radius: 8px; border: 2px solid transparent;
+    font-size: 14px; font-weight: bold; color: #111; }
+  #zone-panel .zk.sel { border-color: #fff; box-shadow: 0 0 0 2px #2196f3; }
+  #zone-panel .zt { flex: 1; min-width: 70px; padding: 9px 4px; border-radius: 8px; border: 1px solid #555;
+    background: #333; color: #eee; font-size: 13px; }
+  #zone-panel .zt.sel { background: #1565c0; border-color: #90caf9; }
+  #zone-panel select { font-size: 14px; padding: 6px; border-radius: 6px; background: #222; color: #eee;
+    border: 1px solid #555; }
+  #zone-panel [hidden] { display: none !important; }
   #door-panel .title { font-size: 12px; color: #aaa; margin-bottom: 6px; }
   #door-panel .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
   #door-panel input, #door-panel select { font-size: 16px; padding: 6px; border-radius: 6px;
@@ -194,6 +216,29 @@
   <div id="station-panel" hidden></div>
   <div id="bag-panel" hidden></div>
   <div id="door-panel" hidden></div>
+  <div id="zone-panel" hidden>
+    <div class="title" id="zone-hint"></div>
+    <div class="row">
+      <button class="zk sel" data-kind="keepout" style="background:#e53935;color:#fff">⛔ ห้ามเข้า</button>
+      <button class="zk" data-kind="30" style="background:#ff8000">🐢 30%</button>
+      <button class="zk" data-kind="50" style="background:#ffd600">🐢 50%</button>
+      <button class="zk" data-kind="erase" style="background:#ddd">🧽 ลบ</button>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <button class="zt sel" data-tool="poly">⬠ หลายเหลี่ยม</button>
+      <button class="zt" data-tool="brush">🖌 พู่กัน</button>
+      <button class="zt" data-tool="rect">▭ สี่เหลี่ยม</button>
+      <select id="zone-width" title="ความกว้างพู่กัน">
+        <option value="0.3">0.3 ม.</option><option value="0.6" selected>0.6 ม.</option>
+        <option value="1.0">1.0 ม.</option><option value="1.5">1.5 ม.</option>
+      </select>
+    </div>
+    <div class="row" id="zone-poly-row" style="margin-top:6px">
+      <button class="zt" id="zone-undo">↶ ย้อนจุด</button>
+      <button class="zt" id="zone-clear">✕ ล้าง</button>
+      <button class="zt" id="zone-close" style="background:#2e7d32;color:#fff">✔ ปิดรูป / ส่ง</button>
+    </div>
+  </div>
   <div id="log-panel" hidden></div>
   <div id="bag-badge" hidden></div>
 
@@ -202,6 +247,7 @@
     <button class="btn" id="mode-goal">ตั้งจุดหมาย</button>
     <button class="btn" id="mode-path">ลากเส้นทาง</button>
     <button class="btn" id="mode-initpose">ตั้งตำแหน่งเริ่มต้น</button>
+    <button class="btn" id="mode-zone">โซน</button>
     <button class="btn" id="btn-stations">Station</button>
     <button class="btn" id="btn-doors">ประตู</button>
     <button class="btn" id="btn-bag">บันทึก Bag</button>
@@ -803,6 +849,7 @@ function redraw() {
   if (activeGoal) drawGoalPin(activeGoal);
   if ((mode === 'goal' || mode === 'initpose') && goalDraft) drawGoalDraft(goalDraft, mode === 'initpose');
   if (mode === 'path' && pathDraft) drawPathDraft(pathDraft.points);
+  if (mode === 'zone') drawZoneEdit();
 }
 
 // RViz-style ground-plane grid: an unbounded 1m grid (5m major lines),
@@ -1108,9 +1155,9 @@ document.getElementById('btn-stations').addEventListener('click', () => {
 });
 
 // ---------- map zones (amr_navigation zone_info_node.py, /amr_zones) ----------
-// {zones: [[x0, y0, x1, y1, kind], ...]} every 2 s, only while Navigation runs
-// on a map that has zone masks (keep-out / speed %). Display only: Nav2's
-// costmap filters are what keep the robot out / slow it down.
+// {map, zones: [[x0, y0, x1, y1, kind], ...], msg} every 2 s while Navigation
+// runs (zone_manager_node.py). Nav2's costmap filters are what keep the robot
+// out / slow it down; this page draws them and edits them (zone mode below).
 var zones = [];   // var: redraw() may run before this line
 var zonesAt = 0;
 const ZONE_STYLE = {keepout: ['rgba(229,57,53,0.40)', '#e53935'],
@@ -1122,8 +1169,10 @@ function handleZones(msg) {
     const d = JSON.parse(msg.data);
     const list = (d.zones || []).filter((z) => Array.isArray(z) && z.length === 5 &&
       z.slice(0, 4).every(isFinite));
-    const changed = list.length !== zones.length;
+    const changed = JSON.stringify(list) !== JSON.stringify(zones);
     zones = list; zonesAt = Date.now();
+    if (d.msg && d.msg !== zoneLastMsg) { if (zoneLastMsg !== '' || mode === 'zone') setStatus(d.msg); }
+    zoneLastMsg = d.msg || '';
     if (changed) redraw();
   } catch (e) {}
 }
@@ -1166,6 +1215,181 @@ function drawZones() {
   }
   ctx.restore();
 }
+
+// ---------- zone editing (mode 'zone') ----------
+// Three tools, all sent as points in the map frame to zone_manager_node.py
+// (via rosboard MSG_ZONE), which rasterizes them into the keep-out / speed
+// masks, updates Nav2's filters at once and writes the mask files (no save
+// step). Two fingers still pan / zoom in every tool.
+//   ⬠ polygon: tap the corners, then "✔ ปิดรูป / ส่ง"
+//   🖌 brush:   drag to paint a stroke of the chosen width
+//   ▭ rect:    drag a rectangle (sent as a 4-point polygon)
+const ZONE_MIN_SIDE = 0.2;    // m - smaller rect drags count as a tap
+const ZONE_TAP_PX = 12;       // CSS px - polygon: more movement = not a tap
+const ZONE_BRUSH_STEP = 0.08; // m between brush points
+const ZONE_MAX_POINTS = 400;
+const ZONE_LABEL = {keepout: 'โซนห้ามเข้า', 30: 'โซนความเร็ว 30%', 50: 'โซนความเร็ว 50%', erase: 'ลบโซน'};
+const ZONE_HINT = {
+  poly: 'แตะทีละมุมบนแผนที่ แล้วกด ✔ ปิดรูป / ส่ง (สองนิ้ว = เลื่อน/ซูม)',
+  brush: 'ลากนิ้วระบายบนแผนที่ ปล่อยนิ้วแล้วยืนยัน (สองนิ้ว = เลื่อน/ซูม)',
+  rect: 'ลากนิ้วเพื่อวาดสี่เหลี่ยม ปล่อยนิ้วแล้วยืนยัน (สองนิ้ว = เลื่อน/ซูม)'};
+var zoneDraft = null;    // rect {ax, ay, tx, ty}
+var zonePoly = [];       // polygon corners [{x, y}]
+var zoneStroke = null;   // brush {points: [{x, y}]}
+var zoneTap = null;      // polygon: pointerdown client position
+var zoneKind = 'keepout';
+var zoneTool = 'poly';
+var zoneLastMsg = '';
+const zonePanel = document.getElementById('zone-panel');
+const zoneWidthSel = document.getElementById('zone-width');
+const zonePolyRow = document.getElementById('zone-poly-row');
+
+function zoneWidth() { return parseFloat(zoneWidthSel.value) || 0.6; }
+function zoneResetDrafts() { zoneDraft = null; zonePoly = []; zoneStroke = null; zoneTap = null; }
+function renderZonePanel() {
+  document.getElementById('zone-hint').textContent = ZONE_HINT[zoneTool];
+  zoneWidthSel.hidden = zoneTool !== 'brush';
+  zonePolyRow.hidden = zoneTool !== 'poly';
+  document.getElementById('zone-close').disabled = zonePoly.length < 3;
+}
+for (const b of zonePanel.querySelectorAll('.zk')) {
+  b.addEventListener('click', () => {
+    zoneKind = b.dataset.kind;
+    for (const o of zonePanel.querySelectorAll('.zk')) o.classList.toggle('sel', o === b);
+    redraw();
+  });
+}
+for (const b of zonePanel.querySelectorAll('.zt[data-tool]')) {
+  b.addEventListener('click', () => {
+    zoneTool = b.dataset.tool;
+    for (const o of zonePanel.querySelectorAll('.zt[data-tool]')) o.classList.toggle('sel', o === b);
+    zoneResetDrafts(); hideConfirm(); renderZonePanel(); redraw();
+  });
+}
+document.getElementById('zone-undo').addEventListener('click', () => { zonePoly.pop(); renderZonePanel(); redraw(); });
+document.getElementById('zone-clear').addEventListener('click', () => { zonePoly = []; hideConfirm(); renderZonePanel(); redraw(); });
+document.getElementById('zone-close').addEventListener('click', () => {
+  if (zonePoly.length >= 3) confirmZone('poly', zonePoly.slice(), 0);
+});
+zoneWidthSel.addEventListener('change', redraw);
+
+function zoneStyle() {
+  return zoneKind === 'erase' ? ['rgba(255,255,255,0.30)', '#ffffff'] : (ZONE_STYLE[zoneKind] || ZONE_STYLE[50]);
+}
+
+function drawZoneEdit() {
+  const st = zoneStyle();
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = st[0]; ctx.strokeStyle = st[1]; ctx.lineWidth = 2;
+  if (zoneDraft) {
+    const a = worldToScreen(Math.min(zoneDraft.ax, zoneDraft.tx), Math.max(zoneDraft.ay, zoneDraft.ty));
+    const b = worldToScreen(Math.max(zoneDraft.ax, zoneDraft.tx), Math.min(zoneDraft.ay, zoneDraft.ty));
+    ctx.setLineDash([6, 4]);
+    ctx.fillRect(a.x, a.y, b.x - a.x, b.y - a.y);
+    ctx.strokeRect(a.x, a.y, b.x - a.x, b.y - a.y);
+    ctx.font = 'bold 13px sans-serif'; ctx.fillStyle = 'white';
+    ctx.fillText(Math.abs(zoneDraft.tx - zoneDraft.ax).toFixed(1) + ' × ' +
+                 Math.abs(zoneDraft.ty - zoneDraft.ay).toFixed(1) + ' ม.', a.x + 4, a.y - 6);
+  }
+  if (zonePoly.length) {
+    const pts = zonePoly.map((p) => worldToScreen(p.x, p.y));
+    ctx.beginPath();
+    pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+    if (pts.length >= 3) { ctx.closePath(); ctx.fill(); }
+    ctx.setLineDash([]); ctx.stroke();
+    for (const p of pts) { ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, 2 * Math.PI); ctx.fillStyle = st[1]; ctx.fill(); }
+    ctx.beginPath(); ctx.arc(pts[0].x, pts[0].y, 10, 0, 2 * Math.PI); ctx.strokeStyle = 'white'; ctx.stroke();
+  }
+  if (zoneStroke && zoneStroke.points.length) {
+    const pts = zoneStroke.points.map((p) => worldToScreen(p.x, p.y));
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.lineWidth = Math.max(3, zoneWidth() * view.scale);
+    ctx.strokeStyle = st[0].replace(/[\d.]+\)$/, '0.55)');
+    ctx.beginPath();
+    pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+    if (pts.length === 1) ctx.lineTo(pts[0].x + 0.1, pts[0].y);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function pointInPoly(x, y, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i], b = poly[j];
+    if ((a.y > y) !== (b.y > y) && x < (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x) inside = !inside;
+  }
+  return inside;
+}
+function nearStroke(x, y, pts, r) {
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[Math.min(i + 1, pts.length - 1)];
+    const dx = b.x - a.x, dy = b.y - a.y, L = dx * dx + dy * dy;
+    const t = L ? Math.max(0, Math.min(1, ((x - a.x) * dx + (y - a.y) * dy) / L)) : 0;
+    if (Math.hypot(a.x + t * dx - x, a.y + t * dy - y) <= r) return true;
+  }
+  return false;
+}
+function polyArea(pts) {
+  let a = 0;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) a += (pts[j].x + pts[i].x) * (pts[j].y - pts[i].y);
+  return Math.abs(a / 2);
+}
+
+function confirmZone(shape, pts, width) {
+  const kind = zoneKind;
+  const robot = tfLookup('map', 'base_footprint');
+  const covered = robot && (shape === 'poly' ? pointInPoly(robot.x, robot.y, pts)
+                                             : nearStroke(robot.x, robot.y, pts, width / 2));
+  const warn = kind === 'keepout' && covered ? 'หุ่นยนต์อยู่ในพื้นที่นี้ - จะออกจากโซนไม่ได้' : '';
+  const size = shape === 'poly' ? polyArea(pts).toFixed(1) + ' ม.²' : 'พู่กัน ' + width + ' ม.';
+  showConfirm(ZONE_LABEL[kind] + ' (' + size + ')? มีผลและบันทึกทันที', warn, () => {
+    if (kind === 'keepout' && !confirm('เพิ่มโซนห้ามเข้า?\n\nNav2 จะไม่วางเส้นทางเข้าพื้นที่นี้ทันที ' +
+        'เส้นทาง (route) ที่บันทึกไว้ผ่านพื้นที่นี้จะใช้ไม่ได้')) return;
+    transport.zoneCmd({action: kind === 'erase' ? 'erase' : 'add',
+                       kind: kind === 'erase' ? null : (kind === 'keepout' ? 'keepout' : Number(kind)),
+                       shape: shape, width: width,
+                       points: pts.map((p) => [+p.x.toFixed(3), +p.y.toFixed(3)])});
+    setStatus('ส่งคำสั่ง' + ZONE_LABEL[kind] + 'แล้ว...');
+    zoneResetDrafts(); hideConfirm(); renderZonePanel(); redraw();
+  });
+}
+
+function zonePointerDown(e) {
+  const w = screenToWorld(e.clientX, e.clientY);
+  if (zoneTool === 'rect') { zoneDraft = {ax: w.x, ay: w.y, tx: w.x, ty: w.y}; hideConfirm(); }
+  else if (zoneTool === 'brush') { zoneStroke = {points: [w]}; hideConfirm(); }
+  else zoneTap = {x: e.clientX, y: e.clientY};
+}
+function zonePointerMove(e) {
+  const w = screenToWorld(e.clientX, e.clientY);
+  if (zoneDraft) { zoneDraft.tx = w.x; zoneDraft.ty = w.y; }
+  else if (zoneStroke) {
+    const last = zoneStroke.points[zoneStroke.points.length - 1];
+    if (zoneStroke.points.length < ZONE_MAX_POINTS && Math.hypot(w.x - last.x, w.y - last.y) >= ZONE_BRUSH_STEP) {
+      zoneStroke.points.push(w);
+    }
+  }
+}
+function zonePointerUp(e) {
+  if (zoneDraft) {
+    const d = zoneDraft;
+    zoneDraft = null;
+    if (Math.abs(d.tx - d.ax) >= ZONE_MIN_SIDE && Math.abs(d.ty - d.ay) >= ZONE_MIN_SIDE) {
+      const x0 = Math.min(d.ax, d.tx), x1 = Math.max(d.ax, d.tx), y0 = Math.min(d.ay, d.ty), y1 = Math.max(d.ay, d.ty);
+      zoneDraft = d;   // keep it drawn until confirmed / discarded
+      confirmZone('poly', [{x: x0, y: y0}, {x: x1, y: y0}, {x: x1, y: y1}, {x: x0, y: y1}], 0);
+    }
+  } else if (zoneStroke) {
+    confirmZone('brush', zoneStroke.points.slice(), zoneWidth());
+  } else if (zoneTap && e && Math.hypot(e.clientX - zoneTap.x, e.clientY - zoneTap.y) < ZONE_TAP_PX) {
+    if (zonePoly.length < ZONE_MAX_POINTS) zonePoly.push(screenToWorld(e.clientX, e.clientY));
+    renderZonePanel();
+  }
+  zoneTap = null;
+}
+function zoneCancelGesture() { zoneTap = null; if (zoneDraft) zoneDraft = null; if (zoneStroke) zoneStroke = null; }
 
 // ---------- doors (amr_bringup door_manager_node.py, /amr_doors) ----------
 // {map, doors: [{name, x, y, radius, relay, pulse_s, wait_s}]} at 1 Hz. A door
@@ -1288,8 +1512,11 @@ const STOP_TOPICS = ['/cmd_vel', '/cmd_vel_smoothed', '/cmd_vel_nav', '/odometry
 // motor current + battery V/A log (one-tap button); /cmd_vel and
 // /wheel/odom give the speed the current belongs to; /nav_event marks
 // station trip start/arrived (nav_goal_executor_node)
-const POWER_TOPICS = ['/motor_current/left', '/motor_current/right', '/battery/state', '/nav_event',
-                      '/cmd_vel', '/wheel/odom'];
+// /amcl_pose = where on the map (floor, ramp), /hook/state = payload lifted
+const POWER_TOPICS = ['/motor_current/left', '/motor_current/right', '/motor_current/stamped', '/battery/state', '/nav_event',
+                      '/cmd_vel', '/wheel/odom', '/amcl_pose', '/hook/state'];
+// only exist in Navigation mode / with the Mega: recorded if there, no warning
+const POWER_OPTIONAL = ['/nav_event', '/amcl_pose', '/hook/state'];
 // big topics: warn, they can fill the disk / load the Jetson
 const BAG_HEAVY_TYPES = /PointCloud2|Image|OccupancyGrid/;
 let allTopics = {};   // name -> type, from rosboard's topic list
@@ -1335,7 +1562,8 @@ function renderBagStatus() {
   if (!el) return;
   const fresh = Date.now() - bagStateAt < 5000;
   if (!fresh) el.textContent = 'ไม่มีสถานะจากเครื่องบันทึก (rosboard)';
-  else if (bagState.recording) el.textContent = 'กำลังบันทึก ' + bagState.name + ' - ' + fmtDuration(bagState.elapsed) +
+  else if (bagState.recording) el.textContent = 'กำลังบันทึก ' + bagState.name +
+    (bagState.payload_kg != null ? ' [payload ' + bagState.payload_kg + ' kg]' : '') + ' - ' + fmtDuration(bagState.elapsed) +
     ' (หยุดเองเมื่อครบ ' + Math.round(bagState.max_s / 60) + ' นาที)';
   else el.textContent = (bagState.name ? 'ไฟล์ล่าสุด: ' + bagState.dir + '/' + bagState.name : 'ยังไม่ได้บันทึก') +
     (bagState.error ? ' - ' + bagState.error : '');
@@ -1359,7 +1587,7 @@ function renderBagStatus() {
     res.textContent = txt || '';
     res.className = !txt ? '' : (bagState.stop_ok ? 'pass' : 'fail');
   }
-  for (const cb of bagPanel.querySelectorAll('input[type=checkbox]')) cb.disabled = rec;
+  for (const cb of bagPanel.querySelectorAll('input')) cb.disabled = rec;
 }
 
 function renderBagPanel() {
@@ -1390,6 +1618,29 @@ function renderBagPanel() {
 
   // stop-distance test: tick the topics the analysis needs, record the
   // runs, stop, then analyse the last bag on the robot (result below)
+  // payload label for the power log (weight-prediction training data);
+  // last value kept per browser so repeated runs at one weight are quick
+  const labelRow = document.createElement('div');
+  labelRow.className = 'row';
+  let savedLabel = {};
+  try { savedLabel = JSON.parse(localStorage.getItem('goal_picker_bag_label')) || {}; } catch (e) {}
+  const kgIn = document.createElement('input');
+  kgIn.id = 'bag-kg'; kgIn.type = 'number'; kgIn.min = '0'; kgIn.max = '500'; kgIn.step = '0.1';
+  kgIn.inputMode = 'decimal'; kgIn.placeholder = 'น้ำหนัก payload (kg)';
+  kgIn.value = savedLabel.kg || ''; kgIn.style.width = '11em';
+  const noteIn = document.createElement('input');
+  noteIn.id = 'bag-note'; noteIn.type = 'text'; noteIn.maxLength = 60;
+  noteIn.placeholder = 'หมายเหตุ (เส้นทาง/ของที่บรรทุก)';
+  noteIn.value = savedLabel.note || ''; noteIn.style.flex = '1';
+  // save while typing: the panel is re-rendered when the topic list changes
+  const saveLabel = () => {
+    try { localStorage.setItem('goal_picker_bag_label', JSON.stringify({kg: kgIn.value, note: noteIn.value})); } catch (e) {}
+  };
+  kgIn.oninput = saveLabel; noteIn.oninput = saveLabel;
+  labelRow.appendChild(kgIn);
+  labelRow.appendChild(noteIn);
+  bagPanel.appendChild(labelRow);
+
   const row2 = document.createElement('div');
   row2.className = 'row';
   const mk2 = (id, cls, text, fn) => {
@@ -1404,16 +1655,27 @@ function renderBagPanel() {
     if (missing.length) alert('ไม่พบ topic: ' + missing.join(', ') + '\nเปิด Navigation ก่อน');
   });
   mk2('bag-power', 'primary', 'บันทึก A มอเตอร์ + V/A แบต', () => {
+    // training label: payload weight is required for a power log
+    const kgText = document.getElementById('bag-kg').value.trim();
+    const kg = Number(kgText);
+    if (kgText === '' || !isFinite(kg) || kg < 0 || kg > 500) {
+      alert('ใส่น้ำหนัก payload (kg) 0-500 ก่อนบันทึก (ไม่มีของ = 0)');
+      document.getElementById('bag-kg').focus();
+      return;
+    }
+    const note = document.getElementById('bag-note').value.trim().slice(0, 60);
     const topics = POWER_TOPICS.filter(t => t in allTopics);
-    // /nav_event exists only in Navigation mode - optional, no warning
-    const missing = POWER_TOPICS.filter(t => !(t in allTopics) && t !== '/nav_event');
+    const missing = POWER_TOPICS.filter(t => !(t in allTopics) && !POWER_OPTIONAL.includes(t));
     if (!topics.some(t => t.startsWith('/motor_current') || t === '/battery/state')) {
       alert('ไม่พบ /motor_current หรือ /battery/state - hook_bridge (Mega) ทำงานอยู่ไหม?');
       return;
     }
     if (missing.length && !confirm('ไม่พบ topic: ' + missing.join(', ') + '\nบันทึกเท่าที่มี?')) return;
+    if (!confirm('บันทึก power log\nน้ำหนัก payload = ' + kg + ' kg' + (note ? '\nหมายเหตุ: ' + note : '') +
+        '\nถูกต้อง?')) return;
+    try { localStorage.setItem('goal_picker_bag_label', JSON.stringify({kg: kgText, note: note})); } catch (e) {}
     bagSelected = new Set(topics); saveBagSelection(); renderBagPanel();
-    transport.bagCmd({action: 'start', topics: topics});
+    transport.bagCmd({action: 'start', topics: topics, label: {payload_kg: kg, note: note}});
   });
   mk2('bag-stopdist', 'primary', 'วิเคราะห์ระยะหยุด', () => transport.bagCmd({action: 'stop_dist'}));
   bagPanel.appendChild(row2);
@@ -1582,9 +1844,16 @@ function setMode(next) {
   mode = next;
   goalDraft = null;
   pathDraft = null;
+  zoneResetDrafts();
   hideConfirm();
-  for (const id of ['mode-view', 'mode-goal', 'mode-path', 'mode-initpose']) {
+  for (const id of ['mode-view', 'mode-goal', 'mode-path', 'mode-initpose', 'mode-zone']) {
     document.getElementById(id).classList.toggle('active', id === 'mode-' + next);
+  }
+  zonePanel.hidden = next !== 'zone';
+  document.body.classList.toggle('zone-mode', next === 'zone');
+  if (next === 'zone') {
+    renderZonePanel();
+    stationPanel.hidden = true; doorPanel.hidden = true; bagPanel.hidden = true; logPanel.hidden = true;
   }
   redraw();
 }
@@ -1592,6 +1861,10 @@ document.getElementById('mode-view').addEventListener('click', () => setMode('vi
 document.getElementById('mode-goal').addEventListener('click', () => setMode('goal'));
 document.getElementById('mode-path').addEventListener('click', () => setMode('path'));
 document.getElementById('mode-initpose').addEventListener('click', () => setMode('initpose'));
+document.getElementById('mode-zone').addEventListener('click', () => {
+  if (!zonesFresh()) { setStatus('แก้โซนได้เมื่อเปิดโหมด Navigation อยู่เท่านั้น'); return; }
+  setMode(mode === 'zone' ? 'view' : 'zone');
+});
 
 document.getElementById('btn-cancel-nav').addEventListener('click', () => {
   if (!authenticated) return;
@@ -1612,6 +1885,8 @@ function showConfirm(text, warnText, onSend) {
 btnDiscard.addEventListener('click', () => {
   goalDraft = null;
   pathDraft = null;
+  zoneDraft = null;
+  zoneStroke = null;   // polygon corners stay, to adjust and send again
   hideConfirm();
   redraw();
 });
@@ -1630,11 +1905,14 @@ canvas.addEventListener('pointerdown', (e) => {
       const w = screenToWorld(e.clientX, e.clientY);
       pathDraft = {points: [w]};
       hideConfirm();
+    } else if (mode === 'zone' && mapInfo) {
+      zonePointerDown(e);
     }
   } else if (activePointers.size === 2) {
     panState.active = false;
     goalDraft = null;
     pathDraft = null;
+    if (mode === 'zone') zoneCancelGesture();
   }
   redraw();
 });
@@ -1655,6 +1933,8 @@ canvas.addEventListener('pointermove', (e) => {
       const w = screenToWorld(e.clientX, e.clientY);
       goalDraft.tx = w.x;
       goalDraft.ty = w.y;
+    } else if (mode === 'zone') {
+      zonePointerMove(e);
     } else if (mode === 'path' && pathDraft) {
       const w = screenToWorld(e.clientX, e.clientY);
       const last = pathDraft.points[pathDraft.points.length - 1];
@@ -1672,6 +1952,7 @@ function endPointer(e) {
     panState.active = false;
     if ((mode === 'goal' || mode === 'initpose') && goalDraft) finalizeGoalDraft();
     else if (mode === 'path' && pathDraft) finalizePathDraft();
+    else if (mode === 'zone') zonePointerUp(e);
   } else if (activePointers.size === 1) {
     const remaining = [...activePointers.values()][0];
     panState = {active: mode === 'view', lastX: remaining.x, lastY: remaining.y};

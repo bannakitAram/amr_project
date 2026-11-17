@@ -207,6 +207,8 @@ class ROSBoardNode(object):
         self.mapping_cmd_pub = rospy.Publisher("/rosboard_mapping_cmd", String, queue_size=5)
         # door edits from goal_picker -> amr_bringup door_manager_node.py
         self.door_cmd_pub = rospy.Publisher("/rosboard_door_cmd", String, queue_size=5)
+        # map zone edits from goal_picker -> amr_navigation zone_manager_node.py
+        self.zone_cmd_pub = rospy.Publisher("/rosboard_zone_cmd", String, queue_size=5)
         # route_* = fixed route / planner switch for station goals, same consumer
         self.MAPPING_ACTIONS = ("start", "pause", "save", "finish", "station", "route_fixed", "route_planner")
 
@@ -222,6 +224,11 @@ class ROSBoardNode(object):
         self.bag_topics = []
         self.bag_started = 0.0
         self.bag_error = ""
+        # Training label for the current bag (payload weight prediction):
+        # {"payload_kg": float, "note": str} or None. Written at stop to
+        # <bag>/label.json and appended to <bag_dir>/labels.csv.
+        self.BAG_PAYLOAD_MAX_KG = 500.0
+        self.bag_label = None
         # stop-distance analysis of the last bag (amr_bringup's
         # stop_distance_from_bag.py), run on request from the bag panel
         self.stop_proc_busy = False
@@ -347,14 +354,88 @@ class ROSBoardNode(object):
             cmd["relay"] = relay
         self.door_cmd_pub.publish(String(data=json.dumps(cmd, ensure_ascii=False)))
 
-    def on_bag_cmd(self, action, topics):
+    def on_zone_cmd(self, cmd):
+        """Forward a validated zone edit (polygon or brush stroke, map frame,
+        m) as JSON on /rosboard_zone_cmd; zone_manager_node.py checks it again."""
+        action, kind, shape = cmd.get("action"), cmd.get("kind"), cmd.get("shape")
+        if action not in ("add", "erase") or shape not in ("poly", "brush"):
+            print("error: zone: bad action/shape %r %r" % (action, shape))
+            return
+        if action == "add" and kind not in ("keepout", 30, 50):
+            print("error: zone: bad kind %r" % (kind,))
+            return
+        try:
+            pts = [[float(p[0]), float(p[1])] for p in cmd.get("points", [])][:400]
+            width = float(cmd.get("width", 0.5))
+        except (TypeError, ValueError, IndexError):
+            return
+        if not pts or not all(math.isfinite(v) and abs(v) < 1e4 for p in pts for v in p) \
+                or not math.isfinite(width):
+            return
+        out = {"action": action, "shape": shape, "points": pts, "width": width}
+        if action == "add":
+            out["kind"] = kind
+        self.zone_cmd_pub.publish(String(data=json.dumps(out)))
+
+    def _parse_bag_label(self, label):
+        """Validate the optional training label from the browser. Returns
+        (label_or_None, error_str)."""
+        if label is None:
+            return None, ""
+        if type(label) is not dict:
+            return None, "bad label"
+        try:
+            kg = float(label.get("payload_kg"))
+        except (TypeError, ValueError):
+            return None, "payload_kg is not a number"
+        if not math.isfinite(kg) or kg < 0 or kg > self.BAG_PAYLOAD_MAX_KG:
+            return None, "payload_kg out of range 0-%g" % self.BAG_PAYLOAD_MAX_KG
+        note = re.sub(r"[\x00-\x1f\x7f\"'\\<>;{}\[\],]", "", str(label.get("note") or "")).strip()[:60]
+        return {"payload_kg": round(kg, 2), "note": note}, ""
+
+    def _write_bag_label(self):
+        """caller holds bag_lock, recorder already stopped. Sidecar files
+        for training: <bag>/label.json and one row in <bag_dir>/labels.csv."""
+        if not self.bag_label or not self.bag_name:
+            return
+        ended = time.time()
+        rec = dict(self.bag_label)
+        rec.update({
+            "bag": self.bag_name,
+            "start": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.bag_started)),
+            "duration_s": round(ended - self.bag_started, 1),
+            "topics": self.bag_topics,
+        })
+        path = os.path.join(self.bag_dir, self.bag_name)
+        try:
+            if os.path.isdir(path):
+                with open(os.path.join(path, "label.json"), "w") as f:
+                    json.dump(rec, f, ensure_ascii=False, indent=2)
+            csv_path = os.path.join(self.bag_dir, "labels.csv")
+            new = not os.path.exists(csv_path)
+            with open(csv_path, "a") as f:
+                if new:
+                    f.write("bag,payload_kg,note,start,duration_s\n")
+                f.write("%s,%g,%s,%s,%.1f\n" % (rec["bag"], rec["payload_kg"], rec["note"],
+                                                rec["start"], rec["duration_s"]))
+            rospy.loginfo("bag label: %s payload %g kg" % (self.bag_name, rec["payload_kg"]))
+        except OSError as e:
+            self.bag_error = "label not saved: %s" % e
+        self.bag_label = None
+
+    def on_bag_cmd(self, action, topics, label=None):
         """Start/stop `ros2 bag record` for the goal_picker page. Only
-        currently-advertised topic names are accepted."""
+        currently-advertised topic names are accepted. `label` (optional,
+        power log) = {"payload_kg", "note"} for payload-weight training."""
         with self.bag_lock:
             if action == "start":
                 if self.bag_proc is not None:
                     return
                 if type(topics) is not list:
+                    return
+                label, err = self._parse_bag_label(label)
+                if err:
+                    self.bag_error = err  # bag_state_loop sends it within 1 s
                     return
                 known = getattr(self, "all_topics", {})
                 topics = sorted(set(t for t in topics if type(t) is str and t in known
@@ -364,6 +445,9 @@ class ROSBoardNode(object):
                     return
                 os.makedirs(self.bag_dir, exist_ok=True)
                 self.bag_name = "bag_" + time.strftime("%Y%m%d_%H%M%S")
+                if label:
+                    # weight in the name too, so the label survives a lost sidecar
+                    self.bag_name += "_%skg" % ("%g" % label["payload_kg"]).replace(".", "p")
                 try:
                     self.bag_proc = subprocess.Popen(
                         ["ros2", "bag", "record", "-o", os.path.join(self.bag_dir, self.bag_name)] + topics,
@@ -375,6 +459,7 @@ class ROSBoardNode(object):
                 self.bag_topics = topics
                 self.bag_started = time.time()
                 self.bag_error = ""
+                self.bag_label = label
                 rospy.loginfo("bag record start: %s %s" % (self.bag_name, " ".join(topics)))
             elif action == "stop":
                 self._bag_stop()
@@ -418,6 +503,7 @@ class ROSBoardNode(object):
                 pass
         rospy.loginfo("bag record stop: %s" % self.bag_name)
         self.bag_proc = None
+        self._write_bag_label()
 
     def publish_bag_state(self):
         rec = self.bag_proc is not None
@@ -429,6 +515,7 @@ class ROSBoardNode(object):
             "max_s": self.BAG_MAX_DURATION_S,
             "dir": self.bag_dir,
             "error": self.bag_error,
+            "payload_kg": self.bag_label["payload_kg"] if self.bag_label else None,
             "stop_busy": self.stop_proc_busy,
             "stop_result": self.stop_result,
             "stop_ok": self.stop_ok,
@@ -443,6 +530,7 @@ class ROSBoardNode(object):
                         if self.bag_proc.poll() is not None:
                             self.bag_error = "recorder exited (code %s)" % self.bag_proc.returncode
                             self.bag_proc = None
+                            self._write_bag_label()
                         elif time.time() - self.bag_started > self.BAG_MAX_DURATION_S:
                             self.bag_error = "auto-stopped after %d min" % (self.BAG_MAX_DURATION_S / 60)
                             self._bag_stop()

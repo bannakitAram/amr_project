@@ -5,13 +5,11 @@ Requires a saved map (see amr_slam / nav2_map_server map_saver_cli) and
 assumes robot_state_publisher + EKF (odom) + lidar are already running,
 e.g. via `ros2 launch amr_bringup bringup.launch.py`.
 
-Map zones (Nav2 costmap filters), switched on per map when the files exist
-next to the map yaml (made with `map_edit.py zones-png / zones-build`):
-    <map>_keepout.yaml/.pgm  keep-out mask -> KeepoutFilter in both costmaps
-    <map>_speed.yaml/.pgm    speed % mask  -> SpeedFilter (global costmap),
-                             published on /zone_speed_limit and merged with
-                             the slip limit by slip_speed_limiter_node.py
-Without the files the stack runs exactly as before.
+Map zones (Nav2 costmap filters, always loaded): zone_manager_node.py serves
+the keep-out / speed % masks of the map (<map>_keepout.*, <map>_speed.* next
+to the map yaml; none = no zones) and applies edits from the goal_picker
+page live. SpeedFilter publishes /zone_speed_limit, merged with the slip
+limit by slip_speed_limiter_node.py.
 
 Usage:
     ros2 launch amr_navigation navigation.launch.py map:=/path/to/map.yaml
@@ -34,17 +32,14 @@ ZONE_SPEED_TOPIC = '/zone_speed_limit'
 
 
 def zone_filters(context):
-    """Add the keep-out / speed filters when the map has zone masks: writes a
-    copy of the params file with the filter layers added (params_file is
-    switched to it for every node below) and starts the mask servers."""
+    """Map zones: always load the keep-out / speed filters (a copy of the
+    params file with the filter layers added; params_file is switched to it
+    for every node below) and start zone_manager_node.py, which serves the
+    masks of this map (empty if it has none) and takes live edits from the
+    goal_picker page."""
     map_yaml = LaunchConfiguration('map').perform(context)
     params_path = LaunchConfiguration('params_file').perform(context)
     use_sim_time = LaunchConfiguration('use_sim_time').perform(context) == 'true'
-    stem = os.path.splitext(map_yaml)[0]
-    masks = {k: stem + '_%s.yaml' % k for k in ('keepout', 'speed')}
-    masks = {k: v for k, v in masks.items() if os.path.exists(v)}
-    if not masks:
-        return []
 
     with open(params_path) as f:
         params = yaml.safe_load(f)
@@ -53,11 +48,10 @@ def zone_filters(context):
         plugins = list(rp['plugins'])
         # before inflation, so the keep-out edge is inflated like a wall
         at = plugins.index('inflation_layer') if 'inflation_layer' in plugins else len(plugins)
-        if 'keepout' in masks:
-            plugins.insert(at, 'keepout_filter')
-            rp['keepout_filter'] = {'plugin': 'nav2_costmap_2d::KeepoutFilter',
-                                    'enabled': True, 'filter_info_topic': KEEPOUT_INFO}
-        if 'speed' in masks and cm == 'global_costmap':
+        plugins.insert(at, 'keepout_filter')
+        rp['keepout_filter'] = {'plugin': 'nav2_costmap_2d::KeepoutFilter',
+                                'enabled': True, 'filter_info_topic': KEEPOUT_INFO}
+        if cm == 'global_costmap':
             plugins.append('speed_filter')
             rp['speed_filter'] = {'plugin': 'nav2_costmap_2d::SpeedFilter',
                                   'enabled': True, 'filter_info_topic': SPEED_INFO,
@@ -68,38 +62,12 @@ def zone_filters(context):
     yaml.safe_dump(params, out, sort_keys=False)
     out.close()
 
-    actions = [SetLaunchConfiguration('params_file', out.name)]
-    names = []
-    for kind, ftype, info in (('keepout', 0, KEEPOUT_INFO), ('speed', 1, SPEED_INFO)):
-        if kind not in masks:
-            continue
-        mask_topic = '/%s_filter_mask' % kind
-        actions.append(Node(
-            package='nav2_map_server', executable='map_server',
-            name='%s_mask_server' % kind, output='screen',
-            parameters=[{'use_sim_time': use_sim_time, 'yaml_filename': masks[kind],
-                         'topic_name': mask_topic, 'frame_id': 'map'}]))
-        actions.append(Node(
-            package='nav2_map_server', executable='costmap_filter_info_server',
-            name='%s_filter_info_server' % kind, output='screen',
-            # type 0 = keep-out, 1 = speed limit in % (mask value = percent)
-            parameters=[{'use_sim_time': use_sim_time, 'type': ftype,
-                         'filter_info_topic': info, 'mask_topic': mask_topic,
-                         'base': 0.0, 'multiplier': 1.0}]))
-        names += ['%s_mask_server' % kind, '%s_filter_info_server' % kind]
-    # zones as JSON for the goal_picker page (display only)
-    actions.append(Node(
-        package='amr_navigation', executable='zone_info_node.py', name='zone_info',
-        output='screen',
-        parameters=[{'use_sim_time': use_sim_time,
-                     'keepout_yaml': masks.get('keepout', ''),
-                     'speed_yaml': masks.get('speed', '')}]))
-    actions.append(Node(
-        package='nav2_lifecycle_manager', executable='lifecycle_manager',
-        name='lifecycle_manager_zones', output='screen',
-        parameters=[{'use_sim_time': use_sim_time, 'autostart': True, 'node_names': names}]))
-    print('[navigation.launch] map zones: %s' % ', '.join(sorted(masks)))
-    return actions
+    return [
+        SetLaunchConfiguration('params_file', out.name),
+        Node(package='amr_navigation', executable='zone_manager_node.py',
+             name='zone_manager', output='screen',
+             parameters=[{'use_sim_time': use_sim_time, 'map_yaml': map_yaml}]),
+    ]
 
 
 def generate_launch_description():
