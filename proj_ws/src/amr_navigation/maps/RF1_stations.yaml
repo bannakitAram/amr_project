@@ -1,0 +1,9 @@
+stations:
+- name: Home
+  x: 0.0
+  y: 0.0
+  theta: -0.0
+- name: pos1
+  x: 0.955
+  y: -0.019
+  theta: -0.027
