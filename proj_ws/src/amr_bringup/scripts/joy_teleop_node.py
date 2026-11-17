@@ -2,6 +2,9 @@
 """USB gamepad -> /cmd_vel for Manual mode (hold-to-run).
 
 Hold LB and move the left stick: up/down = linear.x, left/right = angular.z.
+Steering is car-like when reversing: stick back + left = the robot backs
+towards its left (angular.z is flipped while the stick points backward), so
+left/right always mean the direction the robot's travel bends to.
 Normal max 0.30 m/s (= Nav2 max_velocity), 0.15 rad/s, 0.2 m/s^2. Drives
 like the rosboard phone joystick: straight to /cmd_vel, so collision_monitor is NOT
 in this path. The operator must keep the path in sight.
@@ -121,6 +124,9 @@ class JoyTeleop(Node):
 
         cmd = Twist()
         cmd.linear.x = self.out_linear
+        # car-like reverse: stick back + left backs the robot towards its left
+        if linear < 0.0:
+            angular = -angular
         cmd.angular.z = angular * self.max_angular * scale
         self.pub.publish(cmd)
 
