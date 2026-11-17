@@ -65,7 +65,9 @@
       scanBtn.toggleClass("scanning", !!state.scanning);
       scanBtn.prop("disabled", !mapping || busy);
       saveBtn.prop("disabled", !mapping || state.saving);
-      stationBtn.prop("disabled", !mapping || !state.ready || state.saving);
+      // no map -> robot TF until scanning has started once
+      stationBtn.prop("disabled", !mapping || !state.ready || state.saving || !state.localized);
+      stationBtn.attr("title", state.localized ? "" : "กดเริ่มสแกนก่อน");
       const n = (state.stations || []).length;
       stationBtn.html("＋<br>Station" + (n ? " (" + n + ")" : ""));
       finishBtn.prop("disabled", !mapping);

@@ -3180,7 +3180,10 @@ class AmrControlPanel(tk.Tk):
         return {'mode': self._mode or 'idle', 'ready': self._slam_ready,
                 'scanning': self._scanning, 'saving': self._map_saving,
                 'msg': self._mapping_msg,
-                'stations': [st['name'] for st in self._mapping_stations]}
+                'stations': [st['name'] for st in self._mapping_stations],
+                # SLAM publishes map -> odom only once scanning has started:
+                # the phone keeps '+ Station' disabled until then
+                'localized': self._mode == 'mapping' and self.ros.pose() is not None}
 
     def _refresh_mapping_ui(self):
         mapping = self._mode == 'mapping'
