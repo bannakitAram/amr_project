@@ -1,0 +1,13 @@
+[Unit]
+Description=AMR hook_bridge (Mega: battery/hook/relay) - always on
+After=network.target
+
+[Service]
+Type=simple
+User=nvidia
+ExecStart=/home/nvidia/AMR_Project/proj_ws/hook_bridge_start.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

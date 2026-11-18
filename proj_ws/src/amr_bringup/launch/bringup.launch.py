@@ -108,6 +108,7 @@ def generate_launch_description():
     use_hook = LaunchConfiguration('hook')
     use_joystick = LaunchConfiguration('joystick')
     hook_port = LaunchConfiguration('hook_port')
+    use_hook_bridge = LaunchConfiguration('hook_bridge')
     use_navigation = LaunchConfiguration('navigation')
     nav_map = LaunchConfiguration('map')
     slam_start_scanning = LaunchConfiguration('slam_start_scanning')
@@ -139,6 +140,11 @@ def generate_launch_description():
     declare_hook_port = DeclareLaunchArgument(
         'hook_port', default_value='/dev/ttyMega',
         description='Serial port of the hook Mega. /dev/ttyMega = any CH340 (VID:PID only, keep one CH340 on the robot); /dev/hook = pinned to a USB port (udev/99-amr-hook.rules)')
+    declare_use_hook_bridge = DeclareLaunchArgument(
+        'hook_bridge', default_value='false',
+        description='Start hook_bridge here. Default false: it runs always-on as '
+                    'hook_bridge.service (battery shown without bringup); set true only '
+                    'if that service is stopped, else two nodes fight over the serial port')
     declare_use_joystick = DeclareLaunchArgument(
         'joystick', default_value='false',
         description='Launch joy_node + joy_teleop (USB gamepad -> /cmd_vel, hold LB to '
@@ -316,7 +322,8 @@ def generate_launch_description():
         name='hook_bridge',
         parameters=[{'port': hook_port}],
         output='screen',
-        condition=IfCondition(use_hook),
+        condition=IfCondition(PythonExpression(
+            ["'", use_hook, "' == 'true' and '", use_hook_bridge, "' == 'true'"])),
     )
     # 9b) Tower light pattern -> /light/cmd -> hook_bridge -> Mega (same
     #     board as the hook, so same on/off switch)
@@ -386,6 +393,7 @@ def generate_launch_description():
         declare_filter_operator_out,
         declare_use_hook,
         declare_hook_port,
+        declare_use_hook_bridge,
         declare_use_joystick,
         description_launch,
         micro_ros_agent_node,
