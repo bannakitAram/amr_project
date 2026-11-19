@@ -39,8 +39,9 @@ Topics:
                field 5 = remaining charge x0.001 Ah, field 12 = direction
                (1 = charging). current is always >= 0 (magnitude, easier to
                read in logs; not the ROS "negative = discharging" sign):
-               the direction is in power_supply_status. percentage = charge / `battery_capacity_ah`
-               (0..1). Layout from the Junctek KL110F protocol, voltage and
+               the direction is in power_supply_status. percentage =
+               (V - `battery_v_min`) / (`battery_v_max` - `battery_v_min`),
+               clamped 0..1 (default 24..27 V). Layout from the Junctek KL110F protocol, voltage and
                current checked on the robot; charge scale/direction still to
                be checked against the meter display. Our own ":R50" command
                echoed back is ignored.
@@ -140,6 +141,11 @@ class HookBridge(Node):
         # 2 x 12 V 33 Ah in series = 24 V 33 Ah
         self.battery_capacity_ah = float(
             self.declare_parameter('battery_capacity_ah', 33.0).value)
+        # percentage from pack voltage: 24 V = 0 %, 27 V = 100 %
+        self.battery_v_min = float(
+            self.declare_parameter('battery_v_min', 24.0).value)
+        self.battery_v_max = float(
+            self.declare_parameter('battery_v_max', 27.0).value)
         self.bat_pub = self.create_publisher(BatteryState, '/battery/state', 10)
         self.create_subscription(String, '/light/cmd', self.on_light, 10)
         self.light = None       # latest light code
@@ -298,8 +304,9 @@ class HookBridge(Node):
         msg.charge = charge
         msg.capacity = self.battery_capacity_ah
         msg.design_capacity = self.battery_capacity_ah
-        msg.percentage = (max(0.0, min(1.0, charge / self.battery_capacity_ah))
-                          if self.battery_capacity_ah > 0 else float('nan'))
+        v_span = self.battery_v_max - self.battery_v_min
+        msg.percentage = (max(0.0, min(1.0, (voltage - self.battery_v_min) / v_span))
+                          if v_span > 0 else float('nan'))
         msg.power_supply_status = (BatteryState.POWER_SUPPLY_STATUS_CHARGING if charging
                                    else BatteryState.POWER_SUPPLY_STATUS_DISCHARGING)
         msg.power_supply_health = BatteryState.POWER_SUPPLY_HEALTH_UNKNOWN
