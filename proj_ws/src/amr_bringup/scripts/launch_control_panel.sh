@@ -5,4 +5,9 @@ export ROS_LOCALHOST_ONLY=1
 export ROS_DOMAIN_ID=0
 source /opt/ros/humble/setup.bash
 source /home/nvidia/AMR_Project/proj_ws/install/setup.bash
-exec ros2 run amr_bringup amr_control_panel.py
+# keep stderr: the .desktop launch otherwise loses tracebacks / Tk errors
+LOG=$HOME/.ros/log/amr_control_panel.log
+[ -f "$LOG" ] && [ $(stat -c %s "$LOG") -gt 5000000 ] && mv "$LOG" "$LOG.1"
+echo "=== start $(date -Is) ===" >> "$LOG"
+export PYTHONFAULTHANDLER=1
+exec ros2 run amr_bringup amr_control_panel.py >> "$LOG" 2>&1

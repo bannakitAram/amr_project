@@ -3942,12 +3942,28 @@ class AmrControlPanel(tk.Tk):
                 ok = result.returncode == 0 and os.path.exists(map_path + '.yaml')
             except subprocess.TimeoutExpired:
                 ok = False
-            self.after(0, lambda: self._after_save(ok, name, from_phone))
+            # Also serialize slam_toolbox's pose graph (<name>.posegraph/.data)
+            # so this map can be extended later (map_file_name / deserialize_map);
+            # the .pgm alone cannot be resumed.
+            pg_ok = False
+            if ok:
+                try:
+                    subprocess.run(
+                        ['ros2', 'service', 'call', '/slam_toolbox/serialize_map',
+                         'slam_toolbox/srv/SerializePoseGraph',
+                         "{filename: '%s'}" % map_path],
+                        capture_output=True, text=True, timeout=30)
+                    pg_ok = os.path.exists(map_path + '.posegraph')
+                except subprocess.TimeoutExpired:
+                    pg_ok = False
+            self.after(0, lambda: self._after_save(ok, name, from_phone, pg_ok))
         threading.Thread(target=do_save, daemon=True).start()
 
-    def _after_save(self, ok, name, from_phone=False):
+    def _after_save(self, ok, name, from_phone=False, pg_ok=False):
         self._map_saving = False
         self._mapping_msg = (f'บันทึกแล้ว: {name}' if ok else 'บันทึกแผนที่ไม่สำเร็จ')
+        if ok and not pg_ok:
+            self._mapping_msg += ' (posegraph ไม่สำเร็จ - ต่อแผนที่ภายหลังไม่ได้)'
         if ok and self._mapping_stations:
             # new map name (save refuses existing names), so no file to merge
             try:
