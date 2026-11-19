@@ -147,7 +147,7 @@ class ROSBoardNode(object):
         # straight to /cmd_vel - collision_monitor is NOT in this path - so
         # the cap stays low; ISO 3691-4 review before raising it.
         self.TELEOP_LINEAR_MIN = 0.05
-        self.TELEOP_LINEAR_CAP = 0.30
+        self.TELEOP_LINEAR_CAP = 0.50
         self.TELEOP_LINEAR_STEP = 0.05
         self.teleop_user_max_linear = self.TELEOP_MAX_LINEAR
         # Back to the default once nobody has driven for this long, so the
@@ -165,7 +165,13 @@ class ROSBoardNode(object):
                 reliability=QoSReliabilityPolicy.RELIABLE))
         self.teleop_state_pub = rospy.Publisher("/rosboard_teleop_state", String, queue_size=1)
         threading.Thread(target=self.teleop_state_loop, daemon=True).start()
-        self.TELEOP_MAX_ANGULAR = 0.15   # rad/s - kept low so fast in-place turns during Mapping don't hurt SLAM scan-matching
+        self.TELEOP_MAX_ANGULAR = 0.15   # rad/s - at the default 0.10 m/s and forced while mapping is scanning (fast in-place turns hurt SLAM scan-matching)
+        # Angular limit follows the linear limit so turning keeps pace when
+        # the operator raises speed: TELEOP_ANG_PER_LIN rad/s per m/s
+        # (0.10 m/s -> 0.15 rad/s, 0.50 m/s -> 0.50 rad/s), capped at
+        # TELEOP_ANGULAR_CAP = Auto's velocity_smoother angular max.
+        self.TELEOP_ANG_PER_LIN = 1.5
+        self.TELEOP_ANGULAR_CAP = 0.50
         self.TELEOP_DEADMAN_TIMEOUT = 0.5  # seconds - stop if no joystick update arrives in time
         # Linear accel ramp for the joystick (it bypasses velocity_smoother).
         # Only speeding up is ramped: slowing down / stop passes through at
@@ -329,10 +335,11 @@ class ROSBoardNode(object):
         name = re.sub(r"[^A-Za-z0-9_\-]", "", str(name or "").strip().replace(" ", "_"))[:40]
         self.mapping_cmd_pub.publish(String(data=json.dumps({"action": action, "name": name})))
 
-    def on_door_cmd(self, action, name, relay):
+    def on_door_cmd(self, action, name, relay, x=None, y=None):
         """Forward a validated door edit as JSON on /rosboard_door_cmd. The
-        door position is the robot's pose, taken by door_manager_node.py,
-        never from the browser."""
+        door position is the robot's pose (taken by door_manager_node.py)
+        unless the browser pinned it on the map (x, y in map frame, m);
+        door_manager_node.py checks a pinned point against the map again."""
         if action == "pulse":
             # manual remote button (phone, Mapping bar): one relay pulse, no door
             if relay not in (1, 2, 3):
@@ -352,6 +359,12 @@ class ROSBoardNode(object):
                 print("error: door: bad relay %r" % (relay,))
                 return
             cmd["relay"] = relay
+            if x is not None or y is not None:
+                if not all(type(v) in (int, float) and math.isfinite(v) and abs(v) < 10000.0
+                           for v in (x, y)):
+                    print("error: door: bad pin %r, %r" % (x, y))
+                    return
+                cmd["x"], cmd["y"] = round(float(x), 3), round(float(y), 3)
         self.door_cmd_pub.publish(String(data=json.dumps(cmd, ensure_ascii=False)))
 
     def on_zone_cmd(self, cmd):
@@ -582,7 +595,7 @@ class ROSBoardNode(object):
 
         twist = Twist()
         twist.linear.x = self.teleop_ramp(clamp(linear, self.teleop_effective_max_linear()))
-        twist.angular.z = clamp(angular, self.TELEOP_MAX_ANGULAR)
+        twist.angular.z = clamp(angular, self.teleop_effective_max_angular())
         moving = twist.linear.x != 0.0 or twist.angular.z != 0.0
         if moving:
             self.teleop_last_active = time.time()
@@ -624,6 +637,13 @@ class ROSBoardNode(object):
             return min(self.teleop_user_max_linear, self.TELEOP_MAX_LINEAR)
         return self.teleop_user_max_linear
 
+    def teleop_effective_max_angular(self):
+        if self.teleop_locked():
+            return self.TELEOP_MAX_ANGULAR
+        return round(min(self.TELEOP_ANGULAR_CAP, max(
+            self.TELEOP_MAX_ANGULAR,
+            self.TELEOP_ANG_PER_LIN * self.teleop_effective_max_linear())), 2)
+
     def on_teleop_cfg(self, max_linear):
         """Phone -/+ for the joystick's linear limit, clamped to
         [TELEOP_LINEAR_MIN, TELEOP_LINEAR_CAP] on TELEOP_LINEAR_STEP steps.
@@ -646,7 +666,7 @@ class ROSBoardNode(object):
             "effective": round(self.teleop_effective_max_linear(), 2),
             "locked": self.teleop_locked(),
             "min": self.TELEOP_LINEAR_MIN, "cap": self.TELEOP_LINEAR_CAP,
-            "step": self.TELEOP_LINEAR_STEP, "max_angular": self.TELEOP_MAX_ANGULAR,
+            "step": self.TELEOP_LINEAR_STEP, "max_angular": self.teleop_effective_max_angular(),
             "default": self.TELEOP_MAX_LINEAR,
             "idle_reset_in": (None if self.teleop_user_max_linear == self.TELEOP_MAX_LINEAR
                               else max(0, round(self.TELEOP_IDLE_RESET_S

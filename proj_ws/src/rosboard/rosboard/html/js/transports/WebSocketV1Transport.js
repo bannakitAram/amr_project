@@ -102,9 +102,11 @@ class WebSocketV1Transport {
       this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_MAPPING, {action: action, name: name || ""}]));
     }
 
-    doorCmd({action, name, relay}) {
+    doorCmd({action, name, relay, x, y}) {
       if (!this.isConnected()) return;
-      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_DOOR, {action: action, name: name || "", relay: relay}]));
+      const cmd = {action: action, name: name || "", relay: relay};
+      if (x !== undefined && y !== undefined) { cmd.x = x; cmd.y = y; }   // pinned on the map
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_DOOR, cmd]));
     }
 
     zoneCmd({action, kind, shape, points, width}) {

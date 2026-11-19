@@ -17,6 +17,7 @@ const JOYSTICK_SEND_INTERVAL_MS = 100; // well under the backend's 500ms deadman
   // forced 0.10 while mapping is scanning). The knob scales to it so full
   // deflection = the current limit; the server clamps again regardless.
   let maxLinear = JOYSTICK_MAX_LINEAR;
+  let maxAngular = JOYSTICK_MAX_ANGULAR; // server's limit, follows maxLinear
   let teleopState = null;
   let panelOpen = false;
   let dragging = false;
@@ -27,7 +28,7 @@ const JOYSTICK_SEND_INTERVAL_MS = 100; // well under the backend's 500ms deadman
     if (!currentTransport || !currentTransport.isConnected()) return;
     currentTransport.teleop({
       linear: -knobY * maxLinear,
-      angular: -knobX * JOYSTICK_MAX_ANGULAR,
+      angular: -knobX * maxAngular,
     });
   }
 
@@ -123,6 +124,7 @@ const JOYSTICK_SEND_INTERVAL_MS = 100; // well under the backend's 500ms deadman
     function onTeleopState(msg) {
       try { teleopState = JSON.parse(msg.data); } catch (e) { return; }
       maxLinear = teleopState.effective;
+      if (Number.isFinite(teleopState.max_angular)) maxAngular = teleopState.max_angular;
       renderSpeed();
     }
     const origOnAuthenticated = onAuthenticated;

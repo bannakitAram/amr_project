@@ -284,13 +284,13 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
             self.node.on_bag_cmd(argv[1].get("action"), argv[1].get("topics", []),
                                  argv[1].get("label"))
 
-        # client sent a door edit (goal_picker: set door at robot pose / delete)
+        # client sent a door edit (goal_picker: set door at robot pose or pinned x/y / delete)
         elif argv[0] == ROSBoardSocketHandler.MSG_DOOR:
             if len(argv) != 2 or type(argv[1]) is not dict:
                 print("error: door: bad: %s" % message)
                 return
             self.node.on_door_cmd(argv[1].get("action"), argv[1].get("name", ""),
-                                  argv[1].get("relay"))
+                                  argv[1].get("relay"), argv[1].get("x"), argv[1].get("y"))
 
         # client sent a map zone edit (goal_picker: rectangle add / erase)
         elif argv[0] == ROSBoardSocketHandler.MSG_ZONE:

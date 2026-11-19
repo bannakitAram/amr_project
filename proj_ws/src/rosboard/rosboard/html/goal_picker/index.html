@@ -850,6 +850,7 @@ function redraw() {
   if ((mode === 'goal' || mode === 'initpose') && goalDraft) drawGoalDraft(goalDraft, mode === 'initpose');
   if (mode === 'path' && pathDraft) drawPathDraft(pathDraft.points);
   if (mode === 'zone') drawZoneEdit();
+  if (mode === 'door') drawDoorDraft();
 }
 
 // RViz-style ground-plane grid: an unbounded 1m grid (5m major lines),
@@ -1393,12 +1394,15 @@ function zoneCancelGesture() { zoneTap = null; if (zoneDraft) zoneDraft = null; 
 
 // ---------- doors (amr_bringup door_manager_node.py, /amr_doors) ----------
 // {map, doors: [{name, x, y, radius, relay, pulse_s, wait_s}]} at 1 Hz. A door
-// is set at the robot's CURRENT pose (drive there first); the browser only
-// sends the name and relay. In Auto the robot pulses the door's relay when it
+// is set at the robot's CURRENT pose (drive there first), or pinned by
+// tapping the map (mode 'door': browser sends x/y, door_manager checks it
+// lies on /map). In Auto the robot pulses the door's relay when it
 // enters the circle and stands still for wait_s (nav_goal_executor_node.py).
 var doors = [];   // var: redraw() may run before this line
 var doorsMap = '';
 var doorsAt = 0;
+var doorPinReq = null;   // {name, relay} while mode === 'door'
+var doorDraft = null;    // {x, y} pin being placed
 const doorPanel = document.getElementById('door-panel');
 
 function handleDoors(msg) {
@@ -1434,13 +1438,49 @@ function drawDoors() {
   }
 }
 
+function drawDoorDraft() {
+  if (!doorDraft || !doorPinReq) return;
+  const p = worldToScreen(doorDraft.x, doorDraft.y);
+  const e = worldToScreen(doorDraft.x + (doors[0] ? doors[0].radius : 1.0), doorDraft.y);
+  const r = Math.max(4, Math.hypot(e.x - p.x, e.y - p.y));
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = 'rgba(255,152,0,0.30)'; ctx.strokeStyle = '#ffeb3b'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
+  // pin: tip at the exact point
+  ctx.fillStyle = '#ff9800'; ctx.strokeStyle = 'black'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - 8, p.y - 18); ctx.arc(p.x, p.y - 22, 9, Math.PI * 0.8, Math.PI * 0.2);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center';
+  ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+  const label = '🚪 ' + doorPinReq.name + ' (R' + doorPinReq.relay + ')';
+  ctx.strokeText(label, p.x, p.y - 36); ctx.fillStyle = 'white'; ctx.fillText(label, p.x, p.y - 36);
+  ctx.restore();
+}
+
+function doorPinUp() {
+  if (!doorDraft || !doorPinReq) return;
+  const d = doorDraft, req = doorPinReq;
+  const s = worldToScreen(d.x, d.y);
+  const cls = classifyScreenPoint(s.x, s.y);
+  const warn = cls === 'unmapped' ? 'จุดนี้อยู่นอกพื้นที่ที่สำรวจไว้' : null;
+  const exists = doors.some((o) => o.name === req.name);
+  showConfirm((exists ? 'ย้าย' : 'ปักหมุด') + 'ประตู "' + req.name + '" ที่ (' + d.x.toFixed(2) + ', ' +
+      d.y.toFixed(2) + ') ม. Relay ' + req.relay + '? (ลากเพื่อขยับ)', warn, () => {
+    transport.doorCmd({action: 'add', name: req.name, relay: req.relay, x: d.x, y: d.y});
+    setStatus('ส่งตำแหน่งประตู "' + req.name + '" แล้ว');
+    setMode('view');
+    renderDoorPanel(); doorPanel.hidden = false;
+  });
+}
+
 function renderDoorPanel() {
   doorPanel.innerHTML = '';
   const fresh = Date.now() - doorsAt < 5000 && doorsMap;
   const title = document.createElement('div');
   title.className = 'title';
   title.textContent = !fresh ? 'ไม่มีข้อมูลประตู (เปิดโหมด Navigation ที่ AMR control panel)'
-    : 'ประตูในแผนที่ ' + doorsMap + ' - ขับหุ่นไปจอดกลางช่องประตูก่อน แล้วกดตั้ง';
+    : 'ประตูในแผนที่ ' + doorsMap + ' - ปักหมุดบนแผนที่ หรือขับหุ่นไปจอดกลางช่องประตูแล้วกดตั้ง';
   doorPanel.appendChild(title);
   if (!fresh) return;
 
@@ -1458,8 +1498,21 @@ function renderDoorPanel() {
   const add = document.createElement('button');
   add.className = 'btn primary';
   add.textContent = 'ตั้งประตูที่ตำแหน่งหุ่นตอนนี้';
+  const cleanName = () => name.value.trim().replace(/[^\p{L}\p{M}\p{N}_\- ]/gu, '');
+  const pin = document.createElement('button');
+  pin.className = 'btn primary';
+  pin.textContent = '📍 ปักหมุดบนแผนที่';
+  pin.onclick = () => {
+    const n = cleanName();
+    if (!n) { alert('ใส่ชื่อประตูก่อน'); return; }
+    if (!mapInfo) { alert('ยังไม่มีแผนที่'); return; }
+    setMode('door');
+    doorPinReq = {name: n, relay: parseInt(relay.value, 10)};
+    doorPanel.hidden = true;
+    setStatus('แตะกลางช่องประตู "' + n + '" บนแผนที่ (ลากเพื่อขยับ, กด ดู/View เพื่อยกเลิก)');
+  };
   add.onclick = () => {
-    const n = name.value.trim().replace(/[^\p{L}\p{M}\p{N}_\- ]/gu, '');
+    const n = cleanName();
     if (!n) { alert('ใส่ชื่อประตูก่อน'); return; }
     const pose = tfLookup('map', 'base_footprint');
     if (!pose) { alert('ยังไม่รู้ตำแหน่งหุ่น (ไม่มี TF map -> base_footprint)'); return; }
@@ -1468,7 +1521,7 @@ function renderDoorPanel() {
         pose.x.toFixed(2) + ', ' + pose.y.toFixed(2) + ') ม. ใช้ Relay ' + relay.value + '?')) return;
     transport.doorCmd({action: 'add', name: n, relay: parseInt(relay.value, 10)});
   };
-  row.appendChild(name); row.appendChild(relay); row.appendChild(add);
+  row.appendChild(name); row.appendChild(relay); row.appendChild(pin); row.appendChild(add);
   doorPanel.appendChild(row);
 
   if (!doors.length) {
@@ -1845,6 +1898,8 @@ function setMode(next) {
   goalDraft = null;
   pathDraft = null;
   zoneResetDrafts();
+  doorDraft = null;
+  if (next !== 'door') doorPinReq = null;
   hideConfirm();
   for (const id of ['mode-view', 'mode-goal', 'mode-path', 'mode-initpose', 'mode-zone']) {
     document.getElementById(id).classList.toggle('active', id === 'mode-' + next);
@@ -1887,6 +1942,7 @@ btnDiscard.addEventListener('click', () => {
   pathDraft = null;
   zoneDraft = null;
   zoneStroke = null;   // polygon corners stay, to adjust and send again
+  doorDraft = null;    // door pin mode stays: tap again
   hideConfirm();
   redraw();
 });
@@ -1907,11 +1963,15 @@ canvas.addEventListener('pointerdown', (e) => {
       hideConfirm();
     } else if (mode === 'zone' && mapInfo) {
       zonePointerDown(e);
+    } else if (mode === 'door' && mapInfo && doorPinReq) {
+      doorDraft = screenToWorld(e.clientX, e.clientY);
+      hideConfirm();
     }
   } else if (activePointers.size === 2) {
     panState.active = false;
     goalDraft = null;
     pathDraft = null;
+    doorDraft = null;   // pinch = zoom, not a pin
     if (mode === 'zone') zoneCancelGesture();
   }
   redraw();
@@ -1935,6 +1995,8 @@ canvas.addEventListener('pointermove', (e) => {
       goalDraft.ty = w.y;
     } else if (mode === 'zone') {
       zonePointerMove(e);
+    } else if (mode === 'door' && doorDraft) {
+      doorDraft = screenToWorld(e.clientX, e.clientY);
     } else if (mode === 'path' && pathDraft) {
       const w = screenToWorld(e.clientX, e.clientY);
       const last = pathDraft.points[pathDraft.points.length - 1];
@@ -1953,6 +2015,7 @@ function endPointer(e) {
     if ((mode === 'goal' || mode === 'initpose') && goalDraft) finalizeGoalDraft();
     else if (mode === 'path' && pathDraft) finalizePathDraft();
     else if (mode === 'zone') zonePointerUp(e);
+    else if (mode === 'door') doorPinUp();
   } else if (activePointers.size === 1) {
     const remaining = [...activePointers.values()][0];
     panState = {active: mode === 'view', lastX: remaining.x, lastY: remaining.y};
