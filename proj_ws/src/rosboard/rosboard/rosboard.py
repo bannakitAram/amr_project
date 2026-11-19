@@ -355,7 +355,8 @@ class ROSBoardNode(object):
             return
         cmd = {"action": action, "name": name}
         if action == "add":
-            if relay not in (1, 2, 3):
+            # 0 = sensor door: no relay, short-stop zone (door_manager_node.py)
+            if relay not in (0, 1, 2, 3):
                 print("error: door: bad relay %r" % (relay,))
                 return
             cmd["relay"] = relay

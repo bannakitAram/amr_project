@@ -20,6 +20,11 @@ the lower of the zone % and the slip % (0 = no limit). Two publishers on
 /speed_limit would overwrite each other (leaving a zone could clear the slip
 limit and the other way round).
 
+Sensor doors: door_manager_node.py publishes /door_speed_limit (% , 0 =
+none) at 1 Hz near a sensor door, where collision_monitor runs the short
+FrontStopShort zone. It is merged the same way and has NO stale timeout on
+purpose: if door_manager dies inside the zone the robot stays slow.
+
 Monitoring/comfort only - NOT a safety function (ISO 3691-4): it depends
 on micro-ROS, the IMU and Nav2 all running. Protective stops must stay in
 hardware/firmware and collision_monitor.
@@ -42,7 +47,9 @@ class SlipSpeedLimiter(Node):
         self.pub = self.create_publisher(SpeedLimit, 'speed_limit', 10)
         self.create_subscription(Bool, '/wheel/slip_detected', self.on_slip, 10)
         self.create_subscription(SpeedLimit, '/zone_speed_limit', self.on_zone, 10)
+        self.create_subscription(SpeedLimit, '/door_speed_limit', self.on_door, 10)
         self.zone_percent = 0.0     # 0 = not in a speed zone
+        self.door_percent = 0.0     # 0 = not near a sensor door
         self.sent_percent = None
         self.create_timer(0.1, self.on_timer)
 
@@ -67,8 +74,16 @@ class SlipSpeedLimiter(Node):
         self.zone_percent = value
         self.send()
 
+    def on_door(self, msg):
+        value = float(msg.speed_limit) if msg.percentage else 0.0
+        value = 0.0 if value <= 0.0 or value >= 100.0 else value
+        if value != self.door_percent:
+            self.get_logger().info('sensor door: %s' % ('%.0f%%' % value if value else 'left'))
+            self.door_percent = value
+            self.send()
+
     def send(self):
-        limits = [v for v in (self.zone_percent,
+        limits = [v for v in (self.zone_percent, self.door_percent,
                               float(self.slip_percent) if self.limited else 0.0) if v > 0.0]
         msg = SpeedLimit()
         msg.header.stamp = self.get_clock().now().to_msg()

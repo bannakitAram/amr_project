@@ -447,7 +447,7 @@ collision_monitor:
     source_timeout: 1.0
     base_shift_correction: True
     stop_pub_timeout: 2.0
-    polygons: ["FrontStop", "FootprintApproach"]
+    polygons: ["FrontStop", "FrontStopShort", "FootprintApproach"]
     # Hard stop zone ahead of the bumper. Needed because the HP60C cannot see
     # closer than ~0.28 m from the lens (~0.27 m ahead of the footprint):
     # FootprintApproach alone only starts slowing at v*1.2 s = 0.24 m @0.2 m/s,
@@ -467,6 +467,21 @@ collision_monitor:
       visualize: True
       polygon_pub_topic: "polygon_front_stop"
       enabled: True
+    # Short stop zone for sensor doors (door must "see" the robot very close
+    # before it opens). Disabled here; door_manager_node.py swaps it in for
+    # FrontStop (enabled param, set at runtime) only inside a sensor door's
+    # radius, where the speed is limited to door_speed_percent (~0.05 m/s:
+    # braking ~0.3 cm + ~1 cm latency). LiDAR only in practice: the HP60C
+    # is blind closer than ~0.27 m, so low objects are NOT detected here.
+    FrontStopShort:
+      type: "polygon"
+      action_type: "stop"
+      # bumper (0.49) .. +0.10 m, same width as FrontStop
+      points: [0.59, 0.43, 0.59, -0.43, 0.49, -0.43, 0.49, 0.43]
+      max_points: 5
+      visualize: True
+      polygon_pub_topic: "polygon_front_stop_short"
+      enabled: False
     FootprintApproach:
       type: "polygon"
       action_type: "approach"

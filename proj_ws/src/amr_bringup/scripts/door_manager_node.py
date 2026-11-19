@@ -7,11 +7,24 @@ stations file; the map name and folder come from the control panel's
 
   doors:
     - {name: A, x: 3.20, y: -1.50, radius: 1.5, relay: 1, pulse_s: 0.5, wait_s: 5.0}
+    - {name: S, x: 8.00, y: 2.00, radius: 1.5, relay: 0, ...}   sensor door
+
+relay 0 = sensor door (opens by itself when the robot is very close): no
+relay pulse, no hold. Instead it is a SHORT-STOP zone:
+  - within radius + SLOW_MARGIN_M: /door_speed_limit = door_speed_percent
+    (merged into /speed_limit by slip_speed_limiter_node.py)
+  - within radius (after the robot is slow for SLOW_SETTLE_S):
+    collision_monitor FrontStop (0.35 m) is swapped for FrontStopShort
+    (0.10 m) via its runtime "enabled" parameters
+  - leaving (radius + hysteresis), map change, TF lost or node exit:
+    FrontStop back first, then the speed limit is removed
+  The wanted polygon state is re-sent every RESEND_S (survives a
+  collision_monitor restart, which reloads FrontStop from the yaml).
 
 In:
   /rosboard_door_cmd std_msgs/String JSON from rosboard (goal_picker), checked
                again here:
-                 {"action": "add", "name": "A", "relay": 1}  door at the
+                 {"action": "add", "name": "A", "relay": 1}  (relay 0-3) door at the
                      robot's current pose (TF map -> base_footprint)
                  {"action": "add", "name": "A", "relay": 1, "x": 3.2, "y": -1.5}
                      door pinned on the map (map frame, m); must lie
@@ -26,6 +39,9 @@ In:
 Out:
   /amr_doors   std_msgs/String JSON {map, doors: [...]} at 1 Hz
   /relay/cmd   std_msgs/String "<n> on" then "<n> off" after pulse_s
+  /door_speed_limit nav2_msgs/SpeedLimit %, 1 Hz (0 = none), sensor doors
+  /collision_monitor/set_parameters_atomically  FrontStop/FrontStopShort
+               .enabled, sensor doors
   /door_hold   std_msgs/String JSON {"hold": bool, "door": name, "left_s": s}
                at 10 Hz; hold = true for wait_s after a door was triggered.
                nav_goal_executor_node.py stops the running task while it is
@@ -40,7 +56,9 @@ wait is an obstacle for collision_monitor (the executor then waits for it).
 
 Convenience function only - NOT a safety function (ISO 3691-4). A door that
 does not open is an obstacle for collision_monitor; nothing here checks that
-the door actually opened.
+the door actually opened. The short-stop zone depends on localization: the
+area in front of a sensor door must be a marked restricted zone, and only
+the LiDAR sees obstacles within 0.27 m (HP60C blind zone).
 """
 import json
 import math
@@ -53,6 +71,9 @@ import rclpy.executors
 import tf2_ros
 import yaml
 from geometry_msgs.msg import Twist
+from nav2_msgs.msg import SpeedLimit
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import SetParametersAtomically
 from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
@@ -64,6 +85,10 @@ NAME_RE = re.compile(r'^[^\x00-\x1f\x7f"\'\\/<>:;{}\[\]]{1,24}$')
 MAX_DOORS = 30
 HYSTERESIS_M = 0.3
 AUTO_HOLD_S = 1.5        # /cmd_vel_nav non-zero within this = Auto driving
+SLOW_MARGIN_M = 0.5      # sensor door: slow down this far before the short zone
+SLOW_SETTLE_S = 1.0      # sensor door: slow this long before the short zone
+RESEND_S = 2.0           # re-send collision_monitor polygon state
+CM_SERVICE = '/collision_monitor/set_parameters_atomically'
 
 
 class DoorManager(Node):
@@ -73,6 +98,9 @@ class DoorManager(Node):
         self.default_pulse_s = float(self.declare_parameter('pulse_s', 0.5).value)
         self.default_wait_s = float(self.declare_parameter('wait_s', 5.0).value)
         self.robot_frame = self.declare_parameter('robot_frame', 'base_footprint').value
+        # 15 % of 0.30 m/s = 0.045 m/s
+        self.door_speed_percent = min(30.0, max(5.0, float(
+            self.declare_parameter('door_speed_percent', 15.0).value)))
 
         self.map_name = ''
         self.maps_dir = ''
@@ -83,12 +111,19 @@ class DoorManager(Node):
         self.hold_until = 0.0        # monotonic end of the current door wait
         self.hold_door = ''
         self.map_info = None         # /map MapMetaData, to check pinned doors
+        self.slow_since = None       # monotonic start of the sensor-door slow-down
+        self.short_on = False        # FrontStopShort wanted instead of FrontStop
+        self.short_sent_t = 0.0
+        self.short_inside = set()    # sensor doors whose short zone we are in
+        self.cm_warned = False
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.doors_pub = self.create_publisher(String, '/amr_doors', 10)
         self.relay_pub = self.create_publisher(String, '/relay/cmd', 10)
         self.hold_pub = self.create_publisher(String, '/door_hold', 10)
+        self.door_speed_pub = self.create_publisher(SpeedLimit, '/door_speed_limit', 10)
+        self.cm_client = self.create_client(SetParametersAtomically, CM_SERVICE)
         self.create_subscription(String, '/amr_stations', self.on_stations, 10)
         self.create_subscription(String, '/rosboard_door_cmd', self.on_cmd, 10)
         self.create_subscription(Twist, '/cmd_vel_nav', self.on_nav_cmd, 10)
@@ -97,6 +132,7 @@ class DoorManager(Node):
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_timer(0.1, self.tick)
         self.create_timer(1.0, self.publish_doors)
+        self.create_timer(1.0, self.publish_door_speed)
 
     # ---- storage --------------------------------------------------------
     def doors_path(self):
@@ -118,8 +154,9 @@ class DoorManager(Node):
             pass
         except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as e:
             self.get_logger().error('bad %s: %s' % (self.doors_path(), e))
-        self.doors = [d for d in self.doors if d['relay'] in (1, 2, 3)]
+        self.doors = [d for d in self.doors if d['relay'] in (0, 1, 2, 3)]
         self.inside.clear()
+        self.short_inside.clear()
         self.get_logger().info('map %s: %d door(s)' % (self.map_name, len(self.doors)))
 
     def save(self):
@@ -146,6 +183,7 @@ class DoorManager(Node):
             else:
                 self.doors = []
                 self.inside.clear()
+                self.short_inside.clear()
 
     def on_map(self, msg):
         self.map_info = msg.info
@@ -195,8 +233,8 @@ class DoorManager(Node):
             return
         if action == 'add':
             relay = c.get('relay')
-            if relay not in (1, 2, 3):
-                self.get_logger().warn('door cmd ignored: relay must be 1-3')
+            if relay not in (0, 1, 2, 3):
+                self.get_logger().warn('door cmd ignored: relay must be 0-3')
                 return
             pinned = 'x' in c or 'y' in c
             if pinned:
@@ -229,6 +267,7 @@ class DoorManager(Node):
         elif action == 'delete':
             self.doors = [d for d in self.doors if d['name'] != name]
             self.inside.discard(name)
+            self.short_inside.discard(name)
             self.get_logger().info('door %s deleted' % name)
         else:
             return
@@ -254,7 +293,70 @@ class DoorManager(Node):
     # ---- outputs --------------------------------------------------------
     def publish_doors(self):
         self.doors_pub.publish(String(data=json.dumps(
-            {'map': self.map_name, 'doors': self.doors}, ensure_ascii=False)))
+            {'map': self.map_name, 'doors': self.doors,
+             'short_stop': self.short_on}, ensure_ascii=False)))
+
+    # ---- sensor doors: short-stop zone ----------------------------------
+    def publish_door_speed(self):
+        msg = SpeedLimit()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.percentage = True
+        msg.speed_limit = self.door_speed_percent if self.slow_since is not None else 0.0
+        self.door_speed_pub.publish(msg)
+
+    def set_short(self, on, now, force=False):
+        """FrontStopShort instead of FrontStop (on) or back. Both in one
+        atomic call so there is never a moment with no front stop zone."""
+        if on == self.short_on and not force:
+            return
+        if on != self.short_on:
+            self.get_logger().warn('sensor door: stop distance %s'
+                                   % ('SHORT 0.10 m' if on else 'normal 0.35 m'))
+        self.short_on = on
+        self.short_sent_t = now
+        if not self.cm_client.service_is_ready():
+            if not self.cm_warned:
+                self.get_logger().warn('%s not available' % CM_SERVICE)
+                self.cm_warned = True
+            return
+        self.cm_warned = False
+        req = SetParametersAtomically.Request()
+        for name, value in (('FrontStop.enabled', not on), ('FrontStopShort.enabled', on)):
+            req.parameters.append(Parameter(name=name, value=ParameterValue(
+                type=ParameterType.PARAMETER_BOOL, bool_value=value)))
+        self.cm_client.call_async(req).add_done_callback(self.on_cm_result)
+
+    def on_cm_result(self, fut):
+        try:
+            res = fut.result().result
+        except Exception as e:  # noqa: BLE001 - service went away
+            self.get_logger().error('collision_monitor set failed: %s' % e)
+            return
+        if not res.successful:
+            self.get_logger().error('collision_monitor refused: %s' % res.reason)
+
+    def update_sensor_doors(self, xy, now):
+        """xy None (TF lost / no doors) = not in any zone."""
+        slow = short = False
+        if xy is not None:
+            for d in self.doors:
+                if d['relay'] != 0:
+                    continue
+                dist = math.hypot(xy[0] - d['x'], xy[1] - d['y'])
+                if dist <= d['radius'] + SLOW_MARGIN_M + (
+                        HYSTERESIS_M if self.slow_since is not None else 0.0):
+                    slow = True
+                if d['name'] in self.short_inside:
+                    if dist > d['radius'] + HYSTERESIS_M:
+                        self.short_inside.discard(d['name'])
+                elif dist <= d['radius']:
+                    self.short_inside.add(d['name'])
+                if d['name'] in self.short_inside:
+                    slow = short = True
+        if slow and self.slow_since is None:
+            self.slow_since = now
+            self.get_logger().info('sensor door: speed %.0f%%' % self.door_speed_percent)
+            self.publish_door_speed()
         # short zone only once the robot has had time to slow down
         short = short and self.slow_since is not None and now - self.slow_since >= SLOW_SETTLE_S
         self.set_short(short, now, force=now - self.short_sent_t >= RESEND_S)
@@ -272,9 +374,8 @@ class DoorManager(Node):
         self.hold_pub.publish(String(data=json.dumps(
             {'hold': left > 0, 'door': self.hold_door, 'left_s': round(max(0.0, left), 1)},
             ensure_ascii=False)))
-        if not self.doors:
-            return
-        xy = self.robot_xy()
+        xy = self.robot_xy() if self.doors else None
+        self.update_sensor_doors(xy, now)
         if xy is None:
             return
         auto = now - self.nav_moving_t < AUTO_HOLD_S
@@ -285,7 +386,7 @@ class DoorManager(Node):
                     self.inside.discard(d['name'])
             elif dist <= d['radius']:
                 self.inside.add(d['name'])
-                if auto:
+                if auto and d['relay'] != 0:
                     self.get_logger().info('door %s: pulse relay %d' % (d['name'], d['relay']))
                     self.relay_pub.publish(String(data='%d on' % d['relay']))
                     self.pending_off.append((now + d['pulse_s'], d['relay']))
@@ -303,6 +404,9 @@ def main():
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
+        # best effort: normal stop zone back (fire-and-forget, may not land)
+        if node.short_on and rclpy.ok():
+            node.set_short(False, time.monotonic(), force=True)
         node.destroy_node()
         rclpy.try_shutdown()
 
