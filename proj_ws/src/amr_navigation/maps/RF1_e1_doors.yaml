@@ -1,0 +1,8 @@
+doors:
+- name: DOOR_C
+  x: 40.063
+  y: -0.923
+  radius: 1.0
+  relay: 3
+  pulse_s: 0.5
+  wait_s: 5.0
