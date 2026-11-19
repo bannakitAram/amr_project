@@ -1,0 +1,7 @@
+image: FR2_e1_e1.pgm
+mode: trinary
+resolution: 0.05
+origin: [-11.8, -16.2, 0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.25

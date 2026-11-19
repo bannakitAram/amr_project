@@ -1,0 +1,13 @@
+stations:
+- name: pose1
+  x: 1.056
+  y: 0.057
+  theta: -0.014
+- name: Station_B
+  x: 56.46
+  y: 56.806
+  theta: 1.513
+- name: HOME
+  x: 0.0
+  y: 0.0
+  theta: 0.0
