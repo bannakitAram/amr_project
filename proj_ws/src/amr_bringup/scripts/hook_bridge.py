@@ -54,8 +54,10 @@ Topics:
   /light/cmd   std_msgs/String in: tower light pattern from light_state_node.py
                (IDLE / AUTO / MANUAL / OBSTACLE / FAULT), forwarded as L<n>
                every `light_period_s`. Stops forwarding if /light/cmd goes
-               quiet for `light_timeout_s`, so the Mega's own link watchdog
-               turns the tower red-blink when light_state_node dies too.
+               quiet for `light_timeout_s`: if the `light_state` node is gone
+               from the graph (bringup not running) it sends OFF (L5, lamps
+               dark); if the node still exists but is silent (hung) it sends
+               nothing, so the Mega's link watchdog turns the tower red-blink.
 
 The Mega only reports on change, so the bridge sends '?' every
 `poll_period_s`; any line received counts as alive. Opening the port
@@ -84,7 +86,8 @@ import serial
 
 VALID_CMDS = {'U', 'D', 'S', 'R', '?'}
 # must match LightCmd in arduino/src/main.cpp
-LIGHT_CODES = {'IDLE': 0, 'AUTO': 1, 'MANUAL': 2, 'OBSTACLE': 3, 'FAULT': 4}
+LIGHT_CODES = {'IDLE': 0, 'AUTO': 1, 'MANUAL': 2, 'OBSTACLE': 3, 'FAULT': 4, 'OFF': 5}
+LIGHT_OFF = 5
 
 
 class HookBridge(Node):
@@ -365,7 +368,10 @@ class HookBridge(Node):
 
     def on_light_timer(self):
         if self.light is None or self.now_s() - self.light_rx > self.light_timeout_s:
-            return  # silence -> Mega shows link-lost (red blink) by itself
+            if 'light_state' in self.get_node_names():
+                return  # node alive but silent (hung) -> Mega red-blinks by itself
+            self.send('L%d' % LIGHT_OFF)  # bringup not running -> tower dark
+            return
         self.send('L%d' % self.light)
 
     def on_relay_cmd(self, msg):

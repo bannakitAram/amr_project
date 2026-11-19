@@ -9,6 +9,7 @@
 //          L2 manual      yellow blink 2.5 Hz (joystick driving)
 //          L3 obstacle    yellow steady (collision_monitor holding it)
 //          L4 fault       red steady (sensor watchdog, ...)
+//          L5 off         all off (bringup not running; sent by hook_bridge)
 //   O<n><0|1> = general-purpose relay n (1..3 = D30/D31/D32) off/on,
 //          replies OUT <r1><r2><r3> (e.g. OUT 100). All OFF at boot.
 //          Not safety-related loads only (lights, fan, ...): no link
@@ -128,7 +129,7 @@ bool lastMoveUp = false;        // direction of the last move started
 uint32_t buttonPressedMs = 0;
 bool buttonHandled = false;     // one action per press; release to re-arm
 
-enum LightCmd { L_IDLE, L_AUTO, L_MANUAL, L_OBSTACLE, L_FAULT, L_COUNT };
+enum LightCmd { L_IDLE, L_AUTO, L_MANUAL, L_OBSTACLE, L_FAULT, L_OFF, L_COUNT };
 uint8_t lightCmd = L_IDLE;
 uint32_t lightCmdMs = 0;
 bool lightCmdSeen = false;      // none yet since boot -> link-lost pattern
@@ -248,6 +249,7 @@ void updateLights(uint32_t now) {
     case L_MANUAL:   lamps(false, blink(now, 400), false);  break;
     case L_OBSTACLE: lamps(false, true, false);             break;
     case L_FAULT:    lamps(true, false, false);             break;
+    case L_OFF:      lamps(false, false, false);            break;
     default:         lamps(false, false, true);             break;  // L_IDLE
   }
 }
