@@ -229,7 +229,7 @@ local_costmap:
       # (base_depth=0.951, base_width=0.496, centered on base_link), rounded
       # up ~1.5cm/side to cover the drive wheels poking slightly past the
       # base box on Y. Rectangle corners, base_link frame, X forward/Y left.
-      footprint: "[[0.49, 0.38], [0.49, -0.38], [-0.58, -0.38], [-0.58, 0.38]]"
+      footprint: "[[0.49, 0.40], [0.49, -0.40], [-0.87, -0.40], [-0.87, 0.40]]"
       # stvl_layer is configured below but NOT loaded: inside controller_server
       # it marks nothing (0 voxels, 2026-10-05), while the same params in a
       # standalone costmap work. Until that is fixed, depth only feeds
@@ -328,7 +328,7 @@ global_costmap:
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_footprint
-      footprint: "[[0.49, 0.38], [0.49, -0.38], [-0.58, -0.38], [-0.58, 0.38]]"
+      footprint: "[[0.49, 0.40], [0.49, -0.40], [-0.87, -0.40], [-0.87, 0.40]]"
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -462,7 +462,7 @@ collision_monitor:
       type: "polygon"
       action_type: "stop"
       # x,y pairs in base_footprint: bumper (0.49) .. +0.35 m, width +-0.29
-      points: [0.84, 0.41, 0.84, -0.41, 0.49, -0.41, 0.49, 0.41]
+      points: [0.84, 0.43, 0.84, -0.43, 0.49, -0.43, 0.49, 0.43]
       max_points: 5          # Humble: act when MORE than this many points inside
       visualize: True
       polygon_pub_topic: "polygon_front_stop"
