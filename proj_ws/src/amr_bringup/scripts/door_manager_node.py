@@ -6,7 +6,7 @@ stations file; the map name and folder come from the control panel's
 /amr_stations, so doors exist only while Navigation runs on a map):
 
   doors:
-    - {name: A, x: 3.20, y: -1.50, radius: 1.5, relay: 1, pulse_s: 0.5, wait_s: 5.0}
+    - {name: A, x: 3.20, y: -1.50, radius: 2.5, relay: 1, pulse_s: 0.5, wait_s: 5.0}
     - {name: S, x: 8.00, y: 2.00, radius: 1.5, relay: 0, ...}   sensor door
 
 relay 0 = sensor door (opens by itself when the robot is very close): no
@@ -94,7 +94,13 @@ CM_SERVICE = '/collision_monitor/set_parameters_atomically'
 class DoorManager(Node):
     def __init__(self):
         super().__init__('door_manager')
-        self.default_radius = float(self.declare_parameter('radius', 1.5).value)
+        # relay doors: 2.5 m (was 1.5) - a closed door stops the robot
+        # (FrontStop) ~0.84 m from its centre, so a pin slightly past the
+        # door line never got inside 1.5 m. Sensor doors (relay 0) keep
+        # 1.5 m: their radius is the FrontStopShort (0.10 m) zone, which
+        # must stay small.
+        self.default_radius = float(self.declare_parameter('radius', 2.5).value)
+        self.sensor_radius = float(self.declare_parameter('sensor_radius', 1.5).value)
         self.default_pulse_s = float(self.declare_parameter('pulse_s', 0.5).value)
         self.default_wait_s = float(self.declare_parameter('wait_s', 5.0).value)
         self.robot_frame = self.declare_parameter('robot_frame', 'base_footprint').value
@@ -146,7 +152,8 @@ class DoorManager(Node):
             for d in data.get('doors', [])[:MAX_DOORS]:
                 self.doors.append({
                     'name': str(d['name']), 'x': float(d['x']), 'y': float(d['y']),
-                    'radius': float(d.get('radius', self.default_radius)),
+                    'radius': float(d.get('radius', self.sensor_radius if int(d['relay']) == 0
+                                          else self.default_radius)),
                     'relay': int(d['relay']),
                     'pulse_s': float(d.get('pulse_s', self.default_pulse_s)),
                     'wait_s': min(60.0, max(0.0, float(d.get('wait_s', self.default_wait_s))))})
@@ -252,13 +259,14 @@ class DoorManager(Node):
             if len(self.doors) >= MAX_DOORS:
                 self.get_logger().warn('door cmd ignored: %d doors max' % MAX_DOORS)
                 return
+            radius = self.sensor_radius if relay == 0 else self.default_radius
             self.doors.append({'name': name, 'x': round(xy[0], 3), 'y': round(xy[1], 3),
-                               'radius': self.default_radius, 'relay': relay,
+                               'radius': radius, 'relay': relay,
                                'pulse_s': self.default_pulse_s,
                                'wait_s': self.default_wait_s})
             # being at the door when it is set must not tick it at once
             rxy = xy if not pinned else self.robot_xy()
-            if rxy is not None and math.hypot(rxy[0] - xy[0], rxy[1] - xy[1]) <= self.default_radius:
+            if rxy is not None and math.hypot(rxy[0] - xy[0], rxy[1] - xy[1]) <= radius:
                 self.inside.add(name)
             else:
                 self.inside.discard(name)
