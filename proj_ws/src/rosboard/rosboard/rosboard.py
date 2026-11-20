@@ -477,26 +477,36 @@ class ROSBoardNode(object):
                 rospy.loginfo("bag record start: %s %s" % (self.bag_name, " ".join(topics)))
             elif action == "stop":
                 self._bag_stop()
-            elif action == "stop_dist":
-                # last finished bag only; path is ours, never from the browser
+            elif action in ("stop_dist", "stop_cause"):
+                # last finished bag only; path is ours, never from the browser.
+                # stop_cause: front_stop_source_from_bag.py - which sensor /
+                # polygon / Nav2 failure stopped the robot (false stops)
                 if self.bag_proc is not None or self.stop_proc_busy or not self.bag_name:
                     return
                 self.stop_proc_busy = True
                 self.stop_result = ""
                 self.stop_ok = None
+                if action == "stop_dist":
+                    cmd = ["stop_distance_from_bag.py"]
+                else:
+                    cmd = ["front_stop_source_from_bag.py", "--max-events", "5"]
                 threading.Thread(target=self._run_stop_dist,
-                                 args=(os.path.join(self.bag_dir, self.bag_name),),
+                                 args=(os.path.join(self.bag_dir, self.bag_name), cmd,
+                                       action == "stop_dist"),
                                  daemon=True).start()
         self.publish_bag_state()
 
-    def _run_stop_dist(self, path):
+    def _run_stop_dist(self, path, cmd, pass_fail):
+        """pass_fail: exit code is a pass/fail verdict (stop distance);
+        otherwise the result is a neutral report (stop cause)."""
         try:
             r = subprocess.run(
-                ["ros2", "run", "amr_bringup", "stop_distance_from_bag.py", path],
+                ["ros2", "run", "amr_bringup", cmd[0], path] + cmd[1:],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120, text=True)
             # drop rosbag2's [INFO] lines; keep the tail so the message stays small
             lines = [l for l in r.stdout.splitlines() if not l.startswith("[INFO]")]
-            text, ok = "\n".join(lines)[-4000:], r.returncode == 0
+            text = "\n".join(lines)[-4000:]
+            ok = (r.returncode == 0) if pass_fail else (None if r.returncode == 0 else False)
         except (OSError, subprocess.TimeoutExpired) as e:
             text, ok = "analysis failed: %s" % e, False
         with self.bag_lock:

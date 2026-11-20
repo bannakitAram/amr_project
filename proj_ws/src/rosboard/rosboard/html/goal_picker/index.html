@@ -1565,6 +1565,13 @@ const btnBag = document.getElementById('btn-bag');
 // topics stop_distance_from_bag.py needs (stop-distance test preset)
 const STOP_TOPICS = ['/cmd_vel', '/cmd_vel_smoothed', '/cmd_vel_nav', '/odometry/filtered',
                      '/wheel/odom', '/scan_filtered', '/tf_static'];
+// topics front_stop_source_from_bag.py needs (false stop / "มีสิ่งกีดขวาง"
+// cause: scan vs depth vs FootprintApproach vs Nav2 failure)
+const CAUSE_TOPICS = ['/scan_filtered', '/depth_camera/points', '/collision_monitor_state',
+                      '/cmd_vel_smoothed', '/cmd_vel', '/odometry/filtered', '/rosout',
+                      '/tf', '/tf_static'];
+// Humble's collision_monitor has no state topic (Iron+); recorded if present
+const CAUSE_OPTIONAL = ['/collision_monitor_state'];
 // motor current + battery V/A log (one-tap button); /cmd_vel and
 // /wheel/odom give the speed the current belongs to; /nav_event marks
 // station trip start/arrived (nav_goal_executor_node)
@@ -1629,6 +1636,8 @@ function renderBagStatus() {
   if (start) start.disabled = rec || bagSelected.size === 0;
   const power = document.getElementById('bag-power');
   if (power) power.disabled = rec;
+  const causeRec = document.getElementById('bag-cause');
+  if (causeRec) causeRec.disabled = rec;
   if (stop) stop.disabled = !rec;
   const ana = document.getElementById('bag-stopdist');
   const busy = fresh && bagState.stop_busy;
@@ -1636,12 +1645,17 @@ function renderBagStatus() {
     ana.disabled = !fresh || rec || busy || !bagState.name;
     ana.textContent = busy ? 'กำลังวิเคราะห์...' : 'วิเคราะห์ระยะหยุด';
   }
+  const cause = document.getElementById('bag-stopcause');
+  if (cause) {
+    cause.disabled = !fresh || rec || busy || !bagState.name;
+    cause.textContent = busy ? 'กำลังวิเคราะห์...' : 'วิเคราะห์สาเหตุที่หยุด';
+  }
   const res = document.getElementById('stop-result');
   if (res) {
     const txt = fresh && bagState.stop_result;
     res.hidden = !txt;
     res.textContent = txt || '';
-    res.className = !txt ? '' : (bagState.stop_ok ? 'pass' : 'fail');
+    res.className = !txt || bagState.stop_ok == null ? '' : (bagState.stop_ok ? 'pass' : 'fail');
   }
   for (const cb of bagPanel.querySelectorAll('input')) cb.disabled = rec;
 }
@@ -1734,6 +1748,24 @@ function renderBagPanel() {
     transport.bagCmd({action: 'start', topics: topics, label: {payload_kg: kg, note: note}});
   });
   mk2('bag-stopdist', 'primary', 'วิเคราะห์ระยะหยุด', () => transport.bagCmd({action: 'stop_dist'}));
+  // false stop ("มีสิ่งกีดขวาง" with nothing there): record in the spot,
+  // start the goal, stop recording, then analyse
+  mk2('bag-cause', 'primary', 'บันทึกหาสาเหตุหยุดเอง', () => {
+    // one tap like the power log: pick the topics and start recording
+    const topics = CAUSE_TOPICS.filter(t => t in allTopics);
+    const missing = CAUSE_TOPICS.filter(t => !(t in allTopics) && !CAUSE_OPTIONAL.includes(t));
+    if (!topics.includes('/cmd_vel_smoothed') || !topics.includes('/cmd_vel')) {
+      alert('ไม่พบ /cmd_vel_smoothed หรือ /cmd_vel - เปิด Navigation ก่อน');
+      return;
+    }
+    if (missing.length && !confirm('ไม่พบ topic: ' + missing.join(', ') + '\nบันทึกเท่าที่มี?')) return;
+    if (!confirm('บันทึกหาสาเหตุหยุดเอง (มี depth cloud - ไฟล์ใหญ่ ควรบันทึกสั้นๆ 1-2 นาที)\n' +
+        '1) เริ่มบันทึก  2) สั่ง goal จากจุดที่มีปัญหา  3) รอข้อความเตือนขึ้น\n' +
+        '4) หยุดบันทึก  5) กด "วิเคราะห์สาเหตุที่หยุด"\nเริ่มเลย?')) return;
+    bagSelected = new Set(topics); saveBagSelection(); renderBagPanel();
+    transport.bagCmd({action: 'start', topics: topics});
+  });
+  mk2('bag-stopcause', 'primary', 'วิเคราะห์สาเหตุที่หยุด', () => transport.bagCmd({action: 'stop_cause'}));
   bagPanel.appendChild(row2);
   const res = document.createElement('div');
   res.id = 'stop-result';
