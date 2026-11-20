@@ -442,6 +442,7 @@ NAV_PARAM_DEFAULTS = {
     'v_max': 0.20, 'w_max': 0.50, 'inflation': 0.55, 'goal_tol': 0.10,
     'fp_front': 0.49, 'fp_rear': 0.49, 'fp_left': 0.26, 'fp_right': 0.26,
     'acc_lin': 0.30, 'dec_lin': 0.50, 'acc_rot': 1.00, 'dec_rot': 1.50,
+    'depth': True,
 }
 STOP_LATENCY_S = 0.2      # cmd -> wheels, used for the stop-distance note
 FRONT_STOP_DEPTH = 0.35   # m ahead of the bumper (matches nav2_params.yaml)
@@ -460,7 +461,15 @@ _PARAM_RES = {
     'max_acc': re.compile(r'^(\s*max_accel:\s*\[)' + _NUM + r',\s*' + _NUM + r',\s*' + _NUM + r'\]', re.M),
     'max_dec': re.compile(r'^(\s*max_decel:\s*\[)' + _NUM + r',\s*' + _NUM + r',\s*' + _NUM + r'\]', re.M),
     'footprint': re.compile(r'^(\s*footprint:\s*)"\[\[([^"]*)\]\]"', re.M),
-    'front_stop': re.compile(r'^(\s*points:\s*)\[' + ',\\s*'.join([_NUM] * 8) + r'\]', re.M),
+    # only the FrontStop polygon's points (FrontStopShort, the sensor-door
+    # short zone, has its own fixed 0.10 m depth and must not be resized)
+    'front_stop': re.compile(r'^(\s*FrontStop:\s*\n(?:\s*#.*\n|\s*(?!points:)\w+:.*\n)*?'
+                             r'\s*points:\s*)\[' + ',\\s*'.join([_NUM] * 8) + r'\]', re.M),
+    # collision_monitor's depth source "enabled" (block: depth: / type:
+    # "pointcloud" ... enabled:). Also decides bringup depth_camera:=.
+    'depth': re.compile(r'^(\s*depth:\s*\n\s*type:\s*"pointcloud"\s*\n'
+                        r'(?:\s*(?!enabled:)\w+:.*\n)*?\s*enabled:\s*)(True|False|true|false)\b',
+                        re.M),
 }
 _PARAM_COUNTS = {'inflation': 2, 'footprint': 2}
 
@@ -488,6 +497,7 @@ def read_nav_params(text):
         'acc_rot': float(_PARAM_RES['max_acc'].search(text).group(4)),
         'dec_lin': -float(_PARAM_RES['max_dec'].search(text).group(2)),
         'dec_rot': -float(_PARAM_RES['max_dec'].search(text).group(4)),
+        'depth': _PARAM_RES['depth'].search(text).group(2).lower() == 'true',
     }
 
 
@@ -518,7 +528,20 @@ def write_nav_params(text, v):
     text = _PARAM_RES['front_stop'].sub(
         lambda m: (f'{m.group(1)}[{fx:.2f}, {sl:.2f}, {fx:.2f}, {-sr:.2f}, '
                    f'{fr:.2f}, {-sr:.2f}, {fr:.2f}, {sl:.2f}]'), text)
+    text = _PARAM_RES['depth'].sub(
+        lambda m: m.group(1) + ('True' if v['depth'] else 'False'), text)
     return text
+
+
+def depth_enabled_in_file():
+    """Depth camera on/off for the next bringup, from nav2_params.yaml
+    (collision_monitor depth.enabled). Unreadable file -> True (safe side:
+    camera on, watchdog on)."""
+    try:
+        with open(NAV2_PARAMS) as f:
+            return read_nav_params(f.read())['depth']
+    except (OSError, ValueError, AttributeError):
+        return True
 
 
 _BOX_KEYS = ('min_x', 'max_x', 'min_y', 'max_y')
@@ -2076,13 +2099,19 @@ class AmrControlPanel(tk.Tk):
         self.btn_manual_stop = self._btn(row, 'ปิดระบบ', self._on_stop, kind='danger')
         self.btn_manual_stop.pack(side='left', padx=(px(4), px(0)))
 
+    def _depth_arg(self):
+        """bringup depth_camera:= from nav2_params.yaml, remembered for the
+        Safety pill while this run lasts."""
+        self._depth_on_run = depth_enabled_in_file()
+        return 'depth_camera:=' + ('true' if self._depth_on_run else 'false')
+
     def _on_click_manual(self):
         if self._proc is not None:
             return
         self._launch([
             'ros2', 'launch', 'amr_bringup', 'bringup.launch.py',
             'rviz:=false', 'foxglove:=true', 'slam:=false', 'navigation:=false',
-            'joystick:=true',
+            'joystick:=true', self._depth_arg(),
         ], mode='manual', label='โหมดควบคุมเอง (Manual)')
         threading.Thread(target=self._ensure_monitors_then_show_qr,
                          daemon=True).start()
@@ -2309,7 +2338,10 @@ class AmrControlPanel(tk.Tk):
     def _show_watchdogs(self, labels, keys):
         for k in keys:
             wd = self.ros.watchdog.get(k)
-            if wd is None or time.monotonic() - wd[1] > 3:
+            if k == 'depth' and self._proc is not None and \
+                    not getattr(self, '_depth_on_run', True):
+                labels[k].config(text=T('ปิดใช้งาน'), fg=AMBER)
+            elif wd is None or time.monotonic() - wd[1] > 3:
                 labels[k].config(text=T('ไม่มีข้อมูล'), fg=TEXT_MUTED)
             else:
                 labels[k].config(text='OK' if wd[0] else 'FAULT',
@@ -2764,6 +2796,16 @@ class AmrControlPanel(tk.Tk):
             rng.grid(row=r, column=2, sticky='w', padx=px(8))
             self._param_widgets[key] = (minus, val, plus)
 
+        # depth camera on/off (collision_monitor depth source + bringup
+        # depth_camera:=). Off = no low-obstacle detection below the LiDAR.
+        r = len(NAV_PARAM_SPECS)
+        self._label(left, 'Depth camera (HP60C)', anchor='w', width=20).grid(
+            row=r, column=0, sticky='w')
+        self.btn_depth = self._btn(left, '—', self._toggle_depth)
+        self.btn_depth.grid(row=r, column=1, sticky='w', pady=px(4))
+        self._label(left, 'สิ่งกีดขวางเตี้ยใต้ LiDAR', font=self.f_small, fg=TEXT_MUTED,
+                    anchor='w').grid(row=r, column=2, sticky='w', padx=px(8))
+
         self.param_note = self._label(right, '', font=self.f_small, fg=TEXT_MUTED,
                                       justify='left', anchor='nw', wraplength=px(330))
         self.param_note.pack(fill='both', expand=True)
@@ -2794,6 +2836,19 @@ class AmrControlPanel(tk.Tk):
         self._param_edit = dict(NAV_PARAM_DEFAULTS)
         self._refresh_params()
 
+    def _toggle_depth(self):
+        if 'depth' not in self._param_edit:
+            return
+        if self._param_edit['depth'] and not messagebox.askyesno(
+                'ปิด Depth camera',
+                'ปิด depth camera = หุ่นจะมองไม่เห็นสิ่งกีดขวางที่เตี้ยกว่าระนาบ LiDAR '
+                '(กล่อง/tray บนพื้น, งา forklift, เท้าคน) และไม่มี depth watchdog\n\n'
+                'ใช้เฉพาะทดสอบที่มีคนเฝ้า E-stop หรือพื้นที่ที่ประเมินความเสี่ยงแล้ว '
+                '(ISO 3691-4)\n\nปิด?'):
+            return
+        self._param_edit['depth'] = not self._param_edit['depth']
+        self._refresh_params()
+
     def _adjust_param(self, key, delta):
         spec = next(sp for sp in NAV_PARAM_SPECS if sp[0] == key)
         _, _, _, lo, hi, _, _ = spec
@@ -2818,6 +2873,16 @@ class AmrControlPanel(tk.Tk):
             val.config(text=fmt.format(v), fg=AMBER if diff else TEXT_MAIN)
             self._set_btn_state(minus, v > lo + 1e-9)
             self._set_btn_state(plus, v < hi - 1e-9)
+        dv = self._param_edit.get('depth')
+        if dv is None:
+            self.btn_depth.config(text='—')
+            self._set_btn_state(self.btn_depth, False)
+        else:
+            self._set_btn_state(self.btn_depth, True)
+            self.btn_depth.config(text='เปิด (ON)' if dv else 'ปิด (OFF)',
+                                  bg=GREEN_DARK if dv else RED, fg='white')
+            if dv != self._param_file.get('depth'):
+                changed.append('Depth camera: ' + ('ON → OFF' if not dv else 'OFF → ON'))
         self._set_btn_state(self.btn_param_save, ok and bool(changed))
         self._param_changes = changed
 
@@ -2847,6 +2912,9 @@ class AmrControlPanel(tk.Tk):
                 lines.append(T('⚠ ระยะหยุดเกิน 80% ของความลึก FrontStop - เพิ่ม decel หรือลด v_max'))
             if e['acc_lin'] > e['dec_lin']:
                 lines.append(T('⚠ accel มากกว่า decel - ควรให้ decel ≥ accel'))
+            if not e.get('depth', True):
+                lines.append(T('⚠ Depth camera ปิด - ไม่เห็นสิ่งกีดขวางเตี้ยใต้ระนาบ LiDAR, '
+                               'ไม่มี depth watchdog - ห้ามใช้บนไลน์โดยไม่ประเมินความเสี่ยง'))
             lines.append(T('accel/decel ใช้กับ Navigation (velocity_smoother) เท่านั้น - '
                            'teleop/joystick ส่ง /cmd_vel ตรง ใช้ ramp ของ STM32 (0.5 / 1.2)'))
         if changed:
@@ -2960,9 +3028,14 @@ class AmrControlPanel(tk.Tk):
             self.pill_net.config(text=f'Net {ip}' if online else 'Net offline',
                                  fg=TEXT_MAIN if online else RED)
             self._ip = ip
-        wds = [self.ros.watchdog.get(k) for k in ('imu', 'depth')]
+        depth_off = self._proc is not None and not getattr(self, '_depth_on_run', True)
+        wds = [self.ros.watchdog.get(k) for k in (('imu',) if depth_off else ('imu', 'depth'))]
         live = [w for w in wds if w and time.monotonic() - w[1] < 3]
-        if not live:
+        if live and not all(w[0] for w in live):
+            self.pill_safety.config(text='SENSOR FAULT', bg=RED, fg='white')
+        elif depth_off:
+            self.pill_safety.config(text='DEPTH OFF', bg=AMBER, fg='black')
+        elif not live:
             self.pill_safety.config(text='Safety —', bg=SURFACE_2, fg=TEXT_MUTED)
         elif all(w[0] for w in live):
             self.pill_safety.config(text='Safety OK', bg=GREEN_DARK, fg='white')
@@ -3066,7 +3139,7 @@ class AmrControlPanel(tk.Tk):
             'slam_start_scanning:=false',
             # Keep the rear sector in SLAM: drive by phone/gamepad from the
             # side, not walking behind (rear wall = along-track feature).
-            'filter_operator_out:=false',
+            'filter_operator_out:=false', self._depth_arg(),
         ], mode='mapping', label='โหมดสร้างแผนที่ (Mapping)')
         self._slam_ready = False
         self._scanning = False
@@ -3349,7 +3422,7 @@ class AmrControlPanel(tk.Tk):
         self._launch([
             'ros2', 'launch', 'amr_bringup', 'bringup.launch.py',
             'rviz:=false', 'foxglove:=true', 'slam:=false', 'navigation:=true',
-            f'map:={map_path}',
+            f'map:={map_path}', self._depth_arg(),
         ], mode='navigation',
             label=f'โหมดนำทาง (Navigation)\nแผนที่: {os.path.basename(map_path)}')
         if self._page == 'auto':
