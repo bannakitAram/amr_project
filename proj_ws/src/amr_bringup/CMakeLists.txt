@@ -25,6 +25,7 @@ install(PROGRAMS
   scripts/slip_ratio_from_bag.py
   scripts/accel_slip_test_node.py
   scripts/stop_distance_from_bag.py
+  scripts/front_stop_source_from_bag.py
   scripts/hook_bridge.py
   scripts/light_state_node.py
   scripts/joy_teleop_node.py
