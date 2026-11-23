@@ -65,6 +65,19 @@ GHOST_MIN_CELLS ghosts are found both costmaps are cleared once before the retry
 the LiDAR still sees come back on the next costmap update (0.2 s), so real
 walls/people are not lost; with no fresh scan nothing is cleared.
 
+Backup recovery: when Nav2 fails a request (e.g. RPP "collision ahead"
+after a turn put the nose at a wall), there are no ghost cells, the LiDAR
+sees a real obstacle within BACKUP_FRONT_M of the bumper and nothing within
+BACKUP_REAR_M behind the rear, the robot backs up BACKUP_DIST at
+BACKUP_SPEED (Nav2 BackUp behaviour) and the request is re-sent at once.
+At most BACKUP_MAX times until the robot has moved BACKUP_RESET_M from the
+first backup spot; then the normal wait-and-retry with an operator alert.
+While backing: collision_monitor RearStop on, FrontStop/FrontStopShort off
+(Humble stop zones ignore direction - a wall at the nose would block the
+backup), /nav_backup_active true at 5 Hz so door_manager stops re-sending
+its front-zone state; afterwards the saved states are restored. If the
+restore fails the request is NOT re-sent (front stop zone may be off).
+
 Fixed routes: if the map has a <map>_routes.yaml (recorded from the control
 panel; path in /amr_stations) a station goal follows the recorded route to
 that station with FollowPath, from the route point nearest the robot, in
@@ -86,6 +99,8 @@ import time
 import rclpy
 import yaml
 from rclpy.time import Time
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import GetParameters, SetParametersAtomically
 from geometry_msgs.msg import PoseStamped, Twist
 from lifecycle_msgs.srv import GetState
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
@@ -150,6 +165,19 @@ GHOST_SUPPORT = 0.15     # m - a lethal cell with a scan point this close is rea
 GHOST_MIN_CELLS = 3      # ghost cells needed before clearing
 GHOST_SETTLE_S = 1.0     # s - wait after clearing before the retry is sent
 SCAN_FRESH_S = 1.0       # s - older /scan_filtered: do not clear anything
+FOOT_FRONT = 0.49        # m - base_footprint bumper x (nav2_params.yaml footprint)
+FOOT_REAR = -0.87        # m - base_footprint rear x
+FOOT_HALF_W = 0.40       # m - footprint half width
+BACKUP_FRONT_M = 0.50    # m - real obstacle this close to the bumper -> backup allowed
+BACKUP_REAR_M = 0.60     # m - behind the rear must be empty this far (> RearStop 0.30)
+BACKUP_SIDE_M = 0.10     # m - extra width of the front/rear check boxes
+BACKUP_MIN_POINTS = 3    # scan points that count as an obstacle in a box
+BACKUP_DIST = 0.30       # m
+BACKUP_SPEED = 0.08      # m/s
+BACKUP_TIME_S = 15       # s (int: BasicNavigator puts it in Duration.sec) - BackUp time allowance
+BACKUP_MAX = 2           # backups per stuck spot
+BACKUP_RESET_M = 1.0     # m - moved this far from the first backup spot: count restarts
+CM_PARAMS = '/collision_monitor'
 
 
 def yaw_of(q):
@@ -481,6 +509,109 @@ def main():
                     ghosts += 1
         return ghosts
 
+    def scan_in_base():
+        """Fresh /scan_filtered points in base_footprint, or None."""
+        scan = latest['scan']
+        if scan is None or time.time() - latest['scan_t'] > SCAN_FRESH_S:
+            return None
+        lidar = tf2d('base_footprint', scan.header.frame_id)
+        if lidar is None:
+            return None
+        lx, ly, lyaw = lidar
+        pts = []
+        for i, r in enumerate(scan.ranges):
+            if scan.range_min < r < scan.range_max:
+                a = lyaw + scan.angle_min + i * scan.angle_increment
+                pts.append((lx + r * math.cos(a), ly + r * math.sin(a)))
+        return pts
+
+    def backup_wanted():
+        """(True, why) if a backup should be tried now."""
+        pts = scan_in_base()
+        if pts is None:
+            return False, 'no fresh scan'
+        w = FOOT_HALF_W + BACKUP_SIDE_M
+        front = sum(1 for x, y in pts
+                    if FOOT_FRONT < x < FOOT_FRONT + BACKUP_FRONT_M and abs(y) < w)
+        rear = sum(1 for x, y in pts
+                   if FOOT_REAR - BACKUP_REAR_M < x < FOOT_REAR and abs(y) < w)
+        if front < BACKUP_MIN_POINTS:
+            return False, 'nothing at the bumper (%d pts)' % front
+        if rear >= BACKUP_MIN_POINTS:
+            return False, 'rear not clear (%d pts)' % rear
+        here = tf2d('map', 'base_footprint')
+        if here is not None and backup['where'] is not None and math.hypot(
+                here[0] - backup['where'][0], here[1] - backup['where'][1]) > BACKUP_RESET_M:
+            backup['n'] = 0
+            backup['where'] = None
+        if backup['n'] >= BACKUP_MAX:
+            return False, 'already backed up %d times here' % backup['n']
+        return True, 'front %d pts, rear clear' % front
+
+    def cm_call(client, req, timeout=2.0):
+        if not client.wait_for_service(timeout_sec=timeout):
+            return None
+        fut = client.call_async(req)
+        rclpy.spin_until_future_complete(navigator, fut, timeout_sec=timeout)
+        return fut.result() if fut.done() else None
+
+    def cm_set(values):
+        """Set collision_monitor bool params atomically; True on success."""
+        req = SetParametersAtomically.Request()
+        for name, value in values.items():
+            req.parameters.append(Parameter(name=name, value=ParameterValue(
+                type=ParameterType.PARAMETER_BOOL, bool_value=value)))
+        res = cm_call(cm_set_client, req)
+        return res is not None and res.result.successful
+
+    def start_backup(req):
+        """Switch the stop zones, start BackUp. False = not started (zones restored)."""
+        names = ['FrontStop.enabled', 'FrontStopShort.enabled', 'RearStop.enabled']
+        res = cm_call(cm_get_client, GetParameters.Request(names=names))
+        if res is None or len(res.values) != 3 or \
+                any(v.type != ParameterType.PARAMETER_BOOL for v in res.values):
+            navigator.get_logger().warn('nav_goal_executor_node: backup skipped - '
+                                        'cannot read collision_monitor zones')
+            return False
+        saved = {n: v.bool_value for n, v in zip(names, res.values)}
+        backup_pub.publish(Bool(data=True))  # door_manager: hands off the zones
+        if not cm_set({'RearStop.enabled': True, 'FrontStop.enabled': False,
+                       'FrontStopShort.enabled': False}):
+            cm_set(saved)
+            navigator.get_logger().warn('nav_goal_executor_node: backup skipped - '
+                                        'cannot switch collision_monitor zones')
+            return False
+        if not navigator.backup(backup_dist=BACKUP_DIST, backup_speed=BACKUP_SPEED,
+                                time_allowance=BACKUP_TIME_S):
+            cm_set(saved)
+            navigator.get_logger().warn('nav_goal_executor_node: BackUp goal rejected')
+            return False
+        here = tf2d('map', 'base_footprint')
+        if backup['where'] is None and here is not None:
+            backup['where'] = here[:2]
+        backup['n'] += 1
+        backup.update(active=True, req=req, saved=saved)
+        navigator.get_logger().warn('nav_goal_executor_node: blocked at the nose - backing up '
+                                    '%.2f m (%d/%d)' % (BACKUP_DIST, backup['n'], BACKUP_MAX))
+        alert('warn', 'หน้ารถติดสิ่งกีดขวาง - ถอยหลัง %.0f cm แล้วไปต่ออัตโนมัติ'
+              % (BACKUP_DIST * 100))
+        return True
+
+    def end_backup(resend):
+        """Restore the zones; re-send the request only if that worked."""
+        backup['active'] = False
+        req, backup['req'] = backup['req'], None
+        ok = cm_set(backup['saved']) or cm_set(backup['saved'])
+        backup_pub.publish(Bool(data=False))
+        if not ok:
+            navigator.get_logger().error(
+                'nav_goal_executor_node: could not restore collision_monitor zones %s '
+                'after backup - request dropped' % backup['saved'])
+            alert('error', 'คืนค่า safety zone หลังถอยไม่สำเร็จ - หยุดรอ operator')
+            return
+        if resend and req is not None:
+            pending['value'] = req + (True,)
+
     def clear_ghosts():
         ghosts = count_ghosts()
         if ghosts is None:
@@ -496,6 +627,12 @@ def main():
             if c.service_is_ready():
                 c.call_async(ClearEntireCostmap.Request())
         return True
+
+    backup = {'active': False, 'req': None, 'saved': None, 'n': 0, 'where': None, 'pub_t': 0.0}
+    backup_pub = navigator.create_publisher(Bool, '/nav_backup_active', 10)
+    cm_get_client = navigator.create_client(GetParameters, CM_PARAMS + '/get_parameters')
+    cm_set_client = navigator.create_client(
+        SetParametersAtomically, CM_PARAMS + '/set_parameters_atomically')
 
     def wait_for_clear(req, delay, why):
         """Keep `req` and re-send it after `delay` s (no retry limit)."""
@@ -653,6 +790,12 @@ def main():
                 if task_active['value']:
                     cancel_and_wait()
                     task_active['value'] = False
+                if backup['active']:
+                    cancel_and_wait()
+                    end_backup(resend=False)
+                if not resume:
+                    backup['n'] = 0
+                    backup['where'] = None
                 if approach['value'] is not None:
                     approach['value'].finish('failed', 'approach interrupted')
                     approach['value'] = None
@@ -816,6 +959,17 @@ def main():
                 approach['value'] = None
                 current['req'] = None
 
+            if backup['active']:
+                if time.time() - backup['pub_t'] > 0.2:
+                    backup['pub_t'] = time.time()
+                    backup_pub.publish(Bool(data=True))
+                if navigator.isTaskComplete():
+                    navigator.get_logger().info(
+                        'nav_goal_executor_node: backup finished (%s) - resending request'
+                        % navigator.getResult())
+                    end_backup(resend=True)
+                continue
+
             if task_active['value'] and navigator.isTaskComplete():
                 result = navigator.getResult()
                 task_active['value'] = False
@@ -823,6 +977,14 @@ def main():
                     req = current['req']
                     station['value'] = None
                     current['req'] = None
+                    ghosts = count_ghosts()
+                    want, why = backup_wanted()
+                    navigator.get_logger().info(
+                        'nav_goal_executor_node: request failed - ghosts %s, backup: %s'
+                        % (ghosts, why))
+                    if want and ghosts is not None and ghosts < GHOST_MIN_CELLS and \
+                            start_backup(req):
+                        continue
                     wait_for_clear(req, FAILED_RETRY_S,
                                    'ไปต่อไม่ได้ (ทางถูกบังหรือหาเส้นทางไม่ได้) - จอดรอแล้วลองใหม่อัตโนมัติ')
                     continue

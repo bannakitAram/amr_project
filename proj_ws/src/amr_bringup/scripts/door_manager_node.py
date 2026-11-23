@@ -20,6 +20,9 @@ relay pulse, no hold. Instead it is a SHORT-STOP zone:
     FrontStop back first, then the speed limit is removed
   The wanted polygon state is re-sent every RESEND_S (survives a
   collision_monitor restart, which reloads FrontStop from the yaml).
+  Paused while /nav_backup_active (std_msgs/Bool, nav_goal_executor_node)
+  is true: its backup recovery owns FrontStop/FrontStopShort/RearStop then,
+  and the state is re-sent as soon as the backup ends.
 
 In:
   /rosboard_door_cmd std_msgs/String JSON from rosboard (goal_picker), checked
@@ -78,7 +81,7 @@ from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 # letters (Thai vowel/tone marks are not \w), digits, space, _ and -
 NAME_RE = re.compile(r'^[^\x00-\x1f\x7f"\'\\/<>:;{}\[\]]{1,24}$')
@@ -87,6 +90,7 @@ HYSTERESIS_M = 0.3
 AUTO_HOLD_S = 1.5        # /cmd_vel_nav non-zero within this = Auto driving
 SLOW_MARGIN_M = 0.5      # sensor door: slow down this far before the short zone
 SLOW_SETTLE_S = 1.0      # sensor door: slow this long before the short zone
+BACKUP_STALE_S = 1.0     # /nav_backup_active older than this = not backing up
 RESEND_S = 2.0           # re-send collision_monitor polygon state
 CM_SERVICE = '/collision_monitor/set_parameters_atomically'
 
@@ -133,6 +137,8 @@ class DoorManager(Node):
         self.create_subscription(String, '/amr_stations', self.on_stations, 10)
         self.create_subscription(String, '/rosboard_door_cmd', self.on_cmd, 10)
         self.create_subscription(Twist, '/cmd_vel_nav', self.on_nav_cmd, 10)
+        self.backup_t = 0.0  # last /nav_backup_active true
+        self.create_subscription(Bool, '/nav_backup_active', self.on_backup, 10)
         self.create_subscription(
             OccupancyGrid, '/map', self.on_map,
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -312,9 +318,15 @@ class DoorManager(Node):
         msg.speed_limit = self.door_speed_percent if self.slow_since is not None else 0.0
         self.door_speed_pub.publish(msg)
 
+    def on_backup(self, msg):
+        self.backup_t = time.monotonic() if msg.data else 0.0
+
     def set_short(self, on, now, force=False):
         """FrontStopShort instead of FrontStop (on) or back. Both in one
         atomic call so there is never a moment with no front stop zone."""
+        if time.monotonic() - self.backup_t < BACKUP_STALE_S:
+            self.short_sent_t = 0.0  # executor backing up: resend once it ends
+            return
         if on == self.short_on and not force:
             return
         if on != self.short_on:
