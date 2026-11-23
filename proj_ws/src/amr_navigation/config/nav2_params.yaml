@@ -447,7 +447,7 @@ collision_monitor:
     source_timeout: 1.0
     base_shift_correction: True
     stop_pub_timeout: 2.0
-    polygons: ["FrontStop", "FrontStopShort", "FootprintApproach"]
+    polygons: ["FrontStop", "FrontStopShort", "RearStop", "FootprintApproach"]
     # Hard stop zone ahead of the bumper. Needed because the HP60C cannot see
     # closer than ~0.28 m from the lens (~0.27 m ahead of the footprint):
     # FootprintApproach alone only starts slowing at v*1.2 s = 0.24 m @0.2 m/s,
@@ -481,6 +481,21 @@ collision_monitor:
       max_points: 5
       visualize: True
       polygon_pub_topic: "polygon_front_stop_short"
+      enabled: False
+    # Hard stop zone behind the rear (-0.87) for the executor's backup
+    # recovery (nav_goal_executor_node.py). Humble stop polygons ignore the
+    # direction of travel, so this cannot stay on (a wall behind would stop
+    # forward driving, e.g. at HOME): the executor enables it - and turns
+    # FrontStop/FrontStopShort off, they would block backing away from a
+    # wall - only while BackUp runs, then restores all three.
+    RearStop:
+      type: "polygon"
+      action_type: "stop"
+      # rear (-0.87) .. -0.30 m, same width as FrontStop
+      points: [-0.87, 0.43, -0.87, -0.43, -1.17, -0.43, -1.17, 0.43]
+      max_points: 5
+      visualize: True
+      polygon_pub_topic: "polygon_rear_stop"
       enabled: False
     FootprintApproach:
       type: "polygon"
