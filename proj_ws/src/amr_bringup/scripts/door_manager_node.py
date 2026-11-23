@@ -57,6 +57,13 @@ robot has left the zone (radius + 0.3 m hysteresis). The wait is a fixed
 time: nothing checks that the door opened - a door still closed after the
 wait is an obstacle for collision_monitor (the executor then waits for it).
 
+Re-pulse (repulse_s > 0, relay doors only): while the robot is still inside
+a door it triggered in Auto, the relay is pulsed again every repulse_s so a
+door whose controller restarts its close timer on each pulse stays open
+until the robot has passed. Stops on leaving the zone or after REPULSE_MAX_S.
+ONLY for door controllers where a pulse = open / restart timer. On a TOGGLE
+controller (pulse while open = close) set repulse_s: 0 for that door.
+
 Convenience function only - NOT a safety function (ISO 3691-4). A door that
 does not open is an obstacle for collision_monitor; nothing here checks that
 the door actually opened. The short-stop zone depends on localization: the
@@ -91,6 +98,7 @@ AUTO_HOLD_S = 1.5        # /cmd_vel_nav non-zero within this = Auto driving
 SLOW_MARGIN_M = 0.5      # sensor door: slow down this far before the short zone
 SLOW_SETTLE_S = 1.0      # sensor door: slow this long before the short zone
 BACKUP_STALE_S = 1.0     # /nav_backup_active older than this = not backing up
+REPULSE_MAX_S = 60.0     # stop re-pulsing after this long in one door zone
 RESEND_S = 2.0           # re-send collision_monitor polygon state
 CM_SERVICE = '/collision_monitor/set_parameters_atomically'
 
@@ -107,6 +115,8 @@ class DoorManager(Node):
         self.sensor_radius = float(self.declare_parameter('sensor_radius', 1.5).value)
         self.default_pulse_s = float(self.declare_parameter('pulse_s', 0.5).value)
         self.default_wait_s = float(self.declare_parameter('wait_s', 5.0).value)
+        # 0 = one pulse per pass (old behaviour); per door 'repulse_s' overrides
+        self.default_repulse_s = float(self.declare_parameter('repulse_s', 0.0).value)
         self.robot_frame = self.declare_parameter('robot_frame', 'base_footprint').value
         # 15 % of 0.30 m/s = 0.045 m/s
         self.door_speed_percent = min(30.0, max(5.0, float(
@@ -116,6 +126,7 @@ class DoorManager(Node):
         self.maps_dir = ''
         self.doors = []
         self.inside = set()          # door names the robot is in (armed off)
+        self.repulse = {}            # door name -> [first pulse t, last pulse t]
         self.pending_off = []        # (monotonic time, relay)
         self.nav_moving_t = 0.0
         self.hold_until = 0.0        # monotonic end of the current door wait
@@ -162,15 +173,23 @@ class DoorManager(Node):
                                           else self.default_radius)),
                     'relay': int(d['relay']),
                     'pulse_s': float(d.get('pulse_s', self.default_pulse_s)),
-                    'wait_s': min(60.0, max(0.0, float(d.get('wait_s', self.default_wait_s))))})
+                    'wait_s': min(60.0, max(0.0, float(d.get('wait_s', self.default_wait_s)))),
+                    'repulse_s': self.clamp_repulse(d.get('repulse_s', self.default_repulse_s))})
         except FileNotFoundError:
             pass
         except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as e:
             self.get_logger().error('bad %s: %s' % (self.doors_path(), e))
         self.doors = [d for d in self.doors if d['relay'] in (0, 1, 2, 3)]
         self.inside.clear()
+        self.repulse.clear()
         self.short_inside.clear()
         self.get_logger().info('map %s: %d door(s)' % (self.map_name, len(self.doors)))
+
+    @staticmethod
+    def clamp_repulse(v):
+        """0 = off, else at least 1 s (no relay chatter)."""
+        v = float(v)
+        return 0.0 if v <= 0.0 else min(30.0, max(1.0, v))
 
     def save(self):
         tmp = self.doors_path() + '.tmp'
@@ -196,6 +215,7 @@ class DoorManager(Node):
             else:
                 self.doors = []
                 self.inside.clear()
+                self.repulse.clear()
                 self.short_inside.clear()
 
     def on_map(self, msg):
@@ -269,18 +289,21 @@ class DoorManager(Node):
             self.doors.append({'name': name, 'x': round(xy[0], 3), 'y': round(xy[1], 3),
                                'radius': radius, 'relay': relay,
                                'pulse_s': self.default_pulse_s,
-                               'wait_s': self.default_wait_s})
+                               'wait_s': self.default_wait_s,
+                               'repulse_s': self.clamp_repulse(self.default_repulse_s)})
             # being at the door when it is set must not tick it at once
             rxy = xy if not pinned else self.robot_xy()
             if rxy is not None and math.hypot(rxy[0] - xy[0], rxy[1] - xy[1]) <= radius:
                 self.inside.add(name)
             else:
                 self.inside.discard(name)
+            self.repulse.pop(name, None)
             self.get_logger().info('door %s %s at (%.2f, %.2f) relay %d'
                                    % (name, 'pinned' if pinned else 'set', xy[0], xy[1], relay))
         elif action == 'delete':
             self.doors = [d for d in self.doors if d['name'] != name]
             self.inside.discard(name)
+            self.repulse.pop(name, None)
             self.short_inside.discard(name)
             self.get_logger().info('door %s deleted' % name)
         else:
@@ -404,16 +427,38 @@ class DoorManager(Node):
             if d['name'] in self.inside:
                 if dist > d['radius'] + HYSTERESIS_M:
                     self.inside.discard(d['name'])
+                    self.repulse.pop(d['name'], None)
+                else:
+                    self.tick_repulse(d, now)
             elif dist <= d['radius']:
                 self.inside.add(d['name'])
                 if auto and d['relay'] != 0:
                     self.get_logger().info('door %s: pulse relay %d' % (d['name'], d['relay']))
                     self.relay_pub.publish(String(data='%d on' % d['relay']))
                     self.pending_off.append((now + d['pulse_s'], d['relay']))
+                    if d.get('repulse_s', 0.0) > 0:
+                        self.repulse[d['name']] = [now, now]
                     if d['wait_s'] > 0:
                         self.hold_until = now + d['wait_s']
                         self.hold_door = d['name']
                         self.get_logger().info('door %s: hold %.1f s' % (d['name'], d['wait_s']))
+
+    def tick_repulse(self, d, now):
+        """Pulse again every repulse_s while inside a door triggered in Auto."""
+        rp = self.repulse.get(d['name'])
+        if rp is None or d.get('repulse_s', 0.0) <= 0:
+            return
+        if now - rp[0] > REPULSE_MAX_S:
+            self.get_logger().warn('door %s: re-pulse stopped after %.0f s in zone'
+                                   % (d['name'], REPULSE_MAX_S))
+            del self.repulse[d['name']]
+            return
+        if now - rp[1] < d['repulse_s'] or any(r == d['relay'] for _, r in self.pending_off):
+            return
+        rp[1] = now
+        self.get_logger().info('door %s: re-pulse relay %d' % (d['name'], d['relay']))
+        self.relay_pub.publish(String(data='%d on' % d['relay']))
+        self.pending_off.append((now + d['pulse_s'], d['relay']))
 
 
 def main():

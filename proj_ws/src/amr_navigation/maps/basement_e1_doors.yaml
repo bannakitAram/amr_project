@@ -1,0 +1,9 @@
+doors:
+- name: A
+  x: 36.452
+  y: -16.628
+  radius: 2.5
+  relay: 1
+  pulse_s: 0.5
+  wait_s: 2.0
+  repulse_s: 1.0
