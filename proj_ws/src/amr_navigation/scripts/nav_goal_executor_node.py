@@ -57,6 +57,14 @@ standing) and re-sent when hold goes false or its messages stop for
 DOOR_HOLD_STALE_S. A fixed-time wait only - a door still closed is left to
 collision_monitor and the blocked-wait above. Operator cancel/new goal ends it.
 
+Ghost clearing: before each blocked/failed retry the local costmap's lethal
+cells within GHOST_RADIUS of the robot are checked against the latest
+/scan_filtered. A lethal cell with no scan point within GHOST_SUPPORT is a
+ghost (a mark raytrace never cleared - no LiDAR return behind it). If at least
+GHOST_MIN_CELLS ghosts are found both costmaps are cleared once before the retry. Obstacles
+the LiDAR still sees come back on the next costmap update (0.2 s), so real
+walls/people are not lost; with no fresh scan nothing is cleared.
+
 Fixed routes: if the map has a <map>_routes.yaml (recorded from the control
 panel; path in /amr_stations) a station goal follows the recorded route to
 that station with FollowPath, from the route point nearest the robot, in
@@ -81,7 +89,10 @@ from rclpy.time import Time
 from geometry_msgs.msg import PoseStamped, Twist
 from lifecycle_msgs.srv import GetState
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
-from nav_msgs.msg import Path
+from nav2_msgs.srv import ClearEntireCostmap
+from nav_msgs.msg import OccupancyGrid, Path
+from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
+from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, Empty, String
 from tf2_ros import Buffer, TransformListener
 
@@ -134,6 +145,11 @@ CORRIDOR_ENTRY = 0.25    # m - leg 1 hands over once within this before the pre-
                          # stalled 0.18 m from it, then a recovery Spin; bag 20261020_161338)
 LATERAL_ABORT = 0.35     # m - too far off the line: stop, give up (0.25 tripped after AMCL jumped at the pre-goal)
 APPROACH_TIMEOUT = 90.0  # s
+GHOST_RADIUS = 2.0       # m - lethal cells this close to the robot are checked before a retry
+GHOST_SUPPORT = 0.15     # m - a lethal cell with a scan point this close is real
+GHOST_MIN_CELLS = 3      # ghost cells needed before clearing
+GHOST_SETTLE_S = 1.0     # s - wait after clearing before the retry is sent
+SCAN_FRESH_S = 1.0       # s - older /scan_filtered: do not clear anything
 
 
 def yaw_of(q):
@@ -409,6 +425,78 @@ def main():
         chain['out_t'] = time.time()
         chain['out'] = is_moving(msg)
 
+    latest = {'costmap': None, 'scan': None, 'scan_t': 0.0}
+    clear_clients = [navigator.create_client(ClearEntireCostmap, srv) for srv in (
+        '/local_costmap/clear_entirely_local_costmap',
+        '/global_costmap/clear_entirely_global_costmap')]
+
+    def on_costmap(msg):
+        latest['costmap'] = msg
+
+    def on_scan(msg):
+        latest['scan'] = msg
+        latest['scan_t'] = time.time()
+
+    def tf2d(target, source):
+        """(x, y, yaw) of `source` frame in `target`, or None."""
+        try:
+            t = tf_buffer.lookup_transform(target, source, Time()).transform
+        except Exception:  # noqa: BLE001 - any TF failure means "don't know"
+            return None
+        return t.translation.x, t.translation.y, yaw_of(t.rotation)
+
+    def count_ghosts():
+        """Lethal local-costmap cells near the robot that the live scan does not
+        support. None = cannot judge (no data / no TF) -> do not clear."""
+        cm, scan = latest['costmap'], latest['scan']
+        if cm is None or scan is None or time.time() - latest['scan_t'] > SCAN_FRESH_S:
+            return None
+        frame = cm.header.frame_id
+        robot = tf2d(frame, 'base_link')
+        lidar = tf2d(frame, scan.header.frame_id)
+        if robot is None or lidar is None:
+            return None
+        lx, ly, lyaw = lidar
+        res = cm.info.resolution
+        ox, oy = cm.info.origin.position.x, cm.info.origin.position.y
+        # scan points bucketed by cell for a cheap neighbourhood lookup
+        cells = set()
+        for i, r in enumerate(scan.ranges):
+            if not scan.range_min < r < scan.range_max:
+                continue
+            a = lyaw + scan.angle_min + i * scan.angle_increment
+            cells.add((int((lx + r * math.cos(a) - ox) / res),
+                       int((ly + r * math.sin(a) - oy) / res)))
+        n = int(math.ceil(GHOST_SUPPORT / res))
+        rx, ry = int((robot[0] - ox) / res), int((robot[1] - oy) / res)
+        rad = int(GHOST_RADIUS / res)
+        w, h = cm.info.width, cm.info.height
+        ghosts = 0
+        for j in range(max(0, ry - rad), min(h, ry + rad + 1)):
+            for i in range(max(0, rx - rad), min(w, rx + rad + 1)):
+                if cm.data[j * w + i] < 100:  # 100 = lethal (254); inflation is lower
+                    continue
+                if not any((i + di, j + dj) in cells
+                           for di in range(-n, n + 1) for dj in range(-n, n + 1)):
+                    ghosts += 1
+        return ghosts
+
+    def clear_ghosts():
+        ghosts = count_ghosts()
+        if ghosts is None:
+            navigator.get_logger().warn(
+                'nav_goal_executor_node: ghost check skipped (no fresh scan/costmap/TF)')
+            return False
+        if ghosts < GHOST_MIN_CELLS:  # single cells are scan noise
+            return False
+        navigator.get_logger().warn(
+            'nav_goal_executor_node: %d lethal cells not seen by LiDAR - clearing costmaps '
+            'before retry' % ghosts)
+        for c in clear_clients:
+            if c.service_is_ready():
+                c.call_async(ClearEntireCostmap.Request())
+        return True
+
     def wait_for_clear(req, delay, why):
         """Keep `req` and re-send it after `delay` s (no retry limit)."""
         blocked['req'] = req
@@ -543,6 +631,10 @@ def main():
     navigator.create_subscription(String, '/amr_stations', on_stations, 10)
     navigator.create_subscription(Twist, '/cmd_vel_smoothed', on_smoothed, 10)
     navigator.create_subscription(Twist, '/cmd_vel', on_output, 10)
+    navigator.create_subscription(
+        OccupancyGrid, '/local_costmap/costmap', on_costmap,
+        QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+    navigator.create_subscription(LaserScan, '/scan_filtered', on_scan, qos_profile_sensor_data)
 
     try:
         while rclpy.ok():
@@ -677,6 +769,12 @@ def main():
             else:
                 blocked['since'] = None
             if blocked['req'] is not None and time.time() > blocked['resend_at']:
+                if not blocked.get('cleared') and clear_ghosts():
+                    # let the costmaps clear and re-mark from the scan first
+                    blocked['cleared'] = True
+                    blocked['resend_at'] = time.time() + GHOST_SETTLE_S
+                    continue
+                blocked['cleared'] = False
                 pending['value'] = blocked['req'] + (True,)
                 blocked['req'] = None
 
