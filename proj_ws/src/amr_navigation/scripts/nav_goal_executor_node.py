@@ -872,8 +872,13 @@ def main():
                     if not (0 <= ci < gw and 0 <= cj < gh):
                         return 'outside the map'
                     v = grid.data[cj * gw + ci]
-                    if v >= 99 or v < 0:
-                        return 'wall/unknown at (%.2f, %.2f)' % (wx, wy)
+                    # 100 = lethal only: 99 (inscribed) marks every cell within
+                    # 0.4 m of a wall, which the real footprint check here already
+                    # covers - it rejected the robot's own pose (test 15:35)
+                    if v >= 100:
+                        return 'wall at (%.2f, %.2f)' % (wx, wy)
+                    if v < 0:
+                        return 'unknown space at (%.2f, %.2f)' % (wx, wy)
                     if in_keepout(wx, wy):
                         return 'keep-out at (%.2f, %.2f)' % (wx, wy)
                     fy += gr
