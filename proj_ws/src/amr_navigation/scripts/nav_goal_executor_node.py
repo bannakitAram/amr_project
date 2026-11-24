@@ -849,9 +849,12 @@ def main():
         ramp = min(DETOUR_RAMP_M, room)
         if cum[-1] < full_to + ramp:
             return None, 'object too close to the end of the route', 0
-        grid = latest.get('gcostmap')
+        # walls from the saved map, objects from the live scan: the global
+        # costmap also keeps old obstacle marks (moved object, people) and
+        # rejected shifts of 0.10 m 'hitting a wall' on the route (test 15:57)
+        grid = latest.get('map')
         if grid is None:
-            return None, 'no global costmap', 0
+            return None, 'no /map', 0
         gw, gh, gr = grid.info.width, grid.info.height, grid.info.resolution
         gox, goy = grid.info.origin.position.x, grid.info.origin.position.y
 
@@ -882,10 +885,7 @@ def main():
                     if not (0 <= ci < gw and 0 <= cj < gh):
                         return 'outside the map'
                     v = grid.data[cj * gw + ci]
-                    # 100 = lethal only: 99 (inscribed) marks every cell within
-                    # 0.4 m of a wall, which the real footprint check here already
-                    # covers - it rejected the robot's own pose (test 15:35)
-                    if v >= 100:
+                    if v >= 65:   # occupied in the saved map
                         return 'wall at (%.2f, %.2f)' % (wx, wy)
                     if v < 0:
                         return 'unknown space at (%.2f, %.2f)' % (wx, wy)
