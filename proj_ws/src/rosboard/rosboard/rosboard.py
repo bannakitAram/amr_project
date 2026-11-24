@@ -605,8 +605,14 @@ class ROSBoardNode(object):
             return max(-limit, min(limit, value))
 
         twist = Twist()
-        twist.linear.x = self.teleop_ramp(clamp(linear, self.teleop_effective_max_linear()))
+        want_linear = clamp(linear, self.teleop_effective_max_linear())
+        twist.linear.x = self.teleop_ramp(want_linear)
         twist.angular.z = clamp(angular, self.teleop_effective_max_angular())
+        # stick pulled back = reversing: flip the turn so the robot's rear
+        # swings towards the stick side, like backing a car - same as the
+        # gamepad (amr_bringup joy_teleop_node.py). Pure rotation unchanged.
+        if want_linear < 0.0:
+            twist.angular.z = -twist.angular.z
         moving = twist.linear.x != 0.0 or twist.angular.z != 0.0
         if moving:
             self.teleop_last_active = time.time()

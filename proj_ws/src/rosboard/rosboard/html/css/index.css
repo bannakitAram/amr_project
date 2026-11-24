@@ -492,6 +492,9 @@ input, textarea, *[contenteditable=true] {
 }
 
 .joystick-pad {
+    /* driving + tapping Remote with a 2nd finger must not become a browser
+       pan/zoom gesture: that fires pointercancel on the pad = stop */
+    touch-action: none;
   position: relative;
   width: 200px;
   height: 200px;
@@ -586,6 +589,9 @@ input, textarea, *[contenteditable=true] {
    body.mapping-active pads the joystick panel so the pad re-centres in
    the space to the right of it - nothing overlaps on narrow phones. */
 .mapping-bar {
+    /* driving + tapping Remote with a 2nd finger must not become a browser
+       pan/zoom gesture: that fires pointercancel on the pad = stop */
+    touch-action: none;
   position: fixed;
   left: 6px;
   bottom: 24px;

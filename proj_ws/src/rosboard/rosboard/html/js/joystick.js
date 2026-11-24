@@ -10,6 +10,7 @@
 // a feel/tuning one.
 const JOYSTICK_MAX_LINEAR = 0.1;   // m/s - until the server's /rosboard_teleop_state arrives
 const JOYSTICK_MAX_ANGULAR = 0.15; // rad/s - kept low so fast in-place turns during Mapping don't hurt SLAM scan-matching
+const JOYSTICK_REVERSE_DEADBAND = 0.15; // knob down past this = reversing (car-style steering)
 const JOYSTICK_SEND_INTERVAL_MS = 100; // well under the backend's 500ms deadman timeout
 
 (function () {
@@ -21,15 +22,19 @@ const JOYSTICK_SEND_INTERVAL_MS = 100; // well under the backend's 500ms deadman
   let teleopState = null;
   let panelOpen = false;
   let dragging = false;
+  let dragPointer = null; // pointerId holding the knob; other fingers (Remote R1-R3) don't end the drive
   let sendTimer = null;
   let knobX = 0, knobY = 0; // -1..1, current commanded axes
 
   function sendCurrent() {
     if (!currentTransport || !currentTransport.isConnected()) return;
-    currentTransport.teleop({
-      linear: -knobY * maxLinear,
-      angular: -knobX * maxAngular,
-    });
+    const linear = -knobY * maxLinear;
+    let angular = -knobX * maxAngular;
+    // Car-style steering: when backing up, knob left swings the REAR to the
+    // left (like a steering wheel in reverse), so the yaw sign flips. Pure
+    // in-place turns (knob straight sideways) are unchanged.
+    if (knobY > JOYSTICK_REVERSE_DEADBAND) angular = -angular;
+    currentTransport.teleop({linear: linear, angular: angular});
   }
 
   function sendStop() {
@@ -148,6 +153,8 @@ const JOYSTICK_SEND_INTERVAL_MS = 100; // well under the backend's 500ms deadman
     stopBtn.addEventListener('pointerdown', (e) => {
       e.preventDefault();
       dragging = false;
+      dragPointer = null;
+      if (sendTimer) { clearInterval(sendTimer); sendTimer = null; }
       sendStop();
       resetKnob(knobEl);
       confirmStopped(padEl);
@@ -155,20 +162,26 @@ const JOYSTICK_SEND_INTERVAL_MS = 100; // well under the backend's 500ms deadman
 
     padEl.addEventListener('pointerdown', (e) => {
       e.preventDefault();
+      if (dragging) return; // a 2nd finger on the pad doesn't take over
       dragging = true;
+      dragPointer = e.pointerId;
       padEl.setPointerCapture(e.pointerId);
       setKnobFromEvent(padEl, knobEl, e.clientX, e.clientY);
       if (!sendTimer) sendTimer = setInterval(sendCurrent, JOYSTICK_SEND_INTERVAL_MS);
     });
 
     padEl.addEventListener('pointermove', (e) => {
-      if (!dragging) return;
+      if (!dragging || e.pointerId !== dragPointer) return;
       setKnobFromEvent(padEl, knobEl, e.clientX, e.clientY);
     });
 
     function endDrag(e) {
       if (!dragging) return;
+      // only the finger on the knob ends the drive (lift / cancel of that
+      // finger still stops at once); hidden tab (no e) always stops
+      if (e && e.pointerId !== undefined && e.pointerId !== dragPointer) return;
       dragging = false;
+      dragPointer = null;
       if (sendTimer) {
         clearInterval(sendTimer);
         sendTimer = null;
