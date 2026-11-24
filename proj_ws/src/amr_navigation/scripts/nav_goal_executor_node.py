@@ -157,6 +157,9 @@ DETOUR_EARLY_M = 1.6     # m bumper -> object on the route: stop here while foll
                          # (RPP/FrontStop stopped 0.2-0.5 m short - no room left to shift)
 DETOUR_EARLY_HZ = 5.0    # early-stop check rate
 DETOUR_EARLY_MIN_LEFT = 1.5  # m - no early stop when the route ends closer than this
+DETOUR_EXIT_EXTRA = 0.70  # m - stay in the side lane this much longer: RPP's 0.6 m lookahead
+                          # cut the way back and swung the rear into the object (test 16:05)
+DETOUR_BESIDE_TOL = 0.25  # m - object already beside: robot must be this close to the lane
 DETOUR_REAR_MARGIN = 0.30  # m - behind a detour backup must be clear this much further
 DETOUR_SIDE_CLEAR = 0.20 # m - robot side to object gap while passing it (0.10 tried 2026-11-24
                          # 16:02: shift came out 0 m and RPP's own footprint check refused it)
@@ -850,13 +853,19 @@ def main():
         a, b = min(hits), max(hits)
         need = FOOT_HALF_W + DETOUR_SIDE_CLEAR
         # full shift from the bumper reaching the object to the rear passing it
-        full_from, full_to = cum[a] - FOOT_FRONT - DETOUR_FRONT_GAP, cum[b] - FOOT_REAR + 0.1
+        full_from = cum[a] - FOOT_FRONT - DETOUR_FRONT_GAP
+        full_to = cum[b] - FOOT_REAR + 0.1 + DETOUR_EXIT_EXTRA
         room = full_from          # route length available for the ramp in front
-        if room < DETOUR_RAMP_MIN:
-            back = min(DETOUR_BACK_MAX, DETOUR_RAMP_MIN - room + 0.05)
+        cur = lateral(0, here[:2])  # robot's offset from the route now (+ = left)
+        back_for_room = min(DETOUR_BACK_MAX, DETOUR_RAMP_MIN - room + 0.05)
+        # object already beside the robot (stopped mid-detour): carry on in the
+        # lane the robot is in instead of backing up for a new ramp (test 16:05)
+        beside = room < DETOUR_RAMP_MIN and abs(cur) >= 0.05
+        if room < DETOUR_RAMP_MIN and not beside:
             return None, 'object %.2f m from the bumper - backing up %.2f m for room' % (
-                cum[a] - FOOT_FRONT, back), back
-        ramp = min(DETOUR_RAMP_M, room)
+                cum[a] - FOOT_FRONT, back_for_room), back_for_room
+        ramp_in = 0.0 if beside else min(DETOUR_RAMP_M, room)
+        ramp = DETOUR_RAMP_M      # way back onto the route
         if cum[-1] < full_to + ramp:
             return None, 'object too close to the end of the route', 0
         # walls from the saved map, objects from the live scan: the global
@@ -874,10 +883,12 @@ def main():
 
         def profile(i):
             d = cum[i]
-            if d < full_from - ramp or d > full_to + ramp:
+            if beside and d <= full_to:
+                return 1.0
+            if d < full_from - ramp_in or d > full_to + ramp:
                 return 0.0
             if d < full_from:
-                return smooth((d - (full_from - ramp)) / ramp)
+                return smooth((d - (full_from - ramp_in)) / ramp_in)
             if d > full_to:
                 return smooth(((full_to + ramp) - d) / ramp)
             return 1.0
@@ -915,6 +926,15 @@ def main():
             # side +1 = shift right (path at -off), -1 = left; every object point
             # must end up `need` from the shifted line
             off = max(0.0, max(need - side * lt for _, lt in near))
+            if beside:
+                if -side * cur <= 0:
+                    tried.append('%s: robot is on the other side' % ('left' if side < 0 else 'right'))
+                    continue
+                if off - abs(cur) > DETOUR_BESIDE_TOL:
+                    tried.append('%s needs %.2f m, robot at %.2f m' % (
+                        'left' if side < 0 else 'right', off, abs(cur)))
+                    continue
+                off = max(off, abs(cur))
             if off > DETOUR_MAX_OFFSET:
                 tried.append('%s needs %.2f m' % ('left' if side < 0 else 'right', off))
                 continue
@@ -942,9 +962,12 @@ def main():
                 continue
             path = route_to_path(pts, navigator)
             return path, ('lane shift %.2f m %s, object %.1f-%.1f m ahead, ramp %.1f m, '
-                          'back on the route %.1f m ahead' % (
-                              off, 'left' if shift > 0 else 'right', cum[a], cum[b], ramp,
-                              full_to + ramp)), 0
+                          'back on the route %.1f m ahead%s' % (
+                              off, 'left' if shift > 0 else 'right', cum[a], cum[b], ramp_in,
+                              full_to + ramp, ' (already beside the object)' if beside else '')), 0
+        if beside:
+            return None, ('object beside, no lane from here (%s) - backing up %.2f m' % (
+                '; '.join(tried), back_for_room)), back_for_room
         return None, 'no room: ' + '; '.join(tried), 0
 
     def on_static_map(x, y):
