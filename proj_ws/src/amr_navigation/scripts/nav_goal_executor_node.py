@@ -149,7 +149,10 @@ DETOUR_AFTER_S = 3.0     # s blocked (from collision_monitor stop) before a deto
 DETOUR_FRONT_M = 1.0     # m ahead of the bumper - scan points here = object still there
 DETOUR_SCAN_M = 5.0      # m - scan points this close to the robot are checked against the route
 DETOUR_LOOK_M = 4.5      # m along the route - stretch searched for the blocked part
-DETOUR_BLOCK_R = 0.45    # m - scan point this close to a route point = route blocked there
+DETOUR_BLOCK_R = 0.55    # m - scan point this close to a route point = route blocked there
+                         # (was 0.45: half width 0.40 + tracking error - an object
+                         # grazing the footprint stopped RPP but was 'not on the route')
+DETOUR_REAR_MARGIN = 0.30  # m - behind a detour backup must be clear this much further
 DETOUR_SIDE_CLEAR = 0.20 # m - robot side to object gap while passing it
 DETOUR_RAMP_M = 1.2      # m along the route to move over to the side lane (and back)
 DETOUR_RAMP_MIN = 0.8    # m - shortest ramp; less room in front -> back up first
@@ -928,16 +931,35 @@ def main():
                               full_to + ramp)), 0
         return None, 'no room: ' + '; '.join(tried), 0
 
+    def detour_rear_points(dist):
+        """Scan points behind the rear within `dist` + DETOUR_REAR_MARGIN
+        (footprint width + BACKUP_SIDE_M); None without a fresh scan."""
+        pts = scan_in_base()
+        if pts is None:
+            return None
+        w = FOOT_HALF_W + BACKUP_SIDE_M
+        return sum(1 for x, y in pts
+                   if FOOT_REAR - dist - DETOUR_REAR_MARGIN < x < FOOT_REAR and abs(y) < w)
+
     def send_detour(req):
         """Drive the station request `req` around the object; None on
         success, else why not."""
         path, info, back = plan_detour(req[1])
         if path is None and back > 0:
             navigator.get_logger().warn('nav_goal_executor_node: detour - ' + info)
-            if backup['n'] < BACKUP_MAX and start_backup(req, back):
+            rear = detour_rear_points(back)
+            if rear is None:
+                info += ' (backup not possible: no fresh scan)'
+            elif rear >= BACKUP_MIN_POINTS:
+                # Nav2 BackUp would fail on it and use up a backup (test 15:49)
+                info += ' (backup not possible: rear not clear, %d pts within %.2f m)' % (
+                    rear, back + DETOUR_REAR_MARGIN)
+            elif backup['n'] < BACKUP_MAX and start_backup(req, back):
                 backup['detour'] = True   # after it: plan the lane shift, not the route
                 return None
-            info += ' (backup not possible)'
+            else:
+                info += ' (backup not possible: %d/%d backups used here)' % (
+                    backup['n'], BACKUP_MAX)
         if path is None:
             navigator.get_logger().warn('nav_goal_executor_node: detour rejected - ' + info)
             return info
