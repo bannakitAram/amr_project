@@ -145,6 +145,7 @@ ROUTE_MAX_OFFSET = 0.5   # m - robot further than this from a route can't join i
 # the route past it. Rejected (normal wait) if it leaves the route corridor.
 DETOUR_AFTER_S = 3.0     # s blocked (from collision_monitor stop) before a detour is tried
 DETOUR_FRONT_M = 1.0     # m ahead of the bumper - scan points here = object still there
+DETOUR_OBJECT_M = 2.5    # m ahead of the bumper - points here keep the rejoin point clear
 DETOUR_REJOIN_M = 2.0    # m along the route from the robot - earliest rejoin point
 DETOUR_REJOIN_CLEAR = 0.6  # m - rejoin point at least this far from the object's points
 DETOUR_MAX_OFFSET = 1.0  # m - detour may leave the recorded route by at most this
@@ -684,6 +685,18 @@ def main():
                 c.call_async(ClearEntireCostmap.Request())
         return True
 
+    stuck = {'t0': None, 'where': None}  # first failure of a request at this spot
+
+    def stuck_for():
+        """s since the running request first failed here (restarts after
+        moving BACKUP_RESET_M)."""
+        here = tf2d('map', 'base_footprint')
+        now = time.time()
+        if stuck['t0'] is None or (here is not None and stuck['where'] is not None and math.hypot(
+                here[0] - stuck['where'][0], here[1] - stuck['where'][1]) > BACKUP_RESET_M):
+            stuck['t0'], stuck['where'] = now, here[:2] if here is not None else None
+        return now - stuck['t0']
+
     backup = {'active': False, 'req': None, 'saved': None, 'n': 0, 'where': None, 'pub_t': 0.0}
     backup_pub = navigator.create_publisher(Bool, '/nav_backup_active', 10)
     cm_get_client = navigator.create_client(GetParameters, CM_PARAMS + '/get_parameters')
@@ -725,10 +738,10 @@ def main():
         return True, pick_route(routes, dest, t.transform.translation.x,
                                 t.transform.translation.y, max_offset)
 
-    def object_ahead():
+    def object_ahead(depth=DETOUR_FRONT_M):
         """Scan points (base_footprint) of the object in front of the bumper."""
         pts = scan_in_base() or []
-        return [(x, y) for x, y in pts if FOOT_FRONT < x < FOOT_FRONT + DETOUR_FRONT_M
+        return [(x, y) for x, y in pts if FOOT_FRONT < x < FOOT_FRONT + depth
                 and abs(y) < FOOT_HALF_W + BACKUP_SIDE_M]
 
     def plan_detour(goal):
@@ -742,7 +755,7 @@ def main():
         if points is None or here is None:
             return None, 'robot is more than %.1f m from the route' % DETOUR_MAX_OFFSET
         c, s = math.cos(here[2]), math.sin(here[2])
-        obs = [(here[0] + x * c - y * s, here[1] + x * s + y * c) for x, y in object_ahead()]
+        obs = [(here[0] + x * c - y * s, here[1] + x * s + y * c) for x, y in object_ahead(DETOUR_OBJECT_M)]
         along, k = 0.0, None
         for i in range(1, len(points)):
             along += math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1])
@@ -925,6 +938,7 @@ def main():
                 if not resume:
                     backup['n'] = 0
                     backup['where'] = None
+                    stuck['t0'] = None
                 if approach['value'] is not None:
                     approach['value'].finish('failed', 'approach interrupted')
                     approach['value'] = None
@@ -1122,9 +1136,19 @@ def main():
                     counted = count_ghosts()
                     ghosts, kept = counted if counted is not None else (None, 0)
                     want, why = backup_wanted()
+                    stuck_s = stuck_for()
                     navigator.get_logger().info(
                         'nav_goal_executor_node: request failed - ghosts %s, keep-out %s, '
-                        'backup: %s' % (ghosts, kept, why))
+                        'stuck %.1f s, backup: %s' % (ghosts, kept, stuck_s, why))
+                    # RPP 'collision ahead' aborts FollowPath before collision_monitor
+                    # ever stops the robot: a route that keeps failing at the same
+                    # spot for DETOUR_AFTER_S is a static object -> go around it
+                    if req[0] == 'station' and stuck_s >= DETOUR_AFTER_S and \
+                            (ghosts is None or ghosts < GHOST_MIN_CELLS):
+                        detour_why = send_detour(req)
+                        if detour_why is None:
+                            continue
+                        alert('warn', 'สิ่งกีดขวางไม่ขยับ และอ้อมไม่ได้ (%s) - จอดรอ' % detour_why)
                     if want and ghosts is not None and ghosts < GHOST_MIN_CELLS and \
                             start_backup(req):
                         continue
