@@ -152,6 +152,11 @@ DETOUR_LOOK_M = 4.5      # m along the route - stretch searched for the blocked 
 DETOUR_BLOCK_R = 0.55    # m - scan point this close to a route point = route blocked there
                          # (was 0.45: half width 0.40 + tracking error - an object
                          # grazing the footprint stopped RPP but was 'not on the route')
+DETOUR_EARLY_M = 1.6     # m bumper -> object on the route: stop here while following a route
+                         # (~0.15 m braking at 0.4 m/s leaves >= 1.4 m: ramp 0.8 + gap 0.15 fit)
+                         # (RPP/FrontStop stopped 0.2-0.5 m short - no room left to shift)
+DETOUR_EARLY_HZ = 5.0    # early-stop check rate
+DETOUR_EARLY_MIN_LEFT = 1.5  # m - no early stop when the route ends closer than this
 DETOUR_REAR_MARGIN = 0.30  # m - behind a detour backup must be clear this much further
 DETOUR_SIDE_CLEAR = 0.20 # m - robot side to object gap while passing it
 DETOUR_RAMP_M = 1.2      # m along the route to move over to the side lane (and back)
@@ -801,8 +806,9 @@ def main():
         if points is None or here is None:
             return None, 'robot is more than %.1f m from the route' % DETOUR_MAX_OFFSET, 0
         c, s_ = math.cos(here[2]), math.sin(here[2])
-        obs = [(here[0] + x * c - y * s_, here[1] + x * s_ + y * c)
-               for x, y in (scan_in_base() or []) if math.hypot(x, y) < DETOUR_SCAN_M]
+        obs = [o for o in ((here[0] + x * c - y * s_, here[1] + x * s_ + y * c)
+                           for x, y in (scan_in_base() or []) if math.hypot(x, y) < DETOUR_SCAN_M)
+               if not on_static_map(*o)]
         n = len(points)
         cum = [0.0]
         for i in range(1, n):
@@ -930,6 +936,54 @@ def main():
                               off, 'left' if shift > 0 else 'right', cum[a], cum[b], ramp,
                               full_to + ramp)), 0
         return None, 'no room: ' + '; '.join(tried), 0
+
+    def on_static_map(x, y):
+        """(x, y) is a wall of the saved map (+-1 cell): not a new object."""
+        m = latest.get('map')
+        if m is None:
+            return False
+        r = m.info.resolution
+        ci = int((x - m.info.origin.position.x) / r)
+        cj = int((y - m.info.origin.position.y) / r)
+        for j in range(cj - 1, cj + 2):
+            for i in range(ci - 1, ci + 2):
+                if 0 <= i < m.info.width and 0 <= j < m.info.height and \
+                        m.data[j * m.info.width + i] >= 65:
+                    return True
+        return False
+
+    early = {'t': 0.0}
+
+    def object_on_route_ahead():
+        """(n points, bumper distance) of new objects (not map walls) on the
+        route being followed within DETOUR_EARLY_M of the bumper, or None."""
+        path = route_plan['value']
+        here = tf2d('map', 'base_footprint')
+        pts = scan_in_base()
+        if path is None or here is None or pts is None or len(path.poses) < 2:
+            return None
+        xy = [(p.pose.position.x, p.pose.position.y) for p in path.poses]
+        k = min(range(len(xy)), key=lambda i: math.hypot(xy[i][0] - here[0], xy[i][1] - here[1]))
+        ahead, d = [], 0.0
+        for i in range(k, len(xy)):
+            if i > k:
+                d += math.hypot(xy[i][0] - xy[i - 1][0], xy[i][1] - xy[i - 1][1])
+            ahead.append((xy[i], d))
+        if ahead[-1][1] < DETOUR_EARLY_MIN_LEFT:
+            return None   # close to the end: station area, leave it to RPP/approach
+        reach = FOOT_FRONT + DETOUR_EARLY_M
+        ahead = [a for a in ahead if a[1] <= reach]
+        c, s_ = math.cos(here[2]), math.sin(here[2])
+        n, nearest = 0, None
+        for x, y in pts:
+            if not (FOOT_FRONT - 0.05 < x < reach + DETOUR_BLOCK_R):
+                continue
+            ox, oy = here[0] + x * c - y * s_, here[1] + x * s_ + y * c
+            dist, along = min((math.hypot(px - ox, py - oy), dd) for (px, py), dd in ahead)
+            if dist < DETOUR_BLOCK_R and not on_static_map(ox, oy):
+                n += 1   # along = route point beside the object, not one before it
+                nearest = along if nearest is None else min(nearest, along)
+        return (n, nearest - FOOT_FRONT) if n >= BACKUP_MIN_POINTS else None
 
     def detour_rear_points(dist):
         """Scan points behind the rear within `dist` + DETOUR_REAR_MARGIN
@@ -1077,6 +1131,9 @@ def main():
     navigator.create_subscription(LaserScan, '/scan_filtered', on_scan, qos_profile_sensor_data)
     navigator.create_subscription(
         OccupancyGrid, '/global_costmap/costmap', lambda m: latest.__setitem__('gcostmap', m),
+        QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+    navigator.create_subscription(
+        OccupancyGrid, '/map', lambda m: latest.__setitem__('map', m),
         QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
     navigator.create_subscription(
         OccupancyGrid, '/keepout_filter_mask', on_keepout,
@@ -1236,13 +1293,37 @@ def main():
                     continue
                 blocked['cleared'] = False
                 req, blocked['req'] = blocked['req'], None
-                if blocked.pop('detour', False) and len(object_ahead()) >= BACKUP_MIN_POINTS:
+                if blocked.pop('detour', False):
                     why = send_detour(req)
-                    if why is not None:
+                    if why is None:
+                        continue
+                    if not why.startswith('no object'):
                         wait_for_clear(req, BLOCK_RETRY_S,
                                        'สิ่งกีดขวางไม่ขยับ และอ้อมไม่ได้ (%s) - จอดรอ' % why)
-                    continue
+                        continue
+                    # object gone in the wait: carry on along the route
                 pending['value'] = req + (True,)
+
+            # early stop: object on the route ahead -> stand DETOUR_EARLY_M
+            # short of it, so a lane shift has room after DETOUR_AFTER_S
+            if task_active['value'] and route_plan['value'] is not None and \
+                    current['req'] is not None and current['req'][0] == 'station' and \
+                    not backup['active'] and time.time() - early['t'] > 1.0 / DETOUR_EARLY_HZ:
+                early['t'] = time.time()
+                found = object_on_route_ahead()
+                if found is not None:
+                    req = current['req']
+                    cancel_and_wait()
+                    task_active['value'] = False
+                    station['value'] = None
+                    current['req'] = None
+                    navigator.get_logger().warn(
+                        'nav_goal_executor_node: object on the route %.2f m ahead of the bumper '
+                        '(%d pts) - stopping, detour in %.0f s if it stays' % (
+                            found[1], found[0], DETOUR_AFTER_S))
+                    wait_for_clear(req, DETOUR_AFTER_S,
+                                   'มีสิ่งกีดขวางบนเส้นทาง - จอดรอ %.0f วิ ถ้าไม่ขยับจะอ้อม' % DETOUR_AFTER_S)
+                    blocked['detour'] = True
 
             # door wait: stand still while door_manager holds, then carry on
             door_holding = door['hold'] and time.time() - door['t'] < DOOR_HOLD_STALE_S
