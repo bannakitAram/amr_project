@@ -145,7 +145,10 @@ ROUTE_MAX_OFFSET = 0.5   # m - robot further than this from a route can't join i
 # the route past it. Rejected (normal wait) if it leaves the route corridor.
 DETOUR_AFTER_S = 3.0     # s blocked (from collision_monitor stop) before a detour is tried
 DETOUR_FRONT_M = 1.0     # m ahead of the bumper - scan points here = object still there
-DETOUR_OBJECT_M = 2.5    # m ahead of the bumper - points here keep the rejoin point clear
+DETOUR_SCAN_M = 5.0      # m - scan points this close to the robot are checked against the route
+DETOUR_LOOK_M = 4.5      # m along the route - stretch searched for the blocked part
+DETOUR_BLOCK_R = 0.45    # m - scan point this close to a route point = route blocked there
+DETOUR_PAST_M = 0.8      # m along the route past the last blocked point - earliest rejoin
 DETOUR_REJOIN_M = 2.0    # m along the route from the robot - earliest rejoin point
 DETOUR_REJOIN_CLEAR = 0.6  # m - rejoin point at least this far from the object's points
 DETOUR_MAX_OFFSET = 1.0  # m - detour may leave the recorded route by at most this
@@ -780,17 +783,30 @@ def main():
         if points is None or here is None:
             return None, 'robot is more than %.1f m from the route' % DETOUR_MAX_OFFSET
         c, s = math.cos(here[2]), math.sin(here[2])
-        obs = [(here[0] + x * c - y * s, here[1] + x * s + y * c) for x, y in object_ahead(DETOUR_OBJECT_M)]
-        along, k = 0.0, None
+        obs = [(here[0] + x * c - y * s, here[1] + x * s + y * c)
+               for x, y in (scan_in_base() or []) if math.hypot(x, y) < DETOUR_SCAN_M]
+        # walk the route ahead: last point the object blocks, then the first
+        # clear point at least DETOUR_PAST_M past it (and DETOUR_REJOIN_M from here)
+        cum = [0.0]
         for i in range(1, len(points)):
-            along += math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1])
-            if along >= DETOUR_REJOIN_M and all(
-                    math.hypot(points[i][0] - ox, points[i][1] - oy) > DETOUR_REJOIN_CLEAR
-                    for ox, oy in obs):
-                k = i
-                break
+            cum.append(cum[-1] + math.hypot(points[i][0] - points[i - 1][0],
+                                            points[i][1] - points[i - 1][1]))
+
+        def blocked_at(i, r):
+            return any(math.hypot(points[i][0] - ox, points[i][1] - oy) < r for ox, oy in obs)
+        hit = [i for i in range(len(points)) if cum[i] <= DETOUR_LOOK_M and
+               blocked_at(i, DETOUR_BLOCK_R)]
+        if not hit:
+            return None, 'no object on the route within %.1f m (scan)' % DETOUR_LOOK_M
+        last = hit[-1]
+        k = next((i for i in range(last + 1, len(points))
+                  if cum[i] >= max(DETOUR_REJOIN_M, cum[last] + DETOUR_PAST_M) and
+                  not blocked_at(i, DETOUR_REJOIN_CLEAR)), None)
         if k is None:
             return None, 'no clear route point past the object'
+        along = cum[k]
+        blocked_pts = [o for o in obs if any(math.hypot(points[i][0] - o[0], points[i][1] - o[1])
+                                             < DETOUR_BLOCK_R for i in hit)]
         start = PoseStamped()
         start.header.frame_id = 'map'
         start.header.stamp = navigator.get_clock().now().to_msg()
@@ -805,6 +821,11 @@ def main():
         length = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(xy, xy[1:]))
         if length > DETOUR_MAX_RATIO * along + 1.0:
             return None, 'detour too long (%.1f m for %.1f m of route)' % (length, along)
+        near = min((math.hypot(x - ox, y - oy) for x, y in xy for ox, oy in blocked_pts),
+                   default=99.0)
+        if near < FOOT_HALF_W:
+            return None, ('planned path still runs through the object (%.2f m) - global '
+                          'costmap does not show it yet' % near)
         worst = 0.0
         for x, y in xy:
             if in_keepout(x, y):
@@ -814,8 +835,9 @@ def main():
             return None, 'detour leaves the route by %.2f m (max %.1f)' % (worst, DETOUR_MAX_OFFSET)
         path.poses += route_to_path(points[k + 1:], navigator).poses if k + 1 < len(points) else []
         path.header.stamp = navigator.get_clock().now().to_msg()
-        return path, '%.1f m around, max %.2f m off the route, rejoin %.1f m ahead' % (
-            length, worst, along)
+        return path, ('%.1f m around, max %.2f m off the route, object %.1f-%.1f m ahead, '
+                      'rejoin %.1f m ahead, closest %.2f m' % (
+                          length, worst, cum[hit[0]], cum[hit[-1]], along, near))
 
     def send_detour(req):
         """Drive the station request `req` around the object; None on
