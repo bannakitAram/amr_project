@@ -1444,6 +1444,7 @@ class AmrControlPanel(tk.Tk):
         self._nav_map_name = None
         self._status_poll_job = None
         self._rosboard_proc = None
+        self._rosboard_checked = False  # stale rosboard replaced once per panel run
         self._lichtblick_proc = None
         self._mobile_proc = None
         self._qr_photos = []  # keep references so Tk doesn't GC the images
@@ -3297,6 +3298,7 @@ class AmrControlPanel(tk.Tk):
     # ---------- rosboard / Lichtblick / mobile monitor QR ----------
     def _ensure_monitors_then_show_qr(self):
         ip = get_local_ip()
+        self._replace_stale_rosboard(ip)
 
         if not is_port_open(ip, ROSBOARD_PORT):
             self._start_rosboard()
@@ -3331,6 +3333,49 @@ class AmrControlPanel(tk.Tk):
                 mobile_url = build_mobile_url(ip)
 
         self.after(0, lambda: self._show_monitor_qr(mobile_url, rosboard_url))
+
+    def _replace_stale_rosboard(self, ip):
+        """Once per panel run: a rosboard_node left over from an earlier panel
+        (started with setsid, so it outlives the panel) still holds the port
+        and serves the code it was started with - the new panel's rosboard
+        then fails to bind and the phone never sees a rebuilt rosboard.
+        Stop it here so _start_rosboard starts the installed one."""
+        if self._rosboard_checked:
+            return
+        self._rosboard_checked = True
+        if self._rosboard_proc is not None and self._rosboard_proc.poll() is None:
+            return  # ours
+        # only real rosboard processes: argv[1] is the rosboard_node script, or
+        # `ros2 run rosboard rosboard_node` (a shell whose command line merely
+        # mentions rosboard_node must not be killed)
+        pids = []
+        for d in os.listdir('/proc'):
+            if not d.isdigit() or int(d) == os.getpid():
+                continue
+            try:
+                if os.stat('/proc/' + d).st_uid != os.getuid():
+                    continue
+                with open('/proc/%s/cmdline' % d, 'rb') as f:
+                    argv = f.read().decode(errors='replace').split('\0')
+            except OSError:
+                continue
+            if (len(argv) > 1 and argv[1].endswith('/rosboard/rosboard_node')) or \
+                    argv[1:5] == ['run', 'rosboard', 'rosboard_node', ''] or \
+                    (len(argv) > 4 and argv[2:5] == ['run', 'rosboard', 'rosboard_node']):
+                pids.append(int(d))
+        if not pids:
+            return
+        self.ros.log.append(('W', f'[W] panel: stopping old rosboard (pid {pids}) to start the installed one'))
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid in pids:
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+            for _ in range(10):
+                time.sleep(0.3)
+                if not is_port_open(ip, ROSBOARD_PORT):
+                    return
 
     def _start_rosboard(self):
         if self._rosboard_proc is not None and self._rosboard_proc.poll() is None:
@@ -3453,6 +3498,7 @@ class AmrControlPanel(tk.Tk):
     # ---------- goal_picker QR (Navigation mode: tap/draw a destination) ----------
     def _ensure_nav_monitors_then_show_qr(self):
         ip = get_local_ip()
+        self._replace_stale_rosboard(ip)
 
         if not is_port_open(ip, ROSBOARD_PORT):
             self._start_rosboard()
