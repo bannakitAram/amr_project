@@ -164,6 +164,7 @@ DETOUR_EARLY_HZ = 5.0    # early-stop check rate
 DETOUR_EARLY_MIN_LEFT = 1.5  # m - no early stop when the route ends closer than this
 DETOUR_EXIT_EXTRA = 0.70  # m - stay in the side lane this much longer: RPP's 0.6 m lookahead
                           # cut the way back and swung the rear into the object (test 16:05)
+DETOUR_SKIP_START = 0.30  # m along - poses the robot already covers are not footprint-checked
 DETOUR_SLOPE = 0.55       # m sideways per m along (~29 deg) - steepest lane change
 DETOUR_REAR_MARGIN = 0.30  # m - behind a detour backup must be clear this much further
 DETOUR_SIDE_CLEAR = 0.20 # m - robot side to object gap while passing it (0.10 tried 2026-11-24
@@ -989,6 +990,9 @@ def main():
             for i in range(n):
                 if cum[i] > cum[iN] + ret + 0.5:
                     break
+                if cum[i] < DETOUR_SKIP_START:
+                    continue   # where the robot already stands (its real yaw differs
+                               # from the route's; touched a map wall, test 16:21)
                 bad = footprint_hit(*pts[i])
                 if bad:
                     bad = '%s at %.1f m along' % (bad, cum[i])
