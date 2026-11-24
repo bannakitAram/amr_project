@@ -6,7 +6,7 @@ stations file; the map name and folder come from the control panel's
 /amr_stations, so doors exist only while Navigation runs on a map):
 
   doors:
-    - {name: A, x: 3.20, y: -1.50, radius: 2.5, relay: 1, pulse_s: 0.5, wait_s: 5.0}
+    - {name: A, x: 3.20, y: -1.50, radius: 2.5, relay: 1, pulse_s: 0.5, wait_s: 0.0, repulse_s: 1.0}
     - {name: S, x: 8.00, y: 2.00, radius: 1.5, relay: 0, ...}   sensor door
 
 relay 0 = sensor door (opens by itself when the robot is very close): no
@@ -60,7 +60,9 @@ wait is an obstacle for collision_monitor (the executor then waits for it).
 Re-pulse (repulse_s > 0, relay doors only): while the robot is still inside
 a door it triggered in Auto, the relay is pulsed again every repulse_s so a
 door whose controller restarts its close timer on each pulse stays open
-until the robot has passed. Stops on leaving the zone or after REPULSE_MAX_S.
+until the robot has passed. Stops only when the robot leaves the zone
+(radius + hysteresis), the door is deleted or the map changes - a robot
+parked inside a door zone keeps the door pulsing.
 ONLY for door controllers where a pulse = open / restart timer. On a TOGGLE
 controller (pulse while open = close) set repulse_s: 0 for that door.
 
@@ -98,7 +100,6 @@ AUTO_HOLD_S = 1.5        # /cmd_vel_nav non-zero within this = Auto driving
 SLOW_MARGIN_M = 0.5      # sensor door: slow down this far before the short zone
 SLOW_SETTLE_S = 1.0      # sensor door: slow this long before the short zone
 BACKUP_STALE_S = 1.0     # /nav_backup_active older than this = not backing up
-REPULSE_MAX_S = 60.0     # stop re-pulsing after this long in one door zone
 RESEND_S = 2.0           # re-send collision_monitor polygon state
 CM_SERVICE = '/collision_monitor/set_parameters_atomically'
 
@@ -114,7 +115,7 @@ class DoorManager(Node):
         self.default_radius = float(self.declare_parameter('radius', 2.5).value)
         self.sensor_radius = float(self.declare_parameter('sensor_radius', 1.5).value)
         self.default_pulse_s = float(self.declare_parameter('pulse_s', 0.5).value)
-        self.default_wait_s = float(self.declare_parameter('wait_s', 5.0).value)
+        self.default_wait_s = float(self.declare_parameter('wait_s', 0.0).value)
         # 0 = one pulse per pass (old behaviour); per door 'repulse_s' overrides
         self.default_repulse_s = float(self.declare_parameter('repulse_s', 0.0).value)
         self.robot_frame = self.declare_parameter('robot_frame', 'base_footprint').value
@@ -447,11 +448,6 @@ class DoorManager(Node):
         """Pulse again every repulse_s while inside a door triggered in Auto."""
         rp = self.repulse.get(d['name'])
         if rp is None or d.get('repulse_s', 0.0) <= 0:
-            return
-        if now - rp[0] > REPULSE_MAX_S:
-            self.get_logger().warn('door %s: re-pulse stopped after %.0f s in zone'
-                                   % (d['name'], REPULSE_MAX_S))
-            del self.repulse[d['name']]
             return
         if now - rp[1] < d['repulse_s'] or any(r == d['relay'] for _, r in self.pending_off):
             return

@@ -5,4 +5,5 @@ doors:
   radius: 2.5
   relay: 3
   pulse_s: 0.5
-  wait_s: 5.0
+  wait_s: 0.0
+  repulse_s: 1.0
