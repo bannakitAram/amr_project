@@ -143,8 +143,8 @@ CHAIN_FRESH_S = 0.5      # s - older cmd_vel_smoothed/cmd_vel counts as not publ
 ROUTE_MAX_OFFSET = 0.5   # m - robot further than this from a route can't join it
 
 # Temporary detour on a fixed route: an object that has stopped the robot for
-# DETOUR_AFTER_S is driven around with the planner (global costmap), back onto
-# the route past it. Rejected (normal wait) if it leaves the route corridor.
+# DETOUR_AFTER_S is passed with a lane shift of the route, back onto the
+# route past it. Rejected (normal wait) if it leaves the route corridor.
 DETOUR_AFTER_S = 3.0     # s blocked (from collision_monitor stop) before a detour is tried
 DETOUR_FRONT_M = 1.0     # m ahead of the bumper - scan points here = object still there
 DETOUR_SCAN_M = 5.0      # m - scan points this close to the robot are checked against the route
@@ -155,7 +155,8 @@ DETOUR_RAMP_M = 1.2      # m along the route to move over to the side lane (and 
 DETOUR_RAMP_MIN = 0.8    # m - shortest ramp; less room in front -> back up first
 DETOUR_FRONT_GAP = 0.15  # m - lane must be reached this far before the bumper meets the object
 DETOUR_BACK_MAX = 0.8    # m - longest backup to make room for the ramp
-DETOUR_MAX_OFFSET = 1.0  # m - detour may leave the recorded route by at most this
+DETOUR_MAX_OFFSET = 1.2  # m - detour may leave the recorded route by at most this
+                         # (was 1.0: Station_a->b test 2026-11-24 15:37 needed 1.03 m left)
 DETOUR_FOOT_MARGIN = 0.05  # m - footprint check against the global costmap / scan
 STATION_MATCH = 0.05     # m - a station goal belongs to the saved station this close
 
