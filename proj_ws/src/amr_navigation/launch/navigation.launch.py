@@ -15,6 +15,7 @@ Usage:
     ros2 launch amr_navigation navigation.launch.py map:=/path/to/map.yaml
     ros2 launch amr_navigation navigation.launch.py map:=/path/to/map.yaml use_sim_time:=true
 """
+import math
 import os
 import tempfile
 
@@ -29,6 +30,19 @@ from launch_ros.actions import Node
 KEEPOUT_INFO = '/keepout_costmap_filter_info'
 SPEED_INFO = '/speed_costmap_filter_info'
 ZONE_SPEED_TOPIC = '/zone_speed_limit'
+HOME_FOLLOW_M = 0.5   # m - HOME this close to nav2_params' initial_pose = the start spot
+
+
+def home_pose(map_yaml):
+    """(x, y, yaw) of the HOME station in <map>_stations.yaml, or None."""
+    try:
+        with open(map_yaml[:-5] + '_stations.yaml') as f:
+            for st in (yaml.safe_load(f) or {}).get('stations', []):
+                if st.get('name') == 'HOME':
+                    return float(st['x']), float(st['y']), float(st.get('theta', 0.0))
+    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError):
+        pass
+    return None
 
 
 def zone_filters(context):
@@ -57,6 +71,20 @@ def zone_filters(context):
                                   'enabled': True, 'filter_info_topic': SPEED_INFO,
                                   'speed_limit_topic': ZONE_SPEED_TOPIC}
         rp['plugins'] = plugins
+    home = home_pose(map_yaml)
+    ip = params['amcl']['ros__parameters'].setdefault('initial_pose', {})
+    ix, iy = float(ip.get('x', 0.0)), float(ip.get('y', 0.0))
+    if home is not None and math.hypot(home[0] - ix, home[1] - iy) <= HOME_FOLLOW_M:
+        # HOME is the start spot of this map (robot parked there when
+        # Navigation starts): AMCL starts at HOME, so nudging HOME (FR2_e1_e1:
+        # 15 cm off the wall) moves the start pose with it. A HOME far from
+        # nav2_params' initial_pose (basement_e1: 37 m) is NOT the start spot
+        # - the configured pose stays, or AMCL would lock onto a wrong place.
+        ip.update({'x': home[0], 'y': home[1], 'z': 0.0, 'yaw': home[2]})
+        print('[navigation.launch] AMCL initial pose = HOME (%.3f, %.3f, %.3f)' % home)
+    elif home is not None:
+        print('[navigation.launch] HOME (%.1f, %.1f) is %.1f m from initial_pose - not used '
+              'as the start pose' % (home[0], home[1], math.hypot(home[0] - ix, home[1] - iy)))
     out = tempfile.NamedTemporaryFile('w', prefix='nav2_params_zones_', suffix='.yaml',
                                       delete=False)
     yaml.safe_dump(params, out, sort_keys=False)
