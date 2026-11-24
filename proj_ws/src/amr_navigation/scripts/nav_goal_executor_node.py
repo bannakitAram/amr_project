@@ -91,6 +91,13 @@ routes, maps switched to the planner on the panel's Auto page (read at every
 send), and tapped goals/drawn paths, still use the planner. The final
 approach and the waiting above work the same on a route.
 
+Temporary detour (fixed routes only): when collision_monitor has stopped the
+robot for DETOUR_AFTER_S and the object is still in front of the bumper, the
+planner (global costmap) plans from the robot to a route point >= DETOUR_REJOIN_M
+ahead and clear of the object; that path + the rest of the route is followed.
+Rejected (normal wait-and-retry) if it goes into keep-out, strays more than
+DETOUR_MAX_OFFSET from the route or is too long. collision_monitor stays as is.
+
 A new goal or path always preempts whatever is currently running (cancels
 the in-progress task first) - the operator's most recent tap wins, same as
 re-pressing "2D Nav Goal" in RViz.
@@ -132,6 +139,16 @@ FAILED_RETRY_S = 3.0     # s before re-sending a request Nav2 failed (was 10: a 
 CHAIN_FRESH_S = 0.5      # s - older cmd_vel_smoothed/cmd_vel counts as not publishing
 
 ROUTE_MAX_OFFSET = 0.5   # m - robot further than this from a route can't join it
+
+# Temporary detour on a fixed route: an object that has stopped the robot for
+# DETOUR_AFTER_S is driven around with the planner (global costmap), back onto
+# the route past it. Rejected (normal wait) if it leaves the route corridor.
+DETOUR_AFTER_S = 3.0     # s blocked (from collision_monitor stop) before a detour is tried
+DETOUR_FRONT_M = 1.0     # m ahead of the bumper - scan points here = object still there
+DETOUR_REJOIN_M = 2.0    # m along the route from the robot - earliest rejoin point
+DETOUR_REJOIN_CLEAR = 0.6  # m - rejoin point at least this far from the object's points
+DETOUR_MAX_OFFSET = 1.0  # m - detour may leave the recorded route by at most this
+DETOUR_MAX_RATIO = 2.5   # detour length <= ratio * route length it replaces + 1 m
 STATION_MATCH = 0.05     # m - a station goal belongs to the saved station this close
 
 APPROACH_DIST = 1.0      # m - pre-goal distance behind the station
@@ -225,7 +242,7 @@ def load_routes(path):
         return []
 
 
-def pick_route(routes, dest, x, y):
+def pick_route(routes, dest, x, y, max_offset=ROUTE_MAX_OFFSET):
     """Remaining [x, y, yaw] points of the route to `dest` the robot is
     closest to, starting at its nearest point; None if none is within
     ROUTE_MAX_OFFSET."""
@@ -235,7 +252,7 @@ def pick_route(routes, dest, x, y):
             continue
         dists = [math.hypot(p[0] - x, p[1] - y) for p in r['poses']]
         i = min(range(len(dists)), key=dists.__getitem__)
-        if dists[i] <= ROUTE_MAX_OFFSET and (best is None or dists[i] < best[0]):
+        if dists[i] <= max_offset and (best is None or dists[i] < best[0]):
             best = (dists[i], r['poses'][min(i, len(dists) - 2):])
     return best[1] if best else None
 
@@ -692,7 +709,7 @@ def main():
         stations_info['stations'] = d.get('stations', [])
         stations_info['routes_file'] = d.get('routes_file', '')
 
-    def station_route(goal):
+    def station_route(goal, max_offset=ROUTE_MAX_OFFSET):
         """(use_route, points) for a station goal. use_route False = the map
         has no routes; points None = it has, but none usable from here."""
         routes = load_routes(stations_info['routes_file']) if stations_info['routes_file'] else []
@@ -706,7 +723,77 @@ def main():
         except Exception:
             return True, None
         return True, pick_route(routes, dest, t.transform.translation.x,
-                                t.transform.translation.y)
+                                t.transform.translation.y, max_offset)
+
+    def object_ahead():
+        """Scan points (base_footprint) of the object in front of the bumper."""
+        pts = scan_in_base() or []
+        return [(x, y) for x, y in pts if FOOT_FRONT < x < FOOT_FRONT + DETOUR_FRONT_M
+                and abs(y) < FOOT_HALF_W + BACKUP_SIDE_M]
+
+    def plan_detour(goal):
+        """(Path, info) going around the object and back onto the route to
+        `goal`, or (None, why not)."""
+        try:
+            _, points = station_route(goal, DETOUR_MAX_OFFSET)
+        except (OSError, KeyError, TypeError, AttributeError, yaml.YAMLError) as ex:
+            return None, 'bad routes file: %s' % ex
+        here = tf2d('map', 'base_footprint')
+        if points is None or here is None:
+            return None, 'robot is more than %.1f m from the route' % DETOUR_MAX_OFFSET
+        c, s = math.cos(here[2]), math.sin(here[2])
+        obs = [(here[0] + x * c - y * s, here[1] + x * s + y * c) for x, y in object_ahead()]
+        along, k = 0.0, None
+        for i in range(1, len(points)):
+            along += math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1])
+            if along >= DETOUR_REJOIN_M and all(
+                    math.hypot(points[i][0] - ox, points[i][1] - oy) > DETOUR_REJOIN_CLEAR
+                    for ox, oy in obs):
+                k = i
+                break
+        if k is None:
+            return None, 'no clear route point past the object'
+        start = PoseStamped()
+        start.header.frame_id = 'map'
+        start.header.stamp = navigator.get_clock().now().to_msg()
+        start.pose.position.x, start.pose.position.y = here[0], here[1]
+        start.pose.orientation.z = math.sin(here[2] / 2.0)
+        start.pose.orientation.w = math.cos(here[2] / 2.0)
+        rejoin = route_to_path([points[k]], navigator).poses[0]
+        path = navigator.getPath(start, rejoin, planner_id='GridBased', use_start=True)
+        if path is None or not path.poses:
+            return None, 'planner found no way around'
+        xy = [(p.pose.position.x, p.pose.position.y) for p in path.poses]
+        length = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(xy, xy[1:]))
+        if length > DETOUR_MAX_RATIO * along + 1.0:
+            return None, 'detour too long (%.1f m for %.1f m of route)' % (length, along)
+        worst = 0.0
+        for x, y in xy:
+            if in_keepout(x, y):
+                return None, 'detour runs into a keep-out zone at (%.2f, %.2f)' % (x, y)
+            worst = max(worst, min(math.hypot(x - p[0], y - p[1]) for p in points))
+        if worst > DETOUR_MAX_OFFSET:
+            return None, 'detour leaves the route by %.2f m (max %.1f)' % (worst, DETOUR_MAX_OFFSET)
+        path.poses += route_to_path(points[k + 1:], navigator).poses if k + 1 < len(points) else []
+        path.header.stamp = navigator.get_clock().now().to_msg()
+        return path, '%.1f m around, max %.2f m off the route, rejoin %.1f m ahead' % (
+            length, worst, along)
+
+    def send_detour(req):
+        """Drive the station request `req` around the object; None on
+        success, else why not."""
+        path, info = plan_detour(req[1])
+        if path is None:
+            navigator.get_logger().warn('nav_goal_executor_node: detour rejected - ' + info)
+            return info
+        navigator.get_logger().warn('nav_goal_executor_node: temporary detour - ' + info)
+        current['req'] = req
+        station['value'] = req[1]
+        route_plan['value'] = path
+        if not sent(navigator.followPath(path), 'detour'):
+            return 'Nav2 rejected the detour'
+        alert('warn', 'สิ่งกีดขวางไม่ขยับ - ใช้ทางอ้อมชั่วคราวแล้วกลับเข้าเส้นทางเดิม')
+        return None
 
     def on_slipping(msg):
         t = time.time()
@@ -876,6 +963,8 @@ def main():
                             'nav_goal_executor_node: bad routes file: %s' % ex)
                         use_route, points = True, None
                     if use_route:
+                        if points is None and resume and send_detour(current['req']) is None:
+                            continue  # off the route after a detour: rejoin it
                         if points is None:
                             current['req'] = None
                             nav_event('failed')
@@ -951,8 +1040,11 @@ def main():
                     task_active['value'] = False
                     station['value'] = None
                     current['req'] = None
-                    wait_for_clear(req, BLOCK_RETRY_S,
+                    on_route = req[0] == 'station' and route_plan['value'] is not None
+                    wait_for_clear(req, max(0.0, DETOUR_AFTER_S - BLOCK_S) if on_route
+                                   else BLOCK_RETRY_S,
                                    'มีสิ่งกีดขวาง - จอดรอ จะไปต่ออัตโนมัติเมื่อทางโล่ง')
+                    blocked['detour'] = on_route
             else:
                 blocked['since'] = None
             if blocked['req'] is not None and time.time() > blocked['resend_at']:
@@ -962,8 +1054,14 @@ def main():
                     blocked['resend_at'] = time.time() + GHOST_SETTLE_S
                     continue
                 blocked['cleared'] = False
-                pending['value'] = blocked['req'] + (True,)
-                blocked['req'] = None
+                req, blocked['req'] = blocked['req'], None
+                if blocked.pop('detour', False) and len(object_ahead()) >= BACKUP_MIN_POINTS:
+                    why = send_detour(req)
+                    if why is not None:
+                        wait_for_clear(req, BLOCK_RETRY_S,
+                                       'สิ่งกีดขวางไม่ขยับ และอ้อมไม่ได้ (%s) - จอดรอ' % why)
+                    continue
+                pending['value'] = req + (True,)
 
             # door wait: stand still while door_manager holds, then carry on
             door_holding = door['hold'] and time.time() - door['t'] < DOOR_HOLD_STALE_S
