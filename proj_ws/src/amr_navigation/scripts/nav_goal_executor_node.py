@@ -957,6 +957,7 @@ def main():
         wl = [wall_dist(i, 1.0) for i in range(E + 1)]
         wr = [wall_dist(i, -1.0) for i in range(E + 1)]
         half = FOOT_HALF_W + DETOUR_FOOT_MARGIN
+        body_obj = []   # scan points a leaning footprint touched: keep clear of the whole body
 
         def allowed(i):
             # walls are continuous: the whole body (rear .. bumper) must fit
@@ -964,7 +965,9 @@ def main():
                    if FOOT_REAR - DETOUR_FOOT_MARGIN <= cum[j] - cum[i] <= FOOT_FRONT +
                    DETOUR_FOOT_MARGIN] or [i]
             left_room, right_room = min(wl[j] for j in win), min(wr[j] for j in win)
-            iv = [(lt - need, lt + need) for a_, lt in allobj if lo_a <= a_ - cum[i] <= hi_a]
+            iv = [(lt - need, lt + need) for a_, lt in allobj if lo_a <= a_ - cum[i] <= hi_a] + \
+                [(lt - need, lt + need) for a_, lt in body_obj
+                 if FOOT_REAR - DETOUR_FOOT_MARGIN <= a_ - cum[i] <= FOOT_FRONT + DETOUR_FOOT_MARGIN]
             hold = cum[i] <= last - FOOT_REAR + DETOUR_EXIT_EXTRA
             return [k for k, v in enumerate(grid_s)
                     if v + half <= left_room + 1e-6 and -v + half <= right_room + 1e-6 and
@@ -1047,6 +1050,15 @@ def main():
                 # the real (leaning) footprint touched something the per-point wall
                 # model missed: shrink the room on that side around there, re-plan
                 hx, hy = hit_at
+                if bad.startswith('scan point'):
+                    # an object, not a wall: keep the lane `need` from it all along
+                    # the body (shrinking the whole side like a wall pinned the
+                    # lane to one side too long to get back, test 0.10 m)
+                    jh = min(range(E + 1), key=lambda q: math.hypot(
+                        points[q][0] - hx, points[q][1] - hy))
+                    body_obj.append((cum[jh], lateral(jh, (hx, hy))))
+                    last_bad = 'lane hits %s at %.1f m along' % (bad, cum[i])
+                    continue
                 side_left = lateral(i, (hx, hy)) > off[i]
                 for j in range(E + 1):
                     if abs(cum[j] - cum[i]) <= FOOT_FRONT - FOOT_REAR:
