@@ -29,3 +29,6 @@ frames_*.pdf
 # rosbags recorded from the goal_picker page
 bags/
 proj_ws/src/amr_navigation/maps/*_edit.png
+
+# backups written by route_tools / map edits
+*.bak
