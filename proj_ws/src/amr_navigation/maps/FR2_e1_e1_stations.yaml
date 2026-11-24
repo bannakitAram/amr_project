@@ -9,5 +9,13 @@ stations:
   theta: 1.513
 - name: HOME
   x: 0.0
-  y: 0.0
+  y: 0.15
   theta: 0.0
+- name: doo
+  x: 39.063
+  y: 4.547
+  theta: 0.022
+- name: start0
+  x: 5.044
+  y: 0.726
+  theta: -1.564
