@@ -206,6 +206,9 @@ def compress_image(msg, output):
     except OSError as e:
         output["_error"] = str(e)    
 
+OCC_GRID_MAX_PX = 2048   # AMR: max map image side sent to the browser (was 800)
+
+
 def compress_occupancy_grid(msg, output):
     output["_data"] = []
     output["__comp"] = ["data"]
@@ -217,8 +220,17 @@ def compress_occupancy_grid(msg, output):
     try:
         occupancy_map = np.array(msg.data, dtype=np.uint16).reshape(msg.info.height, msg.info.width)[::-1,:]
 
-        while occupancy_map.shape[0] > 800 or occupancy_map.shape[1] > 800:
-            occupancy_map = occupancy_map[::2,::2]
+        # AMR: limit raised 800 -> OCC_GRID_MAX_PX (goal_picker: FR2 map
+        # 1723 px was shown at 20 cm/px, now 5 cm/px), and halving keeps the
+        # most "solid" cell of each 2x2 block (occupied > free > unknown)
+        # instead of a stride, so 1-cell walls/posts no longer vanish.
+        while occupancy_map.shape[0] > OCC_GRID_MAX_PX or occupancy_map.shape[1] > OCC_GRID_MAX_PX:
+            v = occupancy_map.astype(np.int32)
+            v[v > 100] = -1                       # unknown (-1 read as uint16)
+            h, w = v.shape
+            v = np.pad(v, ((0, h % 2), (0, w % 2)), constant_values=-1)
+            v = v.reshape(v.shape[0] // 2, 2, v.shape[1] // 2, 2).max(axis=(1, 3))
+            occupancy_map = np.where(v < 0, 65535, v).astype(np.uint16)
 
         cv2_img = ((100 - occupancy_map) * 10 // 4).astype(np.uint8) # *10//4 is int approx to *255.0/100.0
         cv2_img = np.stack((cv2_img,)*3, axis = -1) # greyscale to rgb
