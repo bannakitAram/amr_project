@@ -411,9 +411,12 @@ def load_map_image(yaml_path):
 # payload mounted off-centre gives an asymmetric rectangle.
 # The min/max bounds are hard limits - review ISO 3691-4 before widening:
 # FrontStop (0.35 m deep) and the decel limits were sized for 0.2 m/s.
+# v_max goes up to 0.50 (firmware MAX_SPEED_MS 1.5), but Save is refused
+# while the estimated stop distance exceeds STOP_DIST_MAX_FRAC of FrontStop
+# (0.50 m/s needs decel >= ~0.70 m/s^2).
 NAV_PARAM_SPECS = [
     # key, label, unit, min, max, step, fmt
-    ('v_max', 'v_max', 'm/s', 0.05, 0.30, 0.01, '{:.2f}'),
+    ('v_max', 'v_max', 'm/s', 0.05, 0.50, 0.01, '{:.2f}'),
     ('w_max', 'ω_max', 'rad/s', 0.10, 1.00, 0.05, '{:.2f}'),
     ('inflation', 'Inflation radius', 'm', 0.30, 1.30, 0.05, '{:.2f}'),
     ('goal_tol', 'xy_goal_tolerance', 'm', 0.10, 0.50, 0.05, '{:.2f}'),
@@ -446,6 +449,12 @@ NAV_PARAM_DEFAULTS = {
 }
 STOP_LATENCY_S = 0.2      # cmd -> wheels, used for the stop-distance note
 FRONT_STOP_DEPTH = 0.35   # m ahead of the bumper (matches nav2_params.yaml)
+STOP_DIST_MAX_FRAC = 0.8  # Save refused when stop distance > this * FRONT_STOP_DEPTH
+
+
+def stop_distance(v):
+    """Estimated stop distance at v_max with the edited decel + latency."""
+    return v['v_max'] ** 2 / (2 * v['dec_lin']) + v['v_max'] * STOP_LATENCY_S
 FRONT_STOP_MARGIN = 0.03  # m each side beyond the footprint half-width
 LASER_BOX_MARGIN = 0.01   # m self-hit box beyond the footprint (laser_filter.yaml)
 
@@ -856,6 +865,7 @@ EN = {
     '⚠ accel มากกว่า decel - ควรให้ decel ≥ accel': '⚠ accel > decel - keep decel ≥ accel',
     '⚠ ระยะหยุดเกิน 80% ของความลึก FrontStop - เพิ่ม decel หรือลด v_max':
         '⚠ stop distance > 80% of FrontStop depth - raise decel or lower v_max',
+    'บันทึกไม่ได้จนกว่าระยะหยุดจะอยู่ในเกณฑ์': 'Save is blocked until the stop distance is within limits',
     'เขียน nav2_params.yaml + laser_filter.yaml แล้ว (git tree เป็น -dirty)\n':
         'nav2_params.yaml + laser_filter.yaml written (git tree is now -dirty)\n',
     # Map placeholder / map picker / stations
@@ -2905,11 +2915,12 @@ class AmrControlPanel(tk.Tk):
             b = laser_box_for(e)
             lines.append(T('กล่องกรอง LiDAR (self-hit)') + f' x {b["min_x"]:.2f}..{b["max_x"]:.2f}'
                          + f' y {b["min_y"]:.2f}..{b["max_y"]:.2f} m')
-            d_stop = e['v_max'] ** 2 / (2 * e['dec_lin']) + e['v_max'] * STOP_LATENCY_S
+            d_stop = stop_distance(e)
             lines.append(T('ระยะหยุดโดยประมาณที่ v_max') + f' {d_stop:.2f} m '
                          + T('(รวม latency') + f' {STOP_LATENCY_S:.1f} s)')
-            if d_stop > FRONT_STOP_DEPTH * 0.8:
+            if d_stop > FRONT_STOP_DEPTH * STOP_DIST_MAX_FRAC:
                 lines.append(T('⚠ ระยะหยุดเกิน 80% ของความลึก FrontStop - เพิ่ม decel หรือลด v_max'))
+                lines.append(T('บันทึกไม่ได้จนกว่าระยะหยุดจะอยู่ในเกณฑ์'))
             if e['acc_lin'] > e['dec_lin']:
                 lines.append(T('⚠ accel มากกว่า decel - ควรให้ decel ≥ accel'))
             if not e.get('depth', True):
@@ -2925,6 +2936,14 @@ class AmrControlPanel(tk.Tk):
 
     def _on_param_save(self):
         if not self._param_changes:
+            return
+        d_stop = stop_distance(self._param_edit)
+        if d_stop > FRONT_STOP_DEPTH * STOP_DIST_MAX_FRAC:
+            messagebox.showerror(
+                'บันทึก Parameter',
+                'ระยะหยุดโดยประมาณ %.2f m เกิน %.0f%% ของ FrontStop (%.2f m)\n'
+                'เพิ่ม decel หรือลด v_max ก่อนบันทึก (ISO 3691-4)'
+                % (d_stop, STOP_DIST_MAX_FRAC * 100, FRONT_STOP_DEPTH))
             return
         if not messagebox.askyesno(
                 'บันทึก Parameter',
