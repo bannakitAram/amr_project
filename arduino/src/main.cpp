@@ -104,7 +104,10 @@ const uint32_t CUR_PERIOD_MS     = 50;    // CUR line rate 20 Hz
 // KG-F coulometer (RS485 on Serial1). Baud must match the meter's setting.
 const uint32_t BAT_BAUD          = 115200;
 const char     BAT_POLL_CMD[]    = ":R50=1,2,1,\r\n";   // read all, address 1
-const uint32_t BAT_PERIOD_MS     = 1000;
+// 50 ms = same 20 Hz as CUR, so battery V/A line up with the motor current
+// in a bag (accel phases ~0.6-2.7 s). Reply ~55 B + echo = ~5 ms on the bus.
+// If the meter refreshes slower internally, values just repeat.
+const uint32_t BAT_PERIOD_MS     = 50;
 
 // ---- State ------------------------------------------------------------
 enum State { IDLE, AT_UP, AT_DOWN, MOVING_UP, MOVING_DOWN, FAULT };

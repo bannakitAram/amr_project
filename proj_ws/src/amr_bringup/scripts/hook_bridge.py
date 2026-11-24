@@ -32,7 +32,7 @@ Topics:
                it with /wheel/odom by stamp instead of by receive time. Use
                this one for logging / ML; the Float32 topics stay for the UI.
   /battery/raw std_msgs/String out: raw reply line of the Junctek KG-F
-               coulometer ("BAT <reply>", ~1 Hz, RS485 on the Mega's Serial1).
+               coulometer ("BAT <reply>", ~20 Hz, RS485 on the Mega's Serial1).
                Monitor only.
   /battery/state sensor_msgs/BatteryState out, decoded from ":r50=" replies:
                field 3 = voltage x0.01 V, field 4 = current x0.01 A,
