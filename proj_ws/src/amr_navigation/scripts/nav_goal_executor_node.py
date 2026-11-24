@@ -431,9 +431,34 @@ def wait_for_active(navigator, node_name, timeout_s=2.0):
     navigator.destroy_client(client)
 
 
+DUP_CHECK_S = 3.0        # s of DDS discovery before checking for a second executor
+
+
+def another_instance(navigator):
+    """True if a nav_goal_executor_node is already running. Two executors
+    both act on every goal and preempt each other's FollowPath (2026-11-24:
+    a hand-started one + the launch's one -> goals aborted every ~0.5 s)."""
+    me = navigator.get_name()
+    end = time.time() + DUP_CHECK_S
+    while time.time() < end:
+        rclpy.spin_once(navigator, timeout_sec=0.1)
+    n = sum(1 for name, _ns in navigator.get_node_names_and_namespaces() if name == me)
+    if n > 1:
+        navigator.get_logger().fatal(
+            'nav_goal_executor_node: %d nodes named %s are running - this one exits. '
+            'Stop the other (pkill -f nav_goal_executor_node.py) and restart navigation.'
+            % (n, me))
+        return True
+    return False
+
+
 def main():
     rclpy.init()
     navigator = BasicNavigator()
+    if another_instance(navigator):
+        navigator.destroy_node()
+        rclpy.shutdown()
+        return 1
     navigator.get_logger().info('nav_goal_executor_node: waiting for Nav2 to become active...')
     wait_for_active(navigator, 'amcl')
     wait_for_active(navigator, 'bt_navigator')
