@@ -1577,9 +1577,9 @@ const CAUSE_OPTIONAL = ['/collision_monitor_state'];
 // station trip start/arrived (nav_goal_executor_node)
 // /amcl_pose = where on the map (floor, ramp), /hook/state = payload lifted
 const POWER_TOPICS = ['/motor_current/left', '/motor_current/right', '/motor_current/stamped', '/battery/state', '/nav_event',
-                      '/cmd_vel', '/wheel/odom', '/amcl_pose', '/hook/state'];
+                      '/cmd_vel', '/cmd_vel_smoothed', '/wheel/odom', '/imu/data', '/amcl_pose', '/hook/state'];
 // only exist in Navigation mode / with the Mega: recorded if there, no warning
-const POWER_OPTIONAL = ['/nav_event', '/amcl_pose', '/hook/state'];
+const POWER_OPTIONAL = ['/nav_event', '/amcl_pose', '/hook/state', '/cmd_vel_smoothed'];
 // big topics: warn, they can fill the disk / load the Jetson
 const BAG_HEAVY_TYPES = /PointCloud2|Image|OccupancyGrid/;
 let allTopics = {};   // name -> type, from rosboard's topic list
@@ -1786,6 +1786,8 @@ function renderBagPanel() {
     cb.onchange = () => {
       if (cb.checked) bagSelected.add(name); else bagSelected.delete(name);
       saveBagSelection();
+// /imu/data ax + /cmd_vel_smoothed = accel phases (F = m*a: current during
+// a ramp carries the payload mass; cruise current is mostly friction)
       renderBagStatus();
     };
     const type = document.createElement('span');
