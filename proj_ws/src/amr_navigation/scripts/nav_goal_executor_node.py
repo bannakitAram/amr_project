@@ -697,7 +697,17 @@ def main():
                 'after backup - request dropped' % backup['saved'])
             alert('error', 'คืนค่า safety zone หลังถอยไม่สำเร็จ - หยุดรอ operator')
             return
+        then_detour = backup.pop('detour', False)
         if resend and req is not None:
+            if then_detour:
+                # re-sending the route would drive straight back to the object
+                # and use up the room just made (test 2026-11-24 15:33)
+                why = send_detour(req)
+                if why is None:
+                    return
+                wait_for_clear(req, FAILED_RETRY_S,
+                               'สิ่งกีดขวางไม่ขยับ และอ้อมไม่ได้ (%s) - จอดรอ' % why)
+                return
             pending['value'] = req + (True,)
 
     def clear_ghosts():
@@ -919,6 +929,7 @@ def main():
         if path is None and back > 0:
             navigator.get_logger().warn('nav_goal_executor_node: detour - ' + info)
             if backup['n'] < BACKUP_MAX and start_backup(req, back):
+                backup['detour'] = True   # after it: plan the lane shift, not the route
                 return None
             info += ' (backup not possible)'
         if path is None:
