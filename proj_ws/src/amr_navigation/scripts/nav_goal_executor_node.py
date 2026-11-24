@@ -92,11 +92,13 @@ send), and tapped goals/drawn paths, still use the planner. The final
 approach and the waiting above work the same on a route.
 
 Temporary detour (fixed routes only): when collision_monitor has stopped the
-robot for DETOUR_AFTER_S and the object is still in front of the bumper, the
-planner (global costmap) plans from the robot to a route point >= DETOUR_REJOIN_M
-ahead and clear of the object; that path + the rest of the route is followed.
-Rejected (normal wait-and-retry) if it goes into keep-out, strays more than
-DETOUR_MAX_OFFSET from the route or is too long. collision_monitor stays as is.
+robot (or RPP 'collision ahead' failed the route) for DETOUR_AFTER_S, the route
+is shifted sideways around the object (lane shift: ramp DETOUR_RAMP_M, robot
+side DETOUR_SIDE_CLEAR from the object) and back; side and offset come from
+the scan, every pose's footprint is checked on the global costmap, keep-out
+and scan. Too little room for the ramp -> back up first (<= DETOUR_BACK_MAX).
+Rejected (normal wait-and-retry) if it goes into keep-out, hits the map or strays more than
+DETOUR_MAX_OFFSET from the route. collision_monitor stays as is.
 
 A new goal or path always preempts whatever is currently running (cancels
 the in-progress task first) - the operator's most recent tap wins, same as
@@ -148,11 +150,13 @@ DETOUR_FRONT_M = 1.0     # m ahead of the bumper - scan points here = object sti
 DETOUR_SCAN_M = 5.0      # m - scan points this close to the robot are checked against the route
 DETOUR_LOOK_M = 4.5      # m along the route - stretch searched for the blocked part
 DETOUR_BLOCK_R = 0.45    # m - scan point this close to a route point = route blocked there
-DETOUR_PAST_M = 0.8      # m along the route past the last blocked point - earliest rejoin
-DETOUR_REJOIN_M = 2.0    # m along the route from the robot - earliest rejoin point
-DETOUR_REJOIN_CLEAR = 0.6  # m - rejoin point at least this far from the object's points
+DETOUR_SIDE_CLEAR = 0.20 # m - robot side to object gap while passing it
+DETOUR_RAMP_M = 1.2      # m along the route to move over to the side lane (and back)
+DETOUR_RAMP_MIN = 0.8    # m - shortest ramp; less room in front -> back up first
+DETOUR_FRONT_GAP = 0.15  # m - lane must be reached this far before the bumper meets the object
+DETOUR_BACK_MAX = 0.8    # m - longest backup to make room for the ramp
 DETOUR_MAX_OFFSET = 1.0  # m - detour may leave the recorded route by at most this
-DETOUR_MAX_RATIO = 2.5   # detour length <= ratio * route length it replaces + 1 m
+DETOUR_FOOT_MARGIN = 0.05  # m - footprint check against the global costmap / scan
 STATION_MATCH = 0.05     # m - a station goal belongs to the saved station this close
 
 APPROACH_DIST = 1.0      # m - pre-goal distance behind the station
@@ -509,7 +513,7 @@ def main():
         chain['out_t'] = time.time()
         chain['out'] = is_moving(msg)
 
-    latest = {'costmap': None, 'scan': None, 'scan_t': 0.0, 'keepout': None}
+    latest = {'costmap': None, 'scan': None, 'scan_t': 0.0, 'keepout': None, 'gcostmap': None}
     clear_clients = [navigator.create_client(ClearEntireCostmap, srv) for srv in (
         '/local_costmap/clear_entirely_local_costmap',
         '/global_costmap/clear_entirely_global_costmap')]
@@ -648,7 +652,7 @@ def main():
         res = cm_call(cm_set_client, req)
         return res is not None and res.result.successful
 
-    def start_backup(req):
+    def start_backup(req, dist=BACKUP_DIST):
         """Switch the stop zones, start BackUp. False = not started (zones restored)."""
         names = ['FrontStop.enabled', 'FrontStopShort.enabled', 'RearStop.enabled']
         res = cm_call(cm_get_client, GetParameters.Request(names=names))
@@ -665,7 +669,7 @@ def main():
             navigator.get_logger().warn('nav_goal_executor_node: backup skipped - '
                                         'cannot switch collision_monitor zones')
             return False
-        if not navigator.backup(backup_dist=BACKUP_DIST, backup_speed=BACKUP_SPEED,
+        if not navigator.backup(backup_dist=dist, backup_speed=BACKUP_SPEED,
                                 time_allowance=BACKUP_TIME_S):
             cm_set(saved)
             navigator.get_logger().warn('nav_goal_executor_node: BackUp goal rejected')
@@ -676,9 +680,9 @@ def main():
         backup['n'] += 1
         backup.update(active=True, req=req, saved=saved)
         navigator.get_logger().warn('nav_goal_executor_node: blocked at the nose - backing up '
-                                    '%.2f m (%d/%d)' % (BACKUP_DIST, backup['n'], BACKUP_MAX))
+                                    '%.2f m (%d/%d)' % (dist, backup['n'], BACKUP_MAX))
         alert('warn', 'หน้ารถติดสิ่งกีดขวาง - ถอยหลัง %.0f cm แล้วไปต่ออัตโนมัติ'
-              % (BACKUP_DIST * 100))
+              % (dist * 100))
         return True
 
     def end_backup(resend):
@@ -773,76 +777,150 @@ def main():
                 and abs(y) < FOOT_HALF_W + BACKUP_SIDE_M]
 
     def plan_detour(goal):
-        """(Path, info) going around the object and back onto the route to
-        `goal`, or (None, why not)."""
+        """Lane shift around the object on the route to `goal`.
+        Returns (Path, info, 0), (None, why, 0) or (None, why, backup_m)."""
         try:
             _, points = station_route(goal, DETOUR_MAX_OFFSET)
         except (OSError, KeyError, TypeError, AttributeError, yaml.YAMLError) as ex:
-            return None, 'bad routes file: %s' % ex
+            return None, 'bad routes file: %s' % ex, 0
         here = tf2d('map', 'base_footprint')
         if points is None or here is None:
-            return None, 'robot is more than %.1f m from the route' % DETOUR_MAX_OFFSET
-        c, s = math.cos(here[2]), math.sin(here[2])
-        obs = [(here[0] + x * c - y * s, here[1] + x * s + y * c)
+            return None, 'robot is more than %.1f m from the route' % DETOUR_MAX_OFFSET, 0
+        c, s_ = math.cos(here[2]), math.sin(here[2])
+        obs = [(here[0] + x * c - y * s_, here[1] + x * s_ + y * c)
                for x, y in (scan_in_base() or []) if math.hypot(x, y) < DETOUR_SCAN_M]
-        # walk the route ahead: last point the object blocks, then the first
-        # clear point at least DETOUR_PAST_M past it (and DETOUR_REJOIN_M from here)
+        n = len(points)
         cum = [0.0]
-        for i in range(1, len(points)):
+        for i in range(1, n):
             cum.append(cum[-1] + math.hypot(points[i][0] - points[i - 1][0],
                                             points[i][1] - points[i - 1][1]))
+        # the route's own heading (recorded yaw can be off on a weave)
+        yaws = [math.atan2(points[min(i + 1, n - 1)][1] - points[max(i - 1, 0)][1],
+                           points[min(i + 1, n - 1)][0] - points[max(i - 1, 0)][0])
+                for i in range(n)]
 
-        def blocked_at(i, r):
-            return any(math.hypot(points[i][0] - ox, points[i][1] - oy) < r for ox, oy in obs)
-        hit = [i for i in range(len(points)) if cum[i] <= DETOUR_LOOK_M and
-               blocked_at(i, DETOUR_BLOCK_R)]
-        if not hit:
-            return None, 'no object on the route within %.1f m (scan)' % DETOUR_LOOK_M
-        last = hit[-1]
-        k = next((i for i in range(last + 1, len(points))
-                  if cum[i] >= max(DETOUR_REJOIN_M, cum[last] + DETOUR_PAST_M) and
-                  not blocked_at(i, DETOUR_REJOIN_CLEAR)), None)
-        if k is None:
-            return None, 'no clear route point past the object'
-        along = cum[k]
-        blocked_pts = [o for o in obs if any(math.hypot(points[i][0] - o[0], points[i][1] - o[1])
-                                             < DETOUR_BLOCK_R for i in hit)]
-        start = PoseStamped()
-        start.header.frame_id = 'map'
-        start.header.stamp = navigator.get_clock().now().to_msg()
-        start.pose.position.x, start.pose.position.y = here[0], here[1]
-        start.pose.orientation.z = math.sin(here[2] / 2.0)
-        start.pose.orientation.w = math.cos(here[2] / 2.0)
-        rejoin = route_to_path([points[k]], navigator).poses[0]
-        path = navigator.getPath(start, rejoin, planner_id='GridBased', use_start=True)
-        if path is None or not path.poses:
-            return None, 'planner found no way around'
-        xy = [(p.pose.position.x, p.pose.position.y) for p in path.poses]
-        length = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(xy, xy[1:]))
-        if length > DETOUR_MAX_RATIO * along + 1.0:
-            return None, 'detour too long (%.1f m for %.1f m of route)' % (length, along)
-        near = min((math.hypot(x - ox, y - oy) for x, y in xy for ox, oy in blocked_pts),
-                   default=99.0)
-        if near < FOOT_HALF_W:
-            return None, ('planned path still runs through the object (%.2f m) - global '
-                          'costmap does not show it yet' % near)
-        worst = 0.0
-        for x, y in xy:
-            if in_keepout(x, y):
-                return None, 'detour runs into a keep-out zone at (%.2f, %.2f)' % (x, y)
-            worst = max(worst, min(math.hypot(x - p[0], y - p[1]) for p in points))
-        if worst > DETOUR_MAX_OFFSET:
-            return None, 'detour leaves the route by %.2f m (max %.1f)' % (worst, DETOUR_MAX_OFFSET)
-        path.poses += route_to_path(points[k + 1:], navigator).poses if k + 1 < len(points) else []
-        path.header.stamp = navigator.get_clock().now().to_msg()
-        return path, ('%.1f m around, max %.2f m off the route, object %.1f-%.1f m ahead, '
-                      'rejoin %.1f m ahead, closest %.2f m' % (
-                          length, worst, cum[hit[0]], cum[hit[-1]], along, near))
+        def lateral(i, o):
+            dx, dy = o[0] - points[i][0], o[1] - points[i][1]
+            return -dx * math.sin(yaws[i]) + dy * math.cos(yaws[i])   # + = left
+        # object points: those within DETOUR_BLOCK_R of the route ahead
+        hits, near = [], []
+        for o in obs:
+            best = None
+            for i in range(n):
+                if cum[i] > DETOUR_LOOK_M:
+                    break
+                d = math.hypot(points[i][0] - o[0], points[i][1] - o[1])
+                if best is None or d < best[0]:
+                    best = (d, i)
+            if best is not None and best[0] < DETOUR_BLOCK_R:
+                hits.append(best[1])
+                near.append((best[1], lateral(best[1], o)))
+        if len(hits) < BACKUP_MIN_POINTS:
+            return None, 'no object on the route within %.1f m (scan)' % DETOUR_LOOK_M, 0
+        a, b = min(hits), max(hits)
+        need = FOOT_HALF_W + DETOUR_SIDE_CLEAR
+        # full shift from the bumper reaching the object to the rear passing it
+        full_from, full_to = cum[a] - FOOT_FRONT - DETOUR_FRONT_GAP, cum[b] - FOOT_REAR + 0.1
+        room = full_from          # route length available for the ramp in front
+        if room < DETOUR_RAMP_MIN:
+            back = min(DETOUR_BACK_MAX, DETOUR_RAMP_MIN - room + 0.05)
+            return None, 'object %.2f m from the bumper - backing up %.2f m for room' % (
+                cum[a] - FOOT_FRONT, back), back
+        ramp = min(DETOUR_RAMP_M, room)
+        if cum[-1] < full_to + ramp:
+            return None, 'object too close to the end of the route', 0
+        grid = latest.get('gcostmap')
+        if grid is None:
+            return None, 'no global costmap', 0
+        gw, gh, gr = grid.info.width, grid.info.height, grid.info.resolution
+        gox, goy = grid.info.origin.position.x, grid.info.origin.position.y
+
+        def smooth(t):
+            t = min(1.0, max(0.0, t))
+            return t * t * (3 - 2 * t)
+
+        def profile(i):
+            d = cum[i]
+            if d < full_from - ramp or d > full_to + ramp:
+                return 0.0
+            if d < full_from:
+                return smooth((d - (full_from - ramp)) / ramp)
+            if d > full_to:
+                return smooth(((full_to + ramp) - d) / ramp)
+            return 1.0
+
+        def footprint_hit(x, y, yaw):
+            """Reason string if the footprint at (x, y, yaw) hits something."""
+            cy, sy = math.cos(yaw), math.sin(yaw)
+            m = DETOUR_FOOT_MARGIN
+            fx = FOOT_REAR - m
+            while fx <= FOOT_FRONT + m + 1e-6:
+                fy = -FOOT_HALF_W - m
+                while fy <= FOOT_HALF_W + m + 1e-6:
+                    wx, wy = x + fx * cy - fy * sy, y + fx * sy + fy * cy
+                    ci, cj = int((wx - gox) / gr), int((wy - goy) / gr)
+                    if not (0 <= ci < gw and 0 <= cj < gh):
+                        return 'outside the map'
+                    v = grid.data[cj * gw + ci]
+                    if v >= 99 or v < 0:
+                        return 'wall/unknown at (%.2f, %.2f)' % (wx, wy)
+                    if in_keepout(wx, wy):
+                        return 'keep-out at (%.2f, %.2f)' % (wx, wy)
+                    fy += gr
+                fx += gr
+            for ox, oy in obs:
+                dx, dy = ox - x, oy - y
+                lx, ly = dx * cy + dy * sy, -dx * sy + dy * cy
+                if FOOT_REAR - m < lx < FOOT_FRONT + m and abs(ly) < FOOT_HALF_W + m:
+                    return 'scan point at (%.2f, %.2f)' % (ox, oy)
+            return None
+
+        tried = []
+        for side in sorted((1.0, -1.0), key=lambda sd: max(need - sd * lt for _, lt in near)):
+            # side +1 = shift right (path at -off), -1 = left; every object point
+            # must end up `need` from the shifted line
+            off = max(0.0, max(need - side * lt for _, lt in near))
+            if off > DETOUR_MAX_OFFSET:
+                tried.append('%s needs %.2f m' % ('left' if side < 0 else 'right', off))
+                continue
+            shift = -side * off       # + = left of the route
+            pts = []
+            for i in range(n):
+                k = shift * profile(i)
+                pts.append([points[i][0] - k * math.sin(yaws[i]),
+                            points[i][1] + k * math.cos(yaws[i])])
+            for i in range(n):
+                j0, j1 = max(i - 1, 0), min(i + 1, n - 1)
+                pts[i].append(math.atan2(pts[j1][1] - pts[j0][1], pts[j1][0] - pts[j0][0]))
+            pts[-1][2] = points[-1][2]
+            bad = None
+            for i in range(n):
+                if cum[i] > full_to + ramp + 0.5:
+                    break
+                if profile(i) > 0.0 or cum[i] <= full_to + ramp:
+                    bad = footprint_hit(*pts[i])
+                    if bad:
+                        bad = '%s at %.1f m along' % (bad, cum[i])
+                        break
+            if bad:
+                tried.append('%s %.2f m: %s' % ('left' if shift > 0 else 'right', off, bad))
+                continue
+            path = route_to_path(pts, navigator)
+            return path, ('lane shift %.2f m %s, object %.1f-%.1f m ahead, ramp %.1f m, '
+                          'back on the route %.1f m ahead' % (
+                              off, 'left' if shift > 0 else 'right', cum[a], cum[b], ramp,
+                              full_to + ramp)), 0
+        return None, 'no room: ' + '; '.join(tried), 0
 
     def send_detour(req):
         """Drive the station request `req` around the object; None on
         success, else why not."""
-        path, info = plan_detour(req[1])
+        path, info, back = plan_detour(req[1])
+        if path is None and back > 0:
+            navigator.get_logger().warn('nav_goal_executor_node: detour - ' + info)
+            if backup['n'] < BACKUP_MAX and start_backup(req, back):
+                return None
+            info += ' (backup not possible)'
         if path is None:
             navigator.get_logger().warn('nav_goal_executor_node: detour rejected - ' + info)
             return info
@@ -958,6 +1036,9 @@ def main():
         OccupancyGrid, '/local_costmap/costmap', on_costmap,
         QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
     navigator.create_subscription(LaserScan, '/scan_filtered', on_scan, qos_profile_sensor_data)
+    navigator.create_subscription(
+        OccupancyGrid, '/global_costmap/costmap', lambda m: latest.__setitem__('gcostmap', m),
+        QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
     navigator.create_subscription(
         OccupancyGrid, '/keepout_filter_mask', on_keepout,
         QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
