@@ -170,8 +170,9 @@ DETOUR_REPAIRS = 6         # re-plans after a footprint hit the wall model misse
 DETOUR_GRID = 0.02        # m - lateral offset step of the lane search
 DETOUR_SLOPE = 0.55       # m sideways per m along (~29 deg) - steepest lane change
 DETOUR_REAR_MARGIN = 0.30  # m - behind a detour backup must be clear this much further
-DETOUR_SIDE_CLEAR = 0.20 # m - robot side to object gap while passing it (0.10 tried 2026-11-24
-                         # 16:02: shift came out 0 m and RPP's own footprint check refused it)
+DETOUR_SIDE_CLEAR = 0.15 # m - robot side to object gap while passing it. 0.20 refused a 1.00 m
+                         # gap (test 16:38, operator asked); 0.10 tried 16:02: RPP's own
+                         # footprint check refused it. 0.15 untested against RPP.
 DETOUR_RAMP_M = 1.2      # m along the route to move over to the side lane (and back)
 DETOUR_RAMP_MIN = 0.8    # m - shortest ramp; less room in front -> back up first
 DETOUR_FRONT_GAP = 0.15  # m - lane must be reached this far before the bumper meets the object
