@@ -165,6 +165,9 @@ DETOUR_EARLY_MIN_LEFT = 1.5  # m - no early stop when the route ends closer than
 DETOUR_EXIT_EXTRA = 0.70  # m - stay in the side lane this much longer: RPP's 0.6 m lookahead
                           # cut the way back and swung the rear into the object (test 16:05)
 DETOUR_SKIP_START = 0.30  # m along - poses the robot already covers are not footprint-checked
+DETOUR_OBJ_WIN = 0.20     # m along - an object point constrains the lane this close to it
+DETOUR_REPAIRS = 6         # re-plans after a footprint hit the wall model missed
+DETOUR_GRID = 0.02        # m - lateral offset step of the lane search
 DETOUR_SLOPE = 0.55       # m sideways per m along (~29 deg) - steepest lane change
 DETOUR_REAR_MARGIN = 0.30  # m - behind a detour backup must be clear this much further
 DETOUR_SIDE_CLEAR = 0.20 # m - robot side to object gap while passing it (0.10 tried 2026-11-24
@@ -871,6 +874,8 @@ def main():
         gw, gh, gr = grid.info.width, grid.info.height, grid.info.resolution
         gox, goy = grid.info.origin.position.x, grid.info.origin.position.y
 
+        hit_at = []
+
         def footprint_hit(x, y, yaw):
             """Reason string if the footprint at (x, y, yaw) hits something."""
             cy, sy = math.cos(yaw), math.sin(yaw)
@@ -882,13 +887,17 @@ def main():
                     wx, wy = x + fx * cy - fy * sy, y + fx * sy + fy * cy
                     ci, cj = int((wx - gox) / gr), int((wy - goy) / gr)
                     if not (0 <= ci < gw and 0 <= cj < gh):
+                        hit_at[:] = [wx, wy]
                         return 'outside the map'
                     v = grid.data[cj * gw + ci]
                     if v >= 65:   # occupied in the saved map
+                        hit_at[:] = [wx, wy]
                         return 'wall at (%.2f, %.2f)' % (wx, wy)
                     if v < 0:
+                        hit_at[:] = [wx, wy]
                         return 'unknown space at (%.2f, %.2f)' % (wx, wy)
                     if in_keepout(wx, wy):
+                        hit_at[:] = [wx, wy]
                         return 'keep-out at (%.2f, %.2f)' % (wx, wy)
                     fy += gr
                 fx += gr
@@ -896,90 +905,126 @@ def main():
                 dx, dy = ox - x, oy - y
                 lx, ly = dx * cy + dy * sy, -dx * sy + dy * cy
                 if FOOT_REAR - m < lx < FOOT_FRONT + m and abs(ly) < FOOT_HALF_W + m:
+                    hit_at[:] = [ox, oy]
                     return 'scan point at (%.2f, %.2f)' % (ox, oy)
             return None
 
 
-        # Lateral offset per route point (+ = left). Each point gets the offset
-        # nearest the one before that keeps every object point beside the
-        # footprint (bumper .. rear + DETOUR_EXIT_EXTRA) at least `need` away -
-        # objects at different places may need different offsets, e.g. pass
-        # one on the left, then one on the right (test 16:10: a single lane
-        # for both needed 1.24 m in a 1.31 m gap).
-        # just the footprint (+ margin): with the RPP exit extra and 0.15 m gaps
-        # the window was up to 2.2 m long and asked one offset to clear objects
-        # 1.5 m apart (test 16:10); every pose is footprint-checked below anyway
-        lo_a, hi_a = FOOT_REAR - DETOUR_FOOT_MARGIN, FOOT_FRONT + DETOUR_FOOT_MARGIN
+        # Lateral offset per route point (+ = left), searched over the whole
+        # stretch at once (dynamic programming on a DETOUR_GRID grid): start at
+        # the robot's offset, every object point beside the footprint (bumper ..
+        # rear, + margin) >= `need` from the centre line, lane changes <=
+        # DETOUR_SLOPE, end back on the route; least total offset wins. Objects
+        # at different places can be passed on different sides, and the robot
+        # starts moving over early enough (a greedy point-by-point choice had
+        # to jump sideways at the next object: 'turns too sharply', test 16:32).
+        # An object point constrains the lane offset where it is along the route
+        # (the robot follows the lane, so its side passes the point at the lane's
+        # offset there), +- DETOUR_OBJ_WIN. One offset for the whole 1.4 m body
+        # (bumper .. rear window) refused a 2.5 deg lean between clutter behind
+        # and the object ahead (snapshot 16:10); every pose's real footprint is
+        # checked afterwards anyway.
+        lo_a, hi_a = -DETOUR_OBJ_WIN, DETOUR_OBJ_WIN
+        end_c = last - FOOT_REAR + DETOUR_EXIT_EXTRA + DETOUR_MAX_OFFSET / DETOUR_SLOPE
+        if cum[-1] < end_c:
+            return None, 'object too close to the end of the route', 0
+        E = next(i for i in range(n) if cum[i] >= end_c)
+        G = DETOUR_GRID
+        ns = int(round(DETOUR_MAX_OFFSET / G))
+        grid_s = [k * G for k in range(-ns, ns + 1)]
 
-        def forbidden(i):
-            return [(lt - need, lt + need) for a, lt in objs if lo_a <= a - cum[i] <= hi_a]
+        # every unmapped scan point near the stretch (not only those on the route)
+        allobj = []
+        for o in obs:
+            j = min(range(E + 1), key=lambda q: math.hypot(points[q][0] - o[0], points[q][1] - o[1]))
+            lt = lateral(j, o)
+            if abs(lt) <= DETOUR_MAX_OFFSET + need:
+                allobj.append((cum[j], lt))
+        # free sideways room to the /map walls (or unknown) at each route point
+        def wall_dist(i, side):
+            d = 0.0
+            while d < DETOUR_MAX_OFFSET + FOOT_HALF_W + 0.3:
+                wx = points[i][0] - side * d * math.sin(yaws[i])
+                wy = points[i][1] + side * d * math.cos(yaws[i])
+                ci, cj = int((wx - gox) / gr), int((wy - goy) / gr)
+                if not (0 <= ci < gw and 0 <= cj < gh) or grid.data[cj * gw + ci] >= 65 or \
+                        grid.data[cj * gw + ci] < 0 or in_keepout(wx, wy):
+                    return d
+                d += gr / 2
+            return d
+        wl = [wall_dist(i, 1.0) for i in range(E + 1)]
+        wr = [wall_dist(i, -1.0) for i in range(E + 1)]
+        half = FOOT_HALF_W + DETOUR_FOOT_MARGIN
 
-        def nearest_free(iv, pref):
-            cands = [pref] + [e for lo, hi in iv for e in (lo, hi)]
-            ok = [c for c in cands if abs(c) <= DETOUR_MAX_OFFSET + 1e-9 and
-                  all(not (lo + 1e-6 < c < hi - 1e-6) for lo, hi in iv)]
-            return min(ok, key=lambda c: abs(c - pref)) if ok else None
+        def allowed(i):
+            # walls are continuous: the whole body (rear .. bumper) must fit
+            win = [j for j in range(E + 1)
+                   if FOOT_REAR - DETOUR_FOOT_MARGIN <= cum[j] - cum[i] <= FOOT_FRONT +
+                   DETOUR_FOOT_MARGIN] or [i]
+            left_room, right_room = min(wl[j] for j in win), min(wr[j] for j in win)
+            iv = [(lt - need, lt + need) for a_, lt in allobj if lo_a <= a_ - cum[i] <= hi_a]
+            hold = cum[i] <= last - FOOT_REAR + DETOUR_EXIT_EXTRA
+            return [k for k, v in enumerate(grid_s)
+                    if v + half <= left_room + 1e-6 and -v + half <= right_room + 1e-6 and
+                    all(not (lo + 1e-6 < v < hi - 1e-6) for lo, hi in iv)], hold
 
-        tried = []
-        for bias, name in ((0.0, 'nearest'), (DETOUR_MAX_OFFSET, 'left'),
-                           (-DETOUR_MAX_OFFSET, 'right')):
-            target, prev, committed, why = {}, cur, False, None
-            for i in range(n):
-                if cum[i] - hi_a > last:
+        last_bad = None
+        for _repair in range(DETOUR_REPAIRS):
+            INF = float('inf')
+            k_cur = min(range(len(grid_s)), key=lambda k: abs(grid_s[k] - cur))
+            cost = [INF] * len(grid_s)
+            for k in range(len(grid_s)):
+                if abs(grid_s[k] - cur) <= 0.08 + 1e-9:   # RPP takes up a few cm
+                    cost[k] = 0.0
+            ok0, _ = allowed(0)
+            cost = [cost[k] if k in ok0 else INF for k in range(len(grid_s))]
+            if min(cost) == INF:
+                cost = [INF] * len(grid_s)
+                cost[k_cur] = 0.0      # robot already there: trust where it stands
+            back_ptr = [[None] * len(grid_s)]
+            fail_at = None
+            for i in range(1, E + 1):
+                step = int(DETOUR_SLOPE * (cum[i] - cum[i - 1]) / G + 1e-6) + 1
+                ok, hold = allowed(i)
+                okset = set(ok)
+                nc, bp = [INF] * len(grid_s), [None] * len(grid_s)
+                for k in ok:
+                    best, arg = INF, None
+                    for kk in range(max(0, k - step), min(len(grid_s), k + step + 1)):
+                        if cost[kk] == INF:
+                            continue
+                        if abs(grid_s[k] - grid_s[kk]) > DETOUR_SLOPE * (cum[i] - cum[i - 1]) + 1e-6:
+                            continue
+                        c = cost[kk] + abs(grid_s[k]) * (cum[i] - cum[i - 1]) + \
+                            (0.0 if k == kk else 0.002)
+                        if hold and k != kk:
+                            c += 0.05     # keep the lane until the rear has passed (RPP)
+                        if c < best:
+                            best, arg = c, kk
+                    nc[k], bp[k] = best, arg
+                cost = nc
+                back_ptr.append(bp)
+                if min(cost) == INF:
+                    fail_at = i
                     break
-                iv = forbidden(i)
-                if not iv:
-                    continue
-                c = nearest_free(iv, prev if committed else prev + bias)
-                if c is None:
-                    why = 'no %.2f m gap at %.1f m along' % (2 * need, cum[i])
-                    break
-                target[i], prev, committed = c, c, True
-            if why:
-                tried.append('%s: %s' % (name, why))
-                continue
-            if not target:
-                return None, 'no object near the route ahead', 0
-            idx = sorted(target)
-            # first target must be reachable from where the robot is now
-            i0 = idx[0]
-            dist0 = max(cum[i0], 1e-3)
-            if abs(target[i0] - cur) > DETOUR_SLOPE * dist0 + 0.08:   # 8 cm: RPP takes it up
-                back = min(DETOUR_BACK_MAX, abs(target[i0] - cur) / DETOUR_SLOPE - dist0 + 0.05)
-                tried.append('%s: %.2f m sideways within %.2f m' % (
-                    name, abs(target[i0] - cur), dist0))
-                if back > 0.05 and name == 'nearest':
-                    return None, ('object %.2f m from the bumper, %.2f m sideways needed - '
-                                  'backing up %.2f m for room' % (
-                                      first - FOOT_FRONT, abs(target[i0] - cur), back)), back
-                continue
-            iN = idx[-1]
-            # way back: after the rear has passed + RPP lookahead (0.6 m cut the
-            # corner and swung the rear in, test 16:05)
-            ret = DETOUR_EXIT_EXTRA + max(DETOUR_RAMP_MIN, abs(target[iN]) / DETOUR_SLOPE)
-            if cum[-1] < cum[iN] + ret:
-                tried.append('%s: object too close to the end of the route' % name)
-                continue
+            k_end = grid_s.index(0.0) if 0.0 in grid_s else ns
+            if fail_at is not None or cost[k_end] == INF:
+                # would it work if the robot could start anywhere? -> back up for room
+                where = cum[fail_at] if fail_at is not None else cum[E]
+                if cum[min(fail_at or E, n - 1)] - FOOT_FRONT < DETOUR_RAMP_MIN and \
+                        first - FOOT_FRONT < DETOUR_RAMP_MIN:
+                    back = min(DETOUR_BACK_MAX, DETOUR_RAMP_MIN - (first - FOOT_FRONT) + 0.05)
+                    return None, ('object %.2f m from the bumper, no lane from here - backing up '
+                                  '%.2f m for room' % (first - FOOT_FRONT, back)), back
+                return None, 'no room: no lane with %.2f m side gaps at %.1f m along' % (
+                    DETOUR_SIDE_CLEAR, where), 0
             off = [0.0] * n
-            for i in range(n):
-                if i <= i0:
-                    off[i] = cur + (target[i0] - cur) * (cum[i] / dist0)
-                elif i in target:
-                    off[i] = target[i]
-                elif i < iN:
-                    j0 = max(j for j in idx if j < i)
-                    j1 = min(j for j in idx if j > i)
-                    t = (cum[i] - cum[j0]) / max(cum[j1] - cum[j0], 1e-6)
-                    off[i] = target[j0] + (target[j1] - target[j0]) * t
-                else:
-                    hold = cum[i] - cum[iN] - DETOUR_EXIT_EXTRA
-                    off[i] = target[iN] if hold <= 0 else \
-                        target[iN] * max(0.0, 1.0 - hold / (ret - DETOUR_EXIT_EXTRA))
-            steep = next((cum[i] for i in range(1, n) if abs(off[i] - off[i - 1]) >
-                          DETOUR_SLOPE * 1.3 * max(cum[i] - cum[i - 1], 1e-3) + 0.01), None)
-            if steep is not None:
-                tried.append('%s: turns too sharply at %.1f m along' % (name, steep))
-                continue
+            k = k_end
+            for i in range(E, -1, -1):
+                off[i] = grid_s[k]
+                if i > 0:
+                    k = back_ptr[i][k]
+            off[0] = cur
             pts = [[points[i][0] - off[i] * math.sin(yaws[i]),
                     points[i][1] + off[i] * math.cos(yaws[i])] for i in range(n)]
             for i in range(n):
@@ -988,25 +1033,33 @@ def main():
             pts[-1][2] = points[-1][2]
             bad = None
             for i in range(n):
-                if cum[i] > cum[iN] + ret + 0.5:
+                if cum[i] > cum[E] + 0.5:
                     break
                 if cum[i] < DETOUR_SKIP_START:
                     continue   # where the robot already stands (its real yaw differs
                                # from the route's; touched a map wall, test 16:21)
                 bad = footprint_hit(*pts[i])
                 if bad:
-                    bad = '%s at %.1f m along' % (bad, cum[i])
                     break
             if bad:
-                tried.append('%s (max %.2f m): %s' % (name, max(off, key=abs), bad))
+                # the real (leaning) footprint touched something the per-point wall
+                # model missed: shrink the room on that side around there, re-plan
+                hx, hy = hit_at
+                side_left = lateral(i, (hx, hy)) > off[i]
+                for j in range(E + 1):
+                    if abs(cum[j] - cum[i]) <= FOOT_FRONT - FOOT_REAR:
+                        if side_left:
+                            wl[j] = min(wl[j], max(0.0, off[i] + half - gr))
+                        else:
+                            wr[j] = min(wr[j], max(0.0, -off[i] + half - gr))
+                last_bad = 'lane hits %s at %.1f m along' % (bad, cum[i])
                 continue
-            big = max(off, key=abs)
+            big = max(off[:E + 1], key=abs)
             return route_to_path(pts, navigator), (
-                'lane shift max %.2f m %s (%s), objects %.1f-%.1f m ahead, robot at %+.2f m, '
+                'lane shift max %.2f m %s, objects %.1f-%.1f m ahead, robot at %+.2f m, '
                 'back on the route %.1f m ahead' % (
-                    abs(big), 'left' if big > 0 else 'right', name, first, last, cur,
-                    cum[iN] + ret)), 0
-        return None, 'no room: ' + '; '.join(tried), 0
+                    abs(big), 'left' if big > 0 else 'right', first, last, cur, cum[E])), 0
+        return None, 'no room: ' + (last_bad or 'lane search failed'), 0
 
     def on_static_map(x, y):
         """(x, y) is a wall of the saved map (+-1 cell): not a new object."""
