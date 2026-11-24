@@ -368,6 +368,31 @@ class ROSBoardNode(object):
                 cmd["x"], cmd["y"] = round(float(x), 3), round(float(y), 3)
         self.door_cmd_pub.publish(String(data=json.dumps(cmd, ensure_ascii=False)))
 
+    def on_route_cmd(self, cmd):
+        """Forward a validated route edit (goal_picker: line drawn from one
+        station to another, or delete) on /rosboard_mapping_cmd; the AMR
+        control panel checks it against the map and stations again and
+        writes <map>_routes.yaml."""
+        action = cmd.get("action")
+        if action not in ("route_draw", "route_delete", "route_points"):
+            print("error: route: bad action %r" % (action,))
+            return
+        clean = lambda v: re.sub(r"[\x00-\x1f\x7f]", "", str(v or ""))[:40]
+        out = {"action": action, "map": clean(cmd.get("map")),
+               "from": clean(cmd.get("from")), "to": clean(cmd.get("to")),
+               "id": clean(cmd.get("id"))[:32]}
+        if action in ("route_draw", "route_points"):
+            # route_points: tapped via points (0..50), the panel computes the route
+            try:
+                pts = [[round(float(p[0]), 3), round(float(p[1]), 3)]
+                       for p in cmd.get("points", [])][:2000 if action == "route_draw" else 50]
+            except (TypeError, ValueError, IndexError):
+                return
+            if (action == "route_draw" and len(pts) < 2) or not all(math.isfinite(v) and abs(v) < 1e4 for p in pts for v in p):
+                return
+            out["points"] = pts
+        self.mapping_cmd_pub.publish(String(data=json.dumps(out, ensure_ascii=False)))
+
     def on_zone_cmd(self, cmd):
         """Forward a validated zone edit (polygon or brush stroke, map frame,
         m) as JSON on /rosboard_zone_cmd; zone_manager_node.py checks it again."""

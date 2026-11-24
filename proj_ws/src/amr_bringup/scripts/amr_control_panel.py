@@ -46,6 +46,7 @@ from PIL import Image, ImageTk
 from ament_index_python.packages import get_package_share_directory
 
 import amr_calib_panel
+import route_tools
 
 MAPS_DIR = os.path.join(
     get_package_share_directory('amr_navigation'), '..', '..', '..', '..',
@@ -382,6 +383,164 @@ def route_from_samples(samples, start, end):
         ax, ay = (nx, ny) if i < n - 1 else (x, y)
         poses.append([round(x, 3), round(y, 3), round(math.atan2(ay - py, ax - px), 3)])
     return poses, None
+
+
+# Routes drawn on the phone (goal_picker "วาดเส้นทาง"): the drawn line is
+# snapped to the two stations, ends with a straight ROUTE_DRAW_APPROACH_M leg
+# along the end station's heading, is resampled every ROUTE_STEP_M and must
+# keep ROUTE_DRAW_CLEAR_M from every wall cell of the saved map and stay out
+# of the keep-out mask. Map check only - the operator must still check the
+# real aisle (pallets, carts) and test the route at low speed.
+ROUTE_DRAW_APPROACH_M = 0.6   # m straight leg into the end station
+ROUTE_DRAW_CLEAR_M = 0.40     # m centreline to wall (footprint half width 0.42)
+ROUTE_DRAW_MAX_PTS = 2000
+ROUTE_POINTS_MAX = 50         # phone tapped via points
+ROUTE_DRAW_MAX_TURN = math.radians(100)  # sharpest corner allowed in the drawing
+
+
+def _map_grid(yaml_path):
+    """(meta, occ bool grid, free bool grid) of a saved map; row 0 = top."""
+    with open(yaml_path) as f:
+        meta = yaml.safe_load(f)
+    img_path = meta['image']
+    if not os.path.isabs(img_path):
+        img_path = os.path.join(os.path.dirname(yaml_path), img_path)
+    g = np.asarray(Image.open(img_path).convert('L'), dtype=np.float32) / 255.0
+    occ = g if meta.get('negate', 0) else 1.0 - g
+    return meta, occ > meta.get('occupied_thresh', 0.65), occ < meta.get('free_thresh', 0.25)
+
+
+def _grid_cell(meta, shape, x, y):
+    res = float(meta['resolution'])
+    ox, oy = float(meta['origin'][0]), float(meta['origin'][1])
+    col = int(math.floor((x - ox) / res))
+    row = shape[0] - 1 - int(math.floor((y - oy) / res))
+    if 0 <= row < shape[0] and 0 <= col < shape[1]:
+        return row, col
+    return None
+
+
+def route_from_drawing(map_name, pts, start, end):
+    """Drawn [[x, y], ...] (map frame) -> (poses, None) or (None, Thai reason)."""
+    if len(pts) < 2:
+        return None, 'เส้นที่วาดสั้นเกินไป'
+    if math.hypot(pts[0][0] - start['x'], pts[0][1] - start['y']) > ROUTE_END_TOL_M:
+        return None, f'ต้องเริ่มวาดที่ {start["name"]} (ไม่เกิน {ROUTE_END_TOL_M} ม.)'
+    if math.hypot(pts[-1][0] - end['x'], pts[-1][1] - end['y']) > ROUTE_END_TOL_M:
+        return None, f'ต้องวาดไปจบที่ {end["name"]} (ไม่เกิน {ROUTE_END_TOL_M} ม.)'
+    ex, ey, eth = end['x'], end['y'], end.get('theta', 0.0)
+    ax = ex - ROUTE_DRAW_APPROACH_M * math.cos(eth)
+    ay = ey - ROUTE_DRAW_APPROACH_M * math.sin(eth)
+    # drop the drawn tail inside the approach leg, then go straight in
+    body = [p for p in pts[:-1] if math.hypot(p[0] - ex, p[1] - ey) > ROUTE_DRAW_APPROACH_M + 0.1]
+    line = [(start['x'], start['y'])] + [tuple(p) for p in body[1:]] + [(ax, ay), (ex, ey)]
+    clean = [line[0]]
+    for p in line[1:]:
+        if math.hypot(p[0] - clean[-1][0], p[1] - clean[-1][1]) > 0.02:
+            clean.append(p)
+    if len(clean) < 3:
+        return None, 'เส้นที่วาดสั้นเกินไป'
+    # resample every ROUTE_STEP_M
+    dense = [clean[0]]
+    carry = 0.0
+    for (x0, y0), (x1, y1) in zip(clean, clean[1:]):
+        seg = math.hypot(x1 - x0, y1 - y0)
+        d = ROUTE_STEP_M - carry
+        while d <= seg:
+            t = d / seg
+            dense.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+            d += ROUTE_STEP_M
+        carry = seg - (d - ROUTE_STEP_M)
+    if math.hypot(dense[-1][0] - ex, dense[-1][1] - ey) > 0.01:
+        dense.append((ex, ey))
+    # sharp corners (heading change over ~0.3 m)
+    k = 6
+    for i in range(k, len(dense) - k):
+        h0 = math.atan2(dense[i][1] - dense[i - k][1], dense[i][0] - dense[i - k][0])
+        h1 = math.atan2(dense[i + k][1] - dense[i][1], dense[i + k][0] - dense[i][0])
+        if abs(math.atan2(math.sin(h1 - h0), math.cos(h1 - h0))) > ROUTE_DRAW_MAX_TURN:
+            return None, (f'เส้นหักมุมแรงเกินไปที่ ({dense[i][0]:.1f}, {dense[i][1]:.1f}) - '
+                          f'ถ้าตรงจุดเข้า {end["name"]} ให้วาดเข้าทางด้านหลัง Station')
+    # map + keep-out check
+    try:
+        meta, occ, free = _map_grid(os.path.join(MAPS_DIR, map_name + '.yaml'))
+    except (OSError, KeyError, ValueError, yaml.YAMLError) as e:
+        return None, f'อ่านแผนที่ไม่ได้: {e}'
+    res = float(meta['resolution'])
+    r = int(math.ceil(ROUTE_DRAW_CLEAR_M / res))
+    yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
+    disk = (xx * xx + yy * yy) <= r * r
+    keep = None
+    kp = os.path.join(MAPS_DIR, map_name + '_keepout.yaml')
+    if os.path.exists(kp):
+        try:
+            kmeta, kocc, _ = _map_grid(kp)
+            keep = (kmeta, kocc)
+        except (OSError, KeyError, ValueError, yaml.YAMLError):
+            keep = None
+    for x, y in dense[::2]:
+        c = _grid_cell(meta, occ.shape, x, y)
+        if c is None or not free[c]:
+            return None, f'เส้นผ่านจุดที่ไม่ใช่พื้นที่ว่างบนแผนที่ ({x:.1f}, {y:.1f})'
+        r0, c0 = c[0] - r, c[1] - r
+        win = occ[max(r0, 0):c[0] + r + 1, max(c0, 0):c[1] + r + 1]
+        dwin = disk[max(-r0, 0):max(-r0, 0) + win.shape[0], max(-c0, 0):max(-c0, 0) + win.shape[1]]
+        if np.any(win & dwin):
+            return None, (f'เส้นชิดผนังเกินไปที่ ({x:.1f}, {y:.1f}) - '
+                          f'ต้องห่างผนัง ≥ {ROUTE_DRAW_CLEAR_M:.2f} ม.')
+        if keep is not None:
+            kc = _grid_cell(keep[0], keep[1].shape, x, y)
+            if kc is not None and keep[1][kc]:
+                return None, f'เส้นผ่านโซนห้ามเข้า ({x:.1f}, {y:.1f})'
+    samples = []
+    for i, (x, y) in enumerate(dense):
+        nx, ny = dense[min(i + 1, len(dense) - 1)]
+        px, py = dense[i - 1] if i == len(dense) - 1 else (x, y)
+        samples.append((x, y, math.atan2(ny - py, nx - px)))
+    return route_from_samples(samples, start, end)
+
+
+def map_grid_or_none(map_name):
+    """Occupancy grid of a saved map for route_tools, None if unreadable."""
+    try:
+        return route_tools.load_occ(os.path.join(MAPS_DIR, map_name + '.yaml'))
+    except (OSError, KeyError, ValueError, yaml.YAMLError):
+        return None
+
+
+def finish_route(map_name, poses, start, end=None):
+    """Turn a recorded/drawn line into the fixed route (route_tools):
+    with `end`, compute a route on the map that keeps the real footprint
+    clear of walls, using the line as a guide (which aisle / which side);
+    it is used unless its closest approach to a wall is worse than the
+    cleaned-up line's.
+    Otherwise (or if planning fails) the line is only smoothed.
+    Returns (poses, report text, has_warnings) - ~2-10 s for a long route."""
+    grid = map_grid_or_none(map_name)
+    poses_i, notes_i, warns_i = route_tools.improve_route(poses, start, grid)
+    use = (poses_i, notes_i, warns_i)
+    if grid is not None and end is not None:
+        try:
+            pp, pn, pw = route_tools.plan_route(os.path.join(MAPS_DIR, map_name + '.yaml'),
+                                                start, end, guide=poses)
+        except Exception as e:  # noqa: BLE001 - never lose the recorded route
+            pp, pn, pw = None, f'คำนวณไม่สำเร็จ: {e}', []
+        # planned wins unless its closest approach to a wall is worse
+        if pp is not None and (route_tools._clear_score(grid, pp)[0]
+                               >= route_tools._clear_score(grid, poses_i)[0] - 0.01):
+            use = (pp, pn, pw)
+        else:
+            notes_i = notes_i + ['ใช้เส้นที่ขับ (คำนวณเส้นทาง: %s)'
+                                 % (pn if pp is None else 'ไม่ดีกว่าเส้นที่ขับ')]
+            use = (poses_i, notes_i, warns_i)
+    poses, notes, warns = use
+    lines = list(notes)
+    if grid is None:
+        lines.append('อ่านแผนที่ไม่ได้ - ไม่ได้ตรวจระยะห่างผนัง')
+    lines += ['⚠ ' + w for w in warns[:6]]
+    if len(warns) > 6:
+        lines.append('⚠ ... อีก %d จุด' % (len(warns) - 6))
+    return poses, '\n'.join(lines), bool(warns)
 
 
 def load_map_image(yaml_path):
@@ -738,6 +897,8 @@ EN = {
     '⏺ บันทึกเส้นทาง...': '⏺ Record route...',
     '⏹ จบการบันทึกเส้นทาง': '⏹ Finish recording route',
     'ลบเส้นทาง...': 'Delete route...',
+    'คำนวณเส้นทาง (ไม่ต้องขับ)...': 'Compute route (no driving)...',
+    'กำลังคำนวณเส้นทาง...': 'Computing route...',
     'QR ตั้งจุดหมายจากมือถือ': 'Phone QR: set goal',
     'Planner (อ่านอย่างเดียว - แก้ใน nav2_params.yaml)': 'Planner (read-only - edit nav2_params.yaml)',
     'เฉพาะ WARN/ERROR': 'WARN/ERROR only',
@@ -1157,10 +1318,17 @@ class RosBridge:
                 time.sleep(0.03)
         threading.Thread(target=burst, daemon=True).start()
 
-    def publish_stations(self, map_name, stations):
+    def publish_stations(self, map_name, stations, route_msg=None):
         if self.ok:
+            # routes thinned to ~0.25 m for the phone (draw / list / delete)
+            routes = [{'from': rt['from'], 'to': rt['to'],
+                       'pts': [[p[0], p[1]] for p in rt['poses'][::5]] + [rt['poses'][-1][:2]]}
+                      for rt in (load_routes(map_name) if map_name else [])
+                      if rt.get('poses')]
             self.stations_pub.publish(self._String(data=json.dumps(
                 {'map': map_name or '',
+                 'routes': routes,
+                 'route_msg': route_msg or {},
                  'routes_file': routes_path(map_name) if map_name else '',
                  'has_routes': bool(map_name and load_routes(map_name)),
                  'use_routes': bool(map_name and routes_enabled(map_name)),
@@ -1462,7 +1630,9 @@ class AmrControlPanel(tk.Tk):
         self._stations = []
         self._selected_station = None
         self._stations_pub_t = 0.0
+        self._route_draw_msg = {}  # {id, ok, text}: result of the last phone route edit
         self._route_rec = None  # {'map', 'start', 'end', 'samples'} while recording
+        self._route_planning = False  # phone route_points computing in a thread
         self._mission = None  # {'station', 'state': active|paused|arrived, 'd0'}
         self._nav_goal = None  # last goal sent from the Nav-test map (x, y, th)
 
@@ -2415,6 +2585,8 @@ class AmrControlPanel(tk.Tk):
         self.btn_del_station.pack(fill='x', padx=px(10), pady=px(4))
         self.btn_route_rec = self._btn(t_goal, '⏺ บันทึกเส้นทาง...', self._on_route_record)
         self.btn_route_rec.pack(fill='x', padx=px(10), pady=px(4))
+        self.btn_route_plan = self._btn(t_goal, 'คำนวณเส้นทาง (ไม่ต้องขับ)...', self._on_route_plan)
+        self.btn_route_plan.pack(fill='x', padx=px(10), pady=px(4))
         self._btn(t_goal, 'ลบเส้นทาง...', self._on_del_route
                   ).pack(fill='x', padx=px(10), pady=px(4))
         self._btn(t_goal, 'QR ตั้งจุดหมายจากมือถือ', lambda: threading.Thread(
@@ -2569,7 +2741,14 @@ class AmrControlPanel(tk.Tk):
                          'theta': round(pose[2], 3)})
         save_stations(self._nav_map_name, stations)
         self._refresh_stations()  # Auto page buttons + pins pick it up now
-        messagebox.showinfo('บันทึกแล้ว', f'Station "{name}" ({pose[0]:.2f}, {pose[1]:.2f})')
+        grid = map_grid_or_none(self._nav_map_name)
+        warn = grid is not None and route_tools.check_station(grid, stations[-1])
+        if warn:
+            messagebox.showwarning('บันทึกแล้ว - ชิดผนัง',
+                                   f'Station "{name}" ({pose[0]:.2f}, {pose[1]:.2f})\n\n{warn}\n'
+                                   'แนะนำ: ขยับหุ่นออกจากผนังแล้วบันทึกทับ')
+        else:
+            messagebox.showinfo('บันทึกแล้ว', f'Station "{name}" ({pose[0]:.2f}, {pose[1]:.2f})')
 
     def _on_del_station(self):
         if not self._nav_map_name:
@@ -2601,11 +2780,16 @@ class AmrControlPanel(tk.Tk):
             old = [r for r in routes if (r['from'], r['to']) == key]
             if old and not messagebox.askyesno('เส้นทางซ้ำ', f'ทับเส้นทาง {key[0]} → {key[1]} เดิม?'):
                 return
+            poses, report, warned = finish_route(rec['map'], poses, rec['start'], rec['end'])
+            if warned and not messagebox.askyesno(
+                    'เส้นทางชิดผนัง', f'{key[0]} → {key[1]}\n{report}\n\n'
+                    'บันทึกต่อหรือไม่? (แนะนำ: ไม่ - ขับอัดใหม่ให้ห่างผนัง)'):
+                return
             routes = [r for r in routes if (r['from'], r['to']) != key]
             routes.append({'from': key[0], 'to': key[1], 'poses': poses})
             save_routes(rec['map'], routes)
             messagebox.showinfo('บันทึกแล้ว', f'{key[0]} → {key[1]} ({len(poses)} จุด)\n'
-                                              'ทดสอบเส้นนี้ก่อนใช้งานจริง')
+                                              f'{report}\nทดสอบเส้นนี้ก่อนใช้งานจริง')
             return
         if not self._nav_map_name:
             return
@@ -2632,6 +2816,60 @@ class AmrControlPanel(tk.Tk):
         messagebox.showinfo('เริ่มบันทึก', f'ขับเดินหน้าจาก {start["name"]} ไป {others[pick]["name"]} '
                                            'แล้วกดจบการบันทึก\nช่วงท้ายขับตรงเข้า Station ตามทิศของ Station')
 
+    def _on_route_plan(self):
+        """Compute a fixed route between two stations on the saved map
+        (route_tools.plan_route, no guide line): the real footprint is kept
+        clear of walls/keep-out the whole way. Runs in a thread (~1-10 s)."""
+        name = self._nav_map_name
+        if not name or self._route_rec is not None:
+            return
+        stations = load_stations(name)
+        if len(stations) < 2:
+            messagebox.showinfo('ไม่มี Station', 'ต้องมีอย่างน้อย 2 Station')
+            return
+        names = [s['name'] for s in stations]
+        i = self._show_list_picker('คำนวณเส้นทาง: จาก', names)
+        if i is None:
+            return
+        others = [s for s in stations if s['name'] != names[i]]
+        j = self._show_list_picker(f'จาก {names[i]} ไปที่', [s['name'] for s in others])
+        if j is None:
+            return
+        start, end = stations[i], others[j]
+        self.btn_route_plan.config(text=T('กำลังคำนวณเส้นทาง...'), state='disabled')
+
+        def work():
+            try:
+                res = route_tools.plan_route(os.path.join(MAPS_DIR, name + '.yaml'), start, end)
+            except Exception as e:  # noqa: BLE001
+                res = (None, f'คำนวณไม่สำเร็จ: {e}', [])
+            self.after(0, lambda: self._route_plan_done(name, start, end, res))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _route_plan_done(self, name, start, end, res):
+        self.btn_route_plan.config(text=T('คำนวณเส้นทาง (ไม่ต้องขับ)...'), state='normal')
+        poses, notes, warns = res
+        key = (start['name'], end['name'])
+        if poses is None:
+            messagebox.showwarning('คำนวณเส้นทางไม่ได้', f'{key[0]} → {key[1]}\n{notes}\n\n'
+                                   'ลองขยับ Station ออกจากผนัง หรือขับอัดเส้นทางเอง')
+            return
+        lines = list(notes) + ['⚠ ' + w for w in warns[:6]]
+        if len(warns) > 6:
+            lines.append('⚠ ... อีก %d จุด' % (len(warns) - 6))
+        routes = load_routes(name)
+        old = any((r['from'], r['to']) == key for r in routes)
+        if not messagebox.askyesno('บันทึกเส้นทางที่คำนวณ?', f'{key[0]} → {key[1]}\n' + '\n'.join(lines)
+                                   + ('\n\nจะทับเส้นทางเดิม' if old else '')
+                                   + '\n\nตรวจแผนที่เทียบหน้างานจริง แล้วทดสอบที่ความเร็วต่ำก่อนใช้งาน'):
+            return
+        routes = [r for r in routes if (r['from'], r['to']) != key]
+        routes.append({'from': key[0], 'to': key[1], 'poses': poses})
+        save_routes(name, routes)
+        self._refresh_route_mode()
+        messagebox.showinfo('บันทึกแล้ว', f'{key[0]} → {key[1]} ({len(poses)} จุด)\n'
+                                          'ทดสอบเส้นนี้ก่อนใช้งานจริง')
+
     def _sample_route(self):
         rec = self._route_rec
         if self._mode != 'navigation':
@@ -2642,6 +2880,110 @@ class AmrControlPanel(tk.Tk):
         if pose is not None and math.hypot(pose[0] - rec['samples'][-1][0],
                                            pose[1] - rec['samples'][-1][1]) >= ROUTE_STEP_M:
             rec['samples'].append(tuple(pose))
+
+    def _phone_route_cmd(self, cmd):
+        """Route drawn / deleted on the phone (goal_picker, via rosboard)."""
+        rid = str(cmd.get('id', ''))[:32]
+
+        def reply(ok, text, bad=None):
+            # bad (route_points failure): {points, leg, at, station} for the
+            # phone to highlight what to delete/move (route_tools.plan_route)
+            self._route_draw_msg = {'id': rid, 'ok': ok, 'text': text}
+            if bad:
+                self._route_draw_msg['bad'] = bad
+            self.ros.log.append(('I' if ok else 'W', 'route (phone): ' + text))
+
+        name = self._mode == 'navigation' and self._nav_map_name
+        if not name or cmd.get('map') != name:
+            reply(False, 'ไม่ได้อยู่ในโหมด Navigation บนแผนที่นี้')
+            return
+        if self._route_rec is not None:
+            reply(False, 'กำลังบันทึกเส้นทางจากหน้าจอหุ่นอยู่')
+            return
+        stations = {s['name']: s for s in load_stations(name)}
+        a, b = stations.get(cmd.get('from')), stations.get(cmd.get('to'))
+        if a is None or b is None or a is b:
+            reply(False, 'Station ต้นทาง/ปลายทางไม่ถูกต้อง')
+            return
+        try:
+            routes = load_routes(name)
+        except (OSError, yaml.YAMLError) as e:
+            reply(False, f'อ่านไฟล์เส้นทางไม่ได้: {e}')
+            return
+        key = (a['name'], b['name'])
+        if cmd['action'] == 'route_delete':
+            left = [r for r in routes if (r['from'], r['to']) != key]
+            if len(left) == len(routes):
+                reply(False, f'ไม่มีเส้นทาง {key[0]} → {key[1]}')
+                return
+            save_routes(name, left)
+            reply(True, f'ลบเส้นทาง {key[0]} → {key[1]} แล้ว')
+            return
+        if cmd['action'] == 'route_points':
+            self._phone_route_points(cmd, name, a, b, key, reply)
+            return
+        try:
+            pts = [(float(p[0]), float(p[1])) for p in cmd.get('points', [])][:ROUTE_DRAW_MAX_PTS]
+        except (TypeError, ValueError, IndexError):
+            reply(False, 'ข้อมูลเส้นไม่ถูกต้อง')
+            return
+        poses, why = route_from_drawing(name, pts, a, b)
+        if poses is None:
+            reply(False, 'ไม่ได้บันทึก: ' + why)
+            return
+        # narrow aisles that barely fit the robot are legal: save, but put
+        # the clearance warnings in the reply (the phone has no confirm)
+        poses, report, warned = finish_route(name, poses, a, b)
+        replaced = any((r['from'], r['to']) == key for r in routes)
+        routes = [r for r in routes if (r['from'], r['to']) != key]
+        routes.append({'from': key[0], 'to': key[1], 'poses': poses})
+        save_routes(name, routes)
+        reply(True, f'{"ทับ" if replaced else "บันทึก"}เส้นทาง {key[0]} → {key[1]} แล้ว '
+                    f'({len(poses)} จุด) - ทดสอบที่ความเร็วต่ำก่อนใช้งานจริง'
+                    + (' | ' + report.replace('\n', ' | ') if warned else ''))
+
+    def _phone_route_points(self, cmd, name, a, b, key, reply):
+        """Phone tapped points (goal_picker): compute the route a -> points
+        -> b on the map (route_tools.plan_route, footprint kept clear of
+        walls/keep-out) in a thread, save it, reply when done (~1-10 s)."""
+        try:
+            via = [(float(p[0]), float(p[1])) for p in cmd.get('points', [])][:ROUTE_POINTS_MAX]
+        except (TypeError, ValueError, IndexError):
+            reply(False, 'ข้อมูลจุดไม่ถูกต้อง')
+            return
+        if self._route_planning:
+            reply(False, 'กำลังคำนวณเส้นทางอื่นอยู่ - รอสักครู่')
+            return
+        self._route_planning = True
+        self.ros.log.append(('I', f'route (phone): คำนวณ {key[0]} → {key[1]} ผ่าน {len(via)} จุด...'))
+
+        def work():
+            try:
+                res = route_tools.plan_route(os.path.join(MAPS_DIR, name + '.yaml'), a, b, via=via)
+            except Exception as e:  # noqa: BLE001
+                res = (None, f'คำนวณไม่สำเร็จ: {e}', [])
+            self.after(0, lambda: done(res))
+
+        def done(res):
+            self._route_planning = False
+            poses, notes, warns = res
+            if poses is None:
+                reply(False, 'ไม่ได้บันทึก: ' + notes, warns if isinstance(warns, dict) else None)
+                self._stations_pub_t = 0.0
+                return
+            if self._nav_map_name != name:
+                reply(False, 'เปลี่ยนแผนที่ระหว่างคำนวณ - ไม่ได้บันทึก')
+                return
+            routes = load_routes(name)
+            replaced = any((r['from'], r['to']) == key for r in routes)
+            routes = [r for r in routes if (r['from'], r['to']) != key]
+            routes.append({'from': key[0], 'to': key[1], 'poses': poses})
+            save_routes(name, routes)
+            reply(True, f'{"ทับ" if replaced else "บันทึก"}เส้นทาง {key[0]} → {key[1]} แล้ว '
+                        f'({" / ".join(notes)}) - ทดสอบที่ความเร็วต่ำก่อนใช้งานจริง'
+                        + ''.join(' | ⚠ ' + w for w in warns[:4]))
+            self._stations_pub_t = 0.0   # phone sees the new route now
+        threading.Thread(target=work, daemon=True).start()
 
     def _on_del_route(self):
         if not self._nav_map_name:
@@ -3040,7 +3382,8 @@ class AmrControlPanel(tk.Tk):
             # read the file, not self._stations: that is only refreshed
             # when the Auto page is opened
             self.ros.publish_stations(self._nav_map_name if nav else '',
-                                      load_stations(self._nav_map_name) if nav else [])
+                                      load_stations(self._nav_map_name) if nav else [],
+                                      self._route_draw_msg)
             self._stations_pub_t = time.monotonic()
         ip = get_local_ip() if int(time.time()) % 5 == 0 or self.pill_net.cget('text') == 'Net —' else None
         if ip:
@@ -3222,6 +3565,10 @@ class AmrControlPanel(tk.Tk):
             except ValueError:
                 continue
             action = cmd.get('action')
+            if action in ('route_draw', 'route_delete', 'route_points'):
+                self._phone_route_cmd(cmd)
+                self._stations_pub_t = 0.0
+                continue
             if action in ('route_fixed', 'route_planner'):
                 name = self._mode == 'navigation' and self._nav_map_name
                 routes = load_routes(name) if name else []

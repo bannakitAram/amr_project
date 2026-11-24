@@ -115,6 +115,11 @@ class WebSocketV1Transport {
         {action: action, kind: kind, shape: shape, points: points, width: width}]));
     }
 
+    routeCmd(cmd) {
+      if (!this.isConnected()) return;
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_ROUTE, cmd]));
+    }
+
     bagCmd({action, topics, label}) {
       if (!this.isConnected()) return;
       const msg = {action: action, topics: topics || []};
@@ -147,6 +152,7 @@ class WebSocketV1Transport {
   WebSocketV1Transport.MSG_BAG = "b";
   WebSocketV1Transport.MSG_DOOR = "d";
   WebSocketV1Transport.MSG_ZONE = "z";
+  WebSocketV1Transport.MSG_ROUTE = "o";
 
   WebSocketV1Transport.PING_SEQ= "s";
   WebSocketV1Transport.PONG_SEQ = "s";

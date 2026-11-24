@@ -299,6 +299,13 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
                 return
             self.node.on_zone_cmd(argv[1])
 
+        # client (goal_picker) drew / deleted a station-to-station route
+        elif argv[0] == ROSBoardSocketHandler.MSG_ROUTE:
+            if len(argv) != 2 or type(argv[1]) is not dict:
+                print("error: route: bad: %s" % message)
+                return
+            self.node.on_route_cmd(argv[1])
+
         # client wants to unsubscribe from topic
         elif argv[0] == ROSBoardSocketHandler.MSG_UNSUB:
             if len(argv) != 2 or type(argv[1]) is not dict:
@@ -333,6 +340,7 @@ ROSBoardSocketHandler.MSG_TELEOP_CFG = "x";
 ROSBoardSocketHandler.MSG_BAG = "b";
 ROSBoardSocketHandler.MSG_DOOR = "d";
 ROSBoardSocketHandler.MSG_ZONE = "z";
+ROSBoardSocketHandler.MSG_ROUTE = "o";
 
 ROSBoardSocketHandler.PING_SEQ = "s";
 ROSBoardSocketHandler.PONG_SEQ = "s";

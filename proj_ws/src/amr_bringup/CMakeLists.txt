@@ -18,6 +18,7 @@ install(PROGRAMS
   scripts/calib_rotate_node.py
   scripts/calib_straight_node.py
   scripts/amr_calib_panel.py
+  scripts/route_tools.py
   scripts/calc_wheel_radius.py
   scripts/gyro_integrate_node.py
   scripts/scan_lines_node.py

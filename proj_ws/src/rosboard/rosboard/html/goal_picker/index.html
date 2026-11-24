@@ -134,6 +134,16 @@
     padding: 8px 10px; z-index: 22; font-size: 13px;
   }
   #zone-panel[hidden] { display: none; }
+  /* route drawing bar (Station -> Station): same look as the zone panel */
+  #route-bar { position: absolute; left: 10px; right: 10px; bottom: 66px;
+    background: rgba(20,20,20,0.92); color: #eee; border-radius: 10px;
+    padding: 8px 10px; z-index: 22; font-size: 13px; }
+  #route-bar[hidden] { display: none; }
+  #route-bar .title { font-size: 12px; color: #aaa; margin-bottom: 6px; }
+  #route-bar .row { display: flex; gap: 6px; flex-wrap: wrap; }
+  #route-bar .zt { flex: 1; min-width: 60px; padding: 11px 4px; border-radius: 8px; border: 1px solid #555;
+    background: #333; color: #eee; font-size: 14px; }
+  #route-bar .zt.sel { background: #1565c0; border-color: #90caf9; }
   #zone-panel .title { font-size: 12px; color: #aaa; margin-bottom: 6px; }
   #zone-panel .row { display: flex; gap: 6px; flex-wrap: wrap; }
   #zone-panel .zk { flex: 1; min-width: 70px; padding: 10px 4px; border-radius: 8px; border: 2px solid transparent;
@@ -238,6 +248,15 @@
       <button class="zt" id="zone-undo">↶ ย้อนจุด</button>
       <button class="zt" id="zone-clear">✕ ล้าง</button>
       <button class="zt" id="zone-close" style="background:#2e7d32;color:#fff">✔ ปิดรูป / ส่ง</button>
+    </div>
+  </div>
+  <div id="route-bar" hidden>
+    <div class="title" id="route-hint"></div>
+    <div class="row">
+      <button class="zt" id="route-undo">↶ ลบจุดล่าสุด</button>
+      <button class="zt" id="route-clear">✕ ล้าง</button>
+      <button class="zt" id="route-send" style="background:#2e7d32;color:#fff">✔ คำนวณ + บันทึก</button>
+      <button class="zt" id="route-exit">ออก</button>
     </div>
   </div>
   <div id="log-panel" hidden></div>
@@ -852,6 +871,7 @@ function redraw() {
   if (mode === 'path' && pathDraft) drawPathDraft(pathDraft.points);
   if (mode === 'zone') drawZoneEdit();
   if (mode === 'door') drawDoorDraft();
+  drawRoutes();
 }
 
 // RViz-style ground-plane grid: an unbounded 1m grid (5m major lines),
@@ -1054,6 +1074,17 @@ let stationsMap = '';
 let stationsAt = 0;
 let hasRoutes = false;
 let useRoutes = false;
+var routes = [];        // [{from, to, pts: [[x, y], ...]}] thinned, from the panel
+var routeReq = null;    // {from, to, id} while mode === 'route'
+var routeDraft = [];    // tapped via points [{x, y}, ...] (the panel computes the route)
+var routeStroke = null; // unused (freehand drawing replaced by points)
+var routePan = false;   // unused: in route mode one finger pans, a tap adds a point
+var routeTap = null;    // {x, y} screen px of a possible tap (route mode)
+var routeBad = null;    // last failed compute: {points: [i], leg: [i, j], at: [x, y], station}
+const ROUTE_TAP_PX = 10;     // moved less than this = tap, not pan
+const ROUTE_HIT_PX = 26;     // tap this close to a point = remove it
+var routePendingId = '';
+var routeMsgId = '';
 const stationPanel = document.getElementById('station-panel');
 
 function handleStations(msg) {
@@ -1065,6 +1096,20 @@ function handleStations(msg) {
       !!d.has_routes !== hasRoutes || !!d.use_routes !== useRoutes;
     hasRoutes = !!d.has_routes;
     useRoutes = !!d.use_routes;
+    const rl = Array.isArray(d.routes) ? d.routes : [];
+    if (JSON.stringify(rl) !== JSON.stringify(routes)) { routes = rl; if (!stationPanel.hidden) renderStationPanel(); redraw(); }
+    const rm = d.route_msg || {};
+    if (rm.id && rm.id !== routeMsgId) {
+      routeMsgId = rm.id;
+      if (rm.id === routePendingId) {
+        routePendingId = '';
+        setStatus((rm.ok ? '✔ ' : '⚠ ') + rm.text);
+        routeBad = (!rm.ok && rm.bad && mode === 'route') ? rm.bad : null;
+        if (routeBad) { renderRouteBar(); focusRouteBad(); redraw(); }
+        if (!rm.ok) alert(rm.text + (routeBad ? '\n\nจุด/ช่วงที่มีปัญหาเป็นสีแดงบนแผนที่' : ''));
+        else if (mode === 'route') setMode('view');
+      }
+    }
     stations = list;
     stationsMap = d.map || '';
     stationsAt = Date.now();
@@ -1121,6 +1166,7 @@ function renderStationPanel() {
     m.onclick = () => transport.mappingCmd({action: useRoutes ? 'route_planner' : 'route_fixed'});
     stationPanel.appendChild(m);
   }
+  if (stations.length >= 2) renderRouteTools();
   for (const s of stations) {
     const b = document.createElement('button');
     b.className = 'btn primary';
@@ -1130,6 +1176,203 @@ function renderStationPanel() {
     stationPanel.appendChild(b);
   }
 }
+
+// ---------- fixed routes drawn on the map (Station -> Station) ----------
+// The line is sent to the AMR control panel (rosboard MSG_ROUTE ->
+// /rosboard_mapping_cmd), which snaps it to the stations, adds a straight
+// approach into the end station, checks wall clearance / keep-out on the
+// saved map and writes <map>_routes.yaml. The answer comes back in
+// /amr_stations route_msg.
+function renderRouteTools() {
+  const box = document.createElement('div');
+  box.className = 'row';
+  const mk = (label) => {
+    const sel = document.createElement('select');
+    for (const s of stations) {
+      const o = document.createElement('option'); o.value = s.name; o.textContent = label + s.name; sel.appendChild(o);
+    }
+    return sel;
+  };
+  const from = mk('จาก '), to = mk('ไป ');
+  if (stations.length > 1) to.selectedIndex = 1;
+  const draw = document.createElement('button');
+  draw.className = 'btn primary';
+  draw.textContent = '📍 วางจุดเส้นทาง';
+  draw.onclick = () => {
+    if (from.value === to.value) { alert('เลือก Station ต้นทางกับปลายทางให้ต่างกัน'); return; }
+    if (!mapInfo) { alert('ยังไม่มีแผนที่'); return; }
+    stationPanel.hidden = true;
+    setMode('route');
+    routeReq = {from: from.value, to: to.value};
+    routePan = false;
+    renderRouteBar();
+    setStatus('วาดเส้นทาง ' + from.value + ' → ' + to.value);
+    redraw();
+  };
+  box.appendChild(from); box.appendChild(to); box.appendChild(draw);
+  stationPanel.appendChild(box);
+  for (const rt of routes) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const t = document.createElement('span');
+    t.style.flex = '1';
+    t.textContent = 'เส้นทาง ' + rt.from + ' → ' + rt.to;
+    const del = document.createElement('button');
+    del.className = 'btn danger';
+    del.textContent = 'ลบ';
+    del.onclick = () => {
+      if (!confirm('ลบเส้นทาง ' + rt.from + ' → ' + rt.to + '?')) return;
+      routePendingId = 'r' + Date.now();
+      transport.routeCmd({action: 'route_delete', map: stationsMap, from: rt.from, to: rt.to, id: routePendingId});
+    };
+    row.appendChild(t); row.appendChild(del);
+    stationPanel.appendChild(row);
+  }
+}
+
+function stationByName(n) { return stations.find((s) => s.name === n); }
+
+function routeDraftPoints() {
+  const a = routeReq && stationByName(routeReq.from), b = routeReq && stationByName(routeReq.to);
+  if (!a || !b) return null;
+  return [{x: a.x, y: a.y}].concat(routeDraft, [{x: b.x, y: b.y}]);
+}
+
+function drawRoutes() {
+  const sp = document.getElementById('station-panel');
+  if (!(mode === 'route' || (sp && !sp.hidden)) || Date.now() - stationsAt > 5000) return;
+  for (const rt of routes) {
+    drawPathDraftColor(rt.pts.map((p) => ({x: p[0], y: p[1]})), 'rgba(0,229,255,0.7)', 3);
+  }
+  if (mode === 'route') {
+    const pts = routeDraftPoints();
+    if (!pts) return;
+    // order preview only: the real route is computed on the robot
+    ctx.save();
+    ctx.setLineDash([8, 8]);
+    drawPathDraftColor(pts, 'rgba(255,235,59,0.8)', 2);
+    ctx.restore();
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const bad = routeBad || {};
+    if (Array.isArray(bad.leg) && pts[bad.leg[0]] && pts[bad.leg[1]]) {
+      const a = worldToScreen(pts[bad.leg[0]].x, pts[bad.leg[0]].y);
+      const b = worldToScreen(pts[bad.leg[1]].x, pts[bad.leg[1]].y);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
+      ctx.strokeStyle = 'rgba(244,67,54,0.9)'; ctx.lineWidth = 5; ctx.setLineDash([10, 6]); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    const badPts = new Set(Array.isArray(bad.points) ? bad.points : []);
+    routeDraft.forEach((p, i) => {
+      const q = worldToScreen(p.x, p.y);
+      if (badPts.has(i)) {
+        ctx.beginPath(); ctx.arc(q.x, q.y, 20, 0, 2 * Math.PI);
+        ctx.lineWidth = 4; ctx.strokeStyle = '#f44336'; ctx.stroke();
+      }
+      ctx.beginPath(); ctx.arc(q.x, q.y, 12, 0, 2 * Math.PI);
+      ctx.fillStyle = badPts.has(i) ? '#f44336' : '#ffeb3b'; ctx.fill();
+      ctx.lineWidth = 2; ctx.strokeStyle = '#333'; ctx.stroke();
+      ctx.fillStyle = badPts.has(i) ? '#fff' : '#000'; ctx.fillText(String(i + 1), q.x, q.y);
+    });
+    if (Array.isArray(bad.at)) {   // where the robot gets stuck / touches a wall
+      const q = worldToScreen(bad.at[0], bad.at[1]);
+      ctx.strokeStyle = '#f44336'; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.moveTo(q.x - 10, q.y - 10); ctx.lineTo(q.x + 10, q.y + 10);
+      ctx.moveTo(q.x + 10, q.y - 10); ctx.lineTo(q.x - 10, q.y + 10); ctx.stroke();
+      ctx.fillStyle = '#f44336'; ctx.font = 'bold 12px sans-serif';
+      ctx.fillText(bad.station ? bad.station + ' ชิดผนัง' : 'ติดตรงนี้', q.x, q.y - 20);
+    }
+    ctx.restore();
+  }
+}
+
+function focusRouteBad() {
+  // centre the map on the problem (keeps the zoom)
+  const b = routeBad || {};
+  let w = null;
+  if (Array.isArray(b.points) && b.points.length && routeDraft[b.points[0]]) w = routeDraft[b.points[0]];
+  else if (Array.isArray(b.at)) w = {x: b.at[0], y: b.at[1]};
+  if (!w) return;
+  const q = worldToScreen(w.x, w.y);
+  view.panX += canvas.clientWidth / 2 - q.x;
+  view.panY += canvas.clientHeight / 2 - q.y;
+}
+
+function routeTapAt(sx, sy) {
+  // tap near a point removes it, elsewhere adds the next point
+  for (let i = routeDraft.length - 1; i >= 0; i--) {
+    const q = worldToScreen(routeDraft[i].x, routeDraft[i].y);
+    if (Math.hypot(q.x - sx, q.y - sy) <= ROUTE_HIT_PX) {
+      routeDraft.splice(i, 1); routeBad = null; renderRouteBar(); redraw(); return;
+    }
+  }
+  if (routeDraft.length >= 50) { alert('ได้สูงสุด 50 จุด'); return; }
+  routeDraft.push(screenToWorld(sx, sy));
+  routeBad = null;
+  renderRouteBar(); redraw();
+}
+
+function drawPathDraftColor(points, color, width) {
+  if (points.length < 2) return;
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.beginPath();
+  const p0 = worldToScreen(points[0].x, points[0].y);
+  ctx.moveTo(p0.x, p0.y);
+  for (let i = 1; i < points.length; i++) {
+    const p = worldToScreen(points[i].x, points[i].y);
+    ctx.lineTo(p.x, p.y);
+  }
+  ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.stroke();
+  ctx.restore();
+}
+
+function routeLength(pts) {
+  let len = 0;
+  for (let i = 1; i < pts.length; i++) len += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+  return len;
+}
+
+function renderRouteBar() {
+  const bar = document.getElementById('route-bar');
+  bar.hidden = mode !== 'route' || !routeReq;
+  if (bar.hidden) return;
+  const pts = routeDraftPoints();
+  const hint = document.getElementById('route-hint');
+  if (routeBad) {
+    const n = (routeBad.points || []).map((i) => i + 1);
+    hint.textContent = '⚠ ' + (n.length ? 'จุดที่ ' + n.join(', ') + ' มีปัญหา (สีแดง) - แตะที่จุดเพื่อลบ แล้ววางใหม่'
+      : routeBad.station ? 'Station ' + routeBad.station + ' ชิดผนัง - ขยับ Station ก่อน'
+      : 'ช่วงสีแดงไปไม่ได้ (✕ = ตัวรถติด) - เพิ่มจุดพาอ้อม หรือย้ายจุด');
+    return;
+  }
+  hint.textContent = routeReq.from + ' → ' + routeReq.to + ': ' + (routeDraft.length
+    ? routeDraft.length + ' จุด (เส้นประ ' + routeLength(pts).toFixed(1) + ' ม.) - แตะเพิ่มจุด, แตะที่จุดเพื่อลบ'
+    : 'แตะแผนที่เพื่อวางจุดที่ต้องผ่านตามลำดับ (ไม่วางก็ได้ - ระบบเลือกทางเอง) · ลาก = เลื่อน, 2 นิ้ว = ซูม');
+}
+
+function sendRoute() {
+  if (!routeReq || !routeDraftPoints()) return;
+  const exists = routes.some((rt) => rt.from === routeReq.from && rt.to === routeReq.to);
+  if (!confirm('คำนวณและ' + (exists ? 'ทับ' : 'บันทึก') + 'เส้นทาง ' + routeReq.from + ' → ' + routeReq.to +
+      (routeDraft.length ? ' ผ่าน ' + routeDraft.length + ' จุด' : ' (ระบบเลือกทางเอง)') + '?' +
+      '\n\nหุ่นจะคำนวณเส้นทางให้ตัวรถพ้นผนังบนแผนที่ (1-10 วินาที). แผนที่ไม่เห็นพาเลท/รถเข็น/คน ' +
+      'ต้องเดินตรวจเส้นทางจริงและทดสอบที่ความเร็วต่ำโดยมีคนเฝ้าก่อนใช้งานในไลน์ (ISO 3691-4)')) return;
+  routePendingId = 'r' + Date.now();
+  transport.routeCmd({action: 'route_points', map: stationsMap, from: routeReq.from, to: routeReq.to,
+    id: routePendingId, points: routeDraft.map((p) => [p.x, p.y])});
+  setStatus('กำลังคำนวณเส้นทาง...');
+}
+
+document.getElementById('route-undo').addEventListener('click', () => { routeDraft.pop(); routeBad = null; renderRouteBar(); redraw(); });
+document.getElementById('route-clear').addEventListener('click', () => {
+  if (routeDraft.length && !confirm('ล้างจุดทั้งหมด?')) return;
+  routeDraft = []; routeBad = null; renderRouteBar(); redraw();
+});
+document.getElementById('route-send').addEventListener('click', sendRoute);
+document.getElementById('route-exit').addEventListener('click', () => setMode('view'));
 
 function sendToStation(s) {
   stationPanel.hidden = true;
@@ -1954,6 +2197,8 @@ function setMode(next) {
   zoneResetDrafts();
   doorDraft = null;
   if (next !== 'door') doorPinReq = null;
+  routeReq = null; routeDraft = []; routeStroke = null; routePan = false; routeBad = null;
+  document.getElementById('route-bar').hidden = true;
   hideConfirm();
   for (const id of ['mode-view', 'mode-goal', 'mode-path', 'mode-initpose', 'mode-zone']) {
     document.getElementById(id).classList.toggle('active', id === 'mode-' + next);
@@ -1997,6 +2242,7 @@ btnDiscard.addEventListener('click', () => {
   zoneDraft = null;
   zoneStroke = null;   // polygon corners stay, to adjust and send again
   doorDraft = null;    // door pin mode stays: tap again
+  routeDraft = []; routeStroke = null;  // route mode stays: draw again
   hideConfirm();
   redraw();
 });
@@ -2005,8 +2251,9 @@ canvas.addEventListener('pointerdown', (e) => {
   canvas.setPointerCapture(e.pointerId);
   activePointers.set(e.pointerId, {x: e.clientX, y: e.clientY});
   if (activePointers.size === 1) {
-    if (mode === 'view') {
+    if (mode === 'view' || mode === 'route') {
       panState = {active: true, lastX: e.clientX, lastY: e.clientY};
+      routeTap = mode === 'route' && routeReq ? {x: e.clientX, y: e.clientY} : null;
     } else if ((mode === 'goal' || mode === 'initpose') && mapInfo) {
       const w = screenToWorld(e.clientX, e.clientY);
       goalDraft = {ax: w.x, ay: w.y, tx: w.x, ty: w.y};
@@ -2026,6 +2273,7 @@ canvas.addEventListener('pointerdown', (e) => {
     goalDraft = null;
     pathDraft = null;
     doorDraft = null;   // pinch = zoom, not a pin
+    routeTap = null;    // pinch = zoom, not a tap
     if (mode === 'zone') zoneCancelGesture();
   }
   redraw();
@@ -2038,7 +2286,8 @@ canvas.addEventListener('pointermove', (e) => {
   if (activePointers.size >= 2) {
     handlePinch();
   } else if (activePointers.size === 1) {
-    if (mode === 'view' && panState.active) {
+    if ((mode === 'view' || mode === 'route') && panState.active) {
+      if (routeTap && Math.hypot(e.clientX - routeTap.x, e.clientY - routeTap.y) > ROUTE_TAP_PX) routeTap = null;
       view.panX += e.clientX - panState.lastX;
       view.panY += e.clientY - panState.lastY;
       panState.lastX = e.clientX;
@@ -2070,9 +2319,10 @@ function endPointer(e) {
     else if (mode === 'path' && pathDraft) finalizePathDraft();
     else if (mode === 'zone') zonePointerUp(e);
     else if (mode === 'door') doorPinUp();
+    else if (mode === 'route' && routeTap && mapInfo) { const t = routeTap; routeTap = null; routeTapAt(t.x, t.y); }
   } else if (activePointers.size === 1) {
     const remaining = [...activePointers.values()][0];
-    panState = {active: mode === 'view', lastX: remaining.x, lastY: remaining.y};
+    panState = {active: mode === 'view' || mode === 'route', lastX: remaining.x, lastY: remaining.y};
   }
   redraw();
 }
