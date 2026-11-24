@@ -375,7 +375,7 @@ class ROSBoardNode(object):
         if action not in ("add", "erase") or shape not in ("poly", "brush"):
             print("error: zone: bad action/shape %r %r" % (action, shape))
             return
-        if action == "add" and kind not in ("keepout", 30, 50):
+        if action == "add" and kind not in ("keepout", "odom", 30, 50):
             print("error: zone: bad kind %r" % (kind,))
             return
         try:

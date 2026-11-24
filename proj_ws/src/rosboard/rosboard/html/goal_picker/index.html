@@ -222,6 +222,7 @@
       <button class="zk sel" data-kind="keepout" style="background:#e53935;color:#fff">⛔ ห้ามเข้า</button>
       <button class="zk" data-kind="30" style="background:#ff8000">🐢 30%</button>
       <button class="zk" data-kind="50" style="background:#ffd600">🐢 50%</button>
+      <button class="zk" data-kind="odom" style="background:#8e24aa;color:#fff">🧭 Odom</button>
       <button class="zk" data-kind="erase" style="background:#ddd">🧽 ลบ</button>
     </div>
     <div class="row" style="margin-top:6px">
@@ -1162,9 +1163,11 @@ document.getElementById('btn-stations').addEventListener('click', () => {
 var zones = [];   // var: redraw() may run before this line
 var zonesAt = 0;
 const ZONE_STYLE = {keepout: ['rgba(229,57,53,0.40)', '#e53935'],
+                    odom: ['rgba(142,36,170,0.30)', '#8e24aa'],
                     30: ['rgba(255,128,0,0.30)', '#ff8000'],
                     50: ['rgba(255,214,0,0.28)', '#ffd600']};
 
+var odomZoneOn = false;
 function handleZones(msg) {
   try {
     const d = JSON.parse(msg.data);
@@ -1172,8 +1175,18 @@ function handleZones(msg) {
       z.slice(0, 4).every(isFinite));
     const changed = JSON.stringify(list) !== JSON.stringify(zones);
     zones = list; zonesAt = Date.now();
-    if (d.msg && d.msg !== zoneLastMsg) { if (zoneLastMsg !== '' || mode === 'zone') setStatus(d.msg); }
+    if (d.msg && d.msg !== zoneLastMsg) {
+      if (zoneLastMsg !== '' || mode === 'zone') setStatus(d.msg);
+      // a refused edit must not go unnoticed (status bar is easy to miss)
+      if (zoneLastMsg !== '' && mode === 'zone' && d.msg.indexOf('ไม่บันทึก') === 0) alert(d.msg);
+    }
     zoneLastMsg = d.msg || '';
+    // zone_manager switched AMCL to odom-bias (robot inside an odom zone)
+    if (!!d.odom_on !== odomZoneOn) {
+      odomZoneOn = !!d.odom_on;
+      setStatus(odomZoneOn ? '🧭 เข้าโซน Odom - AMCL เชื่อ odom มากขึ้น, ความเร็ว 50%'
+                           : '🧭 ออกจากโซน Odom - AMCL กลับปกติ');
+    }
     if (changed) redraw();
   } catch (e) {}
 }
@@ -1208,7 +1221,7 @@ function drawZones() {
     if (seen.has(z[4])) continue;
     seen.add(z[4]);
     const p = worldToScreen(z[0], z[3]);
-    const label = z[4] === 'keepout' ? '⛔ ห้ามเข้า' : '🐢 ' + z[4] + '%';
+    const label = z[4] === 'keepout' ? '⛔ ห้ามเข้า' : z[4] === 'odom' ? '🧭 Odom' : '🐢 ' + z[4] + '%';
     ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,0.7)';
     ctx.strokeText(label, p.x + 2, p.y - 4);
     ctx.fillStyle = (ZONE_STYLE[z[4]] || ZONE_STYLE[50])[1];
@@ -1229,7 +1242,7 @@ const ZONE_MIN_SIDE = 0.2;    // m - smaller rect drags count as a tap
 const ZONE_TAP_PX = 12;       // CSS px - polygon: more movement = not a tap
 const ZONE_BRUSH_STEP = 0.08; // m between brush points
 const ZONE_MAX_POINTS = 400;
-const ZONE_LABEL = {keepout: 'โซนห้ามเข้า', 30: 'โซนความเร็ว 30%', 50: 'โซนความเร็ว 50%', erase: 'ลบโซน'};
+const ZONE_LABEL = {keepout: 'โซนห้ามเข้า', odom: 'โซน Odom (เชื่อ odom มากขึ้น + ช้า 50%)', 30: 'โซนความเร็ว 30%', 50: 'โซนความเร็ว 50%', erase: 'ลบโซน'};
 const ZONE_HINT = {
   poly: 'แตะทีละมุมบนแผนที่ แล้วกด ✔ ปิดรูป / ส่ง (สองนิ้ว = เลื่อน/ซูม)',
   brush: 'ลากนิ้วระบายบนแผนที่ ปล่อยนิ้วแล้วยืนยัน (สองนิ้ว = เลื่อน/ซูม)',
@@ -1349,7 +1362,7 @@ function confirmZone(shape, pts, width) {
     if (kind === 'keepout' && !confirm('เพิ่มโซนห้ามเข้า?\n\nNav2 จะไม่วางเส้นทางเข้าพื้นที่นี้ทันที ' +
         'เส้นทาง (route) ที่บันทึกไว้ผ่านพื้นที่นี้จะใช้ไม่ได้')) return;
     transport.zoneCmd({action: kind === 'erase' ? 'erase' : 'add',
-                       kind: kind === 'erase' ? null : (kind === 'keepout' ? 'keepout' : Number(kind)),
+                       kind: kind === 'erase' ? null : (kind === 'keepout' || kind === 'odom' ? kind : Number(kind)),
                        shape: shape, width: width,
                        points: pts.map((p) => [+p.x.toFixed(3), +p.y.toFixed(3)])});
     setStatus('ส่งคำสั่ง' + ZONE_LABEL[kind] + 'แล้ว...');

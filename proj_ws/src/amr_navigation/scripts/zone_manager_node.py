@@ -32,19 +32,40 @@ Out for the page:
       rectangles = horizontal runs of equal cells at CELL_M; msg reports the
       last edit, incl. stations / route points that ended up in keep-out.
 
+Odom-bias zones (kind "odom", file <map>_odom.pgm/.yaml, black = zone):
+for areas whose layout changes often (pallets, carts), where the LiDAR does
+not match the map and AMCL pulls the pose off. While the robot
+(TF map -> base_footprint) is inside one, AMCL is switched to ODOM_BIAS:
+less trust in unexplained laser hits (z_hit down, z_rand up), more trust
+in the wheel+IMU odometry (alpha down) and fewer filter updates
+(update_min_d/a up) - AMCL still runs and still uses the fixed walls. On
+leaving (ODOM_EXIT_M hysteresis), map change or node exit the values read
+from AMCL before the switch are put back. Adding an odom zone also sets
+speed 50 % on its cells that have no other zone (slow = less wheel slip =
+better odometry). An odom cell closer than ODOM_SENSOR_DOOR_CLEAR_M to the
+slow-down edge of a sensor door (<map>_doors.yaml relay 0) is refused: the
+sensor door's short-stop zone needs normal localization.
+
 Not a safety function (ISO 3691-4): zones depend on localization.
 """
 import json
 import os
 import shutil
 
+import math
+import time
+
 import numpy as np
 import rclpy
 import rclpy.executors
+import tf2_ros
 import yaml
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import GetParameters, SetParameters
+from rclpy.time import Time
 from nav2_msgs.msg import CostmapFilterInfo
 from nav_msgs.msg import OccupancyGrid
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from std_msgs.msg import String
@@ -56,6 +77,15 @@ MAX_SIDE_M = 60.0     # largest shape extent accepted from the page
 MAX_POINTS = 400
 BRUSH_MIN_M, BRUSH_MAX_M = 0.1, 3.0
 MAX_RECTS = 4000      # /amr_zones size guard
+ODOM_SPEED = 50       # speed % painted with a new odom zone (cells without a zone)
+ODOM_EXIT_M = 0.3     # leave the odom zone only this far outside it
+ODOM_SENSOR_DOOR_CLEAR_M = 4.0  # odom cells this far from a sensor door's slow zone edge
+SENSOR_DOOR_SLOW_MARGIN_M = 0.5  # = door_manager_node.py SLOW_MARGIN_M
+ODOM_RESEND_S = 5.0   # re-assert the AMCL values (survives an AMCL restart)
+# AMCL in an odom zone. Defaults (nav2_params.yaml): alpha1-4 0.1/0.2/0.4/0.2,
+# z_hit 0.8, z_rand 0.2, update_min_d/a 0.05
+ODOM_BIAS = {'alpha1': 0.05, 'alpha2': 0.1, 'alpha3': 0.15, 'alpha4': 0.1,
+             'z_hit': 0.5, 'z_rand': 0.5, 'update_min_d': 0.3, 'update_min_a': 0.15}
 
 
 def read_yaml(path):
@@ -82,7 +112,17 @@ class ZoneManager(Node):
 
         # zone grid in image layout (row 0 = top): 0 none, -1 keep-out, else speed %
         self.zone = np.zeros((self.h, self.w), np.int16)
+        self.odom = np.zeros((self.h, self.w), bool)   # odom-bias zone
         self.load()
+        self.odom_exit = self.dilate(self.odom)
+        self.odom_on = False      # AMCL currently in ODOM_BIAS
+        self.odom_sent_t = 0.0
+        self.amcl_normal = None   # AMCL values read before the first switch
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.amcl_get = self.create_client(GetParameters, '/amcl/get_parameters')
+        self.amcl_set = self.create_client(SetParameters, '/amcl/set_parameters')
+        self.odom_state_pub = self.create_publisher(String, '/odom_zone_state', 10)
         self.backed_up = False
         self.msg = ''
 
@@ -102,14 +142,17 @@ class ZoneManager(Node):
         self.create_subscription(String, '/rosboard_zone_cmd', self.on_cmd, 10)
         self.publish_masks()
         self.create_timer(2.0, self.publish_zones)
+        self.create_timer(0.2, self.tick_odom)
         self.get_logger().info('map %s: %d keep-out, %d speed cells' % (
-            self.map_name, int((self.zone == -1).sum()), int((self.zone > 0).sum())))
+            self.map_name, int((self.zone == -1).sum()), int((self.zone > 0).sum()))
+            + ', %d odom-bias cells' % int(self.odom.sum()))
 
     # ---- files ------------------------------------------------------------
     def paths(self, kind):
         return self.stem + '_%s.yaml' % kind, self.stem + '_%s.pgm' % kind
 
     def load(self):
+        self.load_odom()
         for kind in ('speed', 'keepout'):   # keep-out last: it wins
             y_path, _ = self.paths(kind)
             if not os.path.exists(y_path):
@@ -129,9 +172,30 @@ class ZoneManager(Node):
                 ok = (a >= 1) & (a <= 100)
                 self.zone[ok] = a[ok]
 
+    def load_odom(self):
+        y_path, _ = self.paths('odom')
+        if not os.path.exists(y_path):
+            return
+        try:
+            a = read_image(y_path, read_yaml(y_path))
+        except (OSError, KeyError, ValueError, yaml.YAMLError) as e:
+            self.get_logger().error('%s: %s' % (y_path, e))
+            return
+        if a.shape != self.odom.shape:
+            self.get_logger().error('%s: size differs from the map - ignored' % y_path)
+            return
+        self.odom = a < 128
+
+    def dilate(self, mask):
+        n = int(round(ODOM_EXIT_M / self.res)) * 2 + 1
+        if not mask.any():
+            return mask.copy()
+        img = Image.fromarray(mask.astype(np.uint8) * 255).filter(ImageFilter.MaxFilter(n))
+        return np.array(img) > 0
+
     def save(self):
         if not self.backed_up:
-            for kind in ('keepout', 'speed'):
+            for kind in ('keepout', 'speed', 'odom'):
                 for p in self.paths(kind):
                     if os.path.exists(p):
                         shutil.copy(p, p + '.bak')
@@ -139,7 +203,8 @@ class ZoneManager(Node):
         imgs = {'keepout': (np.where(self.zone == -1, 0, 254).astype(np.uint8), 'trinary',
                             (self.zone == -1).any()),
                 'speed': (np.where(self.zone > 0, self.zone, SPEED_NONE).astype(np.uint8), 'raw',
-                          (self.zone > 0).any())}
+                          (self.zone > 0).any()),
+                'odom': (np.where(self.odom, 0, 254).astype(np.uint8), 'trinary', self.odom.any())}
         for kind, (img, mode, has) in imgs.items():
             y_path, p_path = self.paths(kind)
             if not has:
@@ -186,7 +251,7 @@ class ZoneManager(Node):
             return
         if action not in ('add', 'erase') or shape not in ('poly', 'brush'):
             return
-        if action == 'add' and kind not in ('keepout',) + SPEED_KINDS:
+        if action == 'add' and kind not in ('keepout', 'odom') + SPEED_KINDS:
             return
         if not pts or len(pts) > MAX_POINTS or not np.all(np.isfinite(pts)) or \
                 (shape == 'poly' and len(pts) < 3) or not np.isfinite(width):
@@ -200,7 +265,19 @@ class ZoneManager(Node):
         if not sel.any():
             self.report('โซนอยู่นอกแผนที่ - ไม่บันทึก')
             return
-        self.zone[sel] = 0 if action == 'erase' else (-1 if kind == 'keepout' else int(kind))
+        if action == 'add' and kind == 'odom':
+            why = self.odom_door_conflict(sel)
+            if why:
+                self.report('ไม่บันทึกโซน Odom: ' + why)
+                return
+            self.odom[sel] = True
+            self.zone[sel & (self.zone == 0)] = ODOM_SPEED
+        elif action == 'erase':
+            self.zone[sel] = 0
+            self.odom[sel] = False
+        else:
+            self.zone[sel] = -1 if kind == 'keepout' else int(kind)
+        self.odom_exit = self.dilate(self.odom)
         try:
             self.save()
         except OSError as e:
@@ -208,12 +285,109 @@ class ZoneManager(Node):
             return
         self.publish_masks()
         what = 'ลบโซน' if action == 'erase' else (
-            'เพิ่มโซนห้ามเข้า' if kind == 'keepout' else 'เพิ่มโซนความเร็ว %d%%' % kind)
+            'เพิ่มโซนห้ามเข้า' if kind == 'keepout' else
+            'เพิ่มโซน Odom (ความเร็ว %d%%)' % ODOM_SPEED if kind == 'odom' else
+            'เพิ่มโซนความเร็ว %d%%' % kind)
         area = sel.sum() * self.res * self.res
         warn = self.keepout_warnings()
         self.get_logger().info('%s (%s, %.2f m^2)' % (what, shape, area))
         self.report('%s %.1f ม.² แล้ว (บันทึกไฟล์แล้ว)' % (what, area) +
                     (' - ⚠ ' + '; '.join(warn) if warn else ''))
+
+    def odom_door_conflict(self, sel):
+        """Thai reason if the new odom cells come too close to a sensor door."""
+        try:
+            doors = (read_yaml(self.stem + '_doors.yaml') or {}).get('doors', [])
+        except FileNotFoundError:
+            return ''
+        except (OSError, yaml.YAMLError) as e:
+            return 'อ่านไฟล์ประตูไม่ได้ (%s)' % e
+        rows, cols = np.nonzero(sel)
+        xs = self.ox + (cols + 0.5) * self.res
+        ys = self.oy + (self.h - rows - 0.5) * self.res
+        for d in doors:
+            try:
+                if int(d['relay']) != 0:
+                    continue
+                need = float(d.get('radius', 1.5)) + SENSOR_DOOR_SLOW_MARGIN_M + ODOM_SENSOR_DOOR_CLEAR_M
+                dist = float(np.min(np.hypot(xs - float(d['x']), ys - float(d['y']))))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if dist < need:
+                return ('ใกล้ประตู sensor %s เกินไป (%.1f ม. ต้อง ≥ %.1f ม. จากกลางประตู) - '
+                        'ต้องให้ AMCL กลับมาปกติก่อนถึงประตู' % (d.get('name'), dist, need))
+        return ''
+
+    # ---- odom-bias switching ------------------------------------------------
+    def robot_xy(self):
+        try:
+            t = self.tf_buffer.lookup_transform('map', 'base_footprint', Time())
+        except tf2_ros.TransformException:
+            return None
+        return t.transform.translation.x, t.transform.translation.y
+
+    def in_mask(self, mask, x, y):
+        c = int(math.floor((x - self.ox) / self.res))
+        r = self.h - 1 - int(math.floor((y - self.oy) / self.res))
+        return 0 <= r < self.h and 0 <= c < self.w and bool(mask[r, c])
+
+    def tick_odom(self):
+        xy = self.robot_xy() if self.odom.any() or self.odom_on else None
+        want = False
+        if xy is not None:
+            want = self.in_mask(self.odom_exit if self.odom_on else self.odom, *xy)
+        now = time.monotonic()
+        if want != self.odom_on or (want and now - self.odom_sent_t > ODOM_RESEND_S):
+            self.switch_amcl(want, now)
+        self.odom_state_pub.publish(String(data=json.dumps({'on': self.odom_on})))
+
+    def switch_amcl(self, on, now):
+        if not (self.amcl_set.service_is_ready() and self.amcl_get.service_is_ready()):
+            return
+        if self.amcl_normal is None:
+            # read AMCL's own values once, before changing anything
+            req = GetParameters.Request(names=list(ODOM_BIAS))
+            fut = self.amcl_get.call_async(req)
+            fut.add_done_callback(self.on_amcl_normal)
+            return
+        values = ODOM_BIAS if on else self.amcl_normal
+        req = SetParameters.Request()
+        for name, v in values.items():
+            req.parameters.append(Parameter(name=name, value=ParameterValue(
+                type=ParameterType.PARAMETER_DOUBLE, double_value=float(v))))
+        self.amcl_set.call_async(req).add_done_callback(self.on_amcl_set)
+        if on != self.odom_on:
+            self.get_logger().warn('odom-bias zone: AMCL %s' % ('ODOM-BIAS' if on else 'normal'))
+        self.odom_on = on
+        self.odom_sent_t = now
+        self.publish_zones()  # phone sees the switch now
+
+    def on_amcl_normal(self, fut):
+        try:
+            vals = fut.result().values
+        except Exception as e:  # noqa: BLE001 - AMCL went away
+            self.get_logger().error('AMCL get_parameters failed: %s' % e)
+            return
+        if len(vals) != len(ODOM_BIAS) or any(v.type != ParameterType.PARAMETER_DOUBLE for v in vals):
+            self.get_logger().error('AMCL get_parameters: unexpected answer - odom zone off')
+            return
+        self.amcl_normal = {n: v.double_value for n, v in zip(ODOM_BIAS, vals)}
+        self.get_logger().info('AMCL normal values: %s' % self.amcl_normal)
+
+    def on_amcl_set(self, fut):
+        try:
+            res = fut.result().results
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().error('AMCL set_parameters failed: %s' % e)
+            return
+        bad = [r.reason for r in res if not r.successful]
+        if bad:
+            self.get_logger().error('AMCL refused odom-bias values: %s' % bad)
+
+    def restore_amcl(self):
+        """Best effort on exit: normal AMCL values back."""
+        if self.odom_on and self.amcl_normal is not None and self.amcl_set.service_is_ready():
+            self.switch_amcl(False, time.monotonic())
 
     def keepout_warnings(self):
         keep = self.zone == -1
@@ -279,8 +453,23 @@ class ZoneManager(Node):
                 rects.append([round(self.ox + c0 * cell, 2), round(y1 - cell, 2),
                               round(self.ox + c * cell, 2), round(y1, 2),
                               'keepout' if v == -1 else v])
+        o = self.odom[::step, ::step]
+        for r in np.nonzero(o.any(axis=1))[0]:
+            row = o[r]
+            y1 = self.oy + (self.h - r * step) * self.res
+            c = 0
+            while c < row.shape[0] and len(rects) < MAX_RECTS:
+                if not row[c]:
+                    c += 1
+                    continue
+                c0 = c
+                while c < row.shape[0] and row[c]:
+                    c += 1
+                rects.append([round(self.ox + c0 * cell, 2), round(y1 - cell, 2),
+                              round(self.ox + c * cell, 2), round(y1, 2), 'odom'])
         self.zones_pub.publish(String(data=json.dumps(
-            {'map': self.map_name, 'zones': rects, 'msg': self.msg}, ensure_ascii=False)))
+            {'map': self.map_name, 'zones': rects, 'msg': self.msg,
+             'odom_on': self.odom_on}, ensure_ascii=False)))
 
 
 def main():
@@ -291,6 +480,7 @@ def main():
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
+        node.restore_amcl()
         node.destroy_node()
         rclpy.try_shutdown()
 
