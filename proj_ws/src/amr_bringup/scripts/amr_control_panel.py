@@ -723,18 +723,31 @@ def laser_box_for(v):
             'min_y': round(-(v['fp_right'] + m), 2), 'max_y': round(v['fp_left'] + m, 2)}
 
 
+def _robot_body_split(text):
+    """(head, filter1 block, tail): the footprint self-hit box is filter1 only;
+    filter2+ (cart leg patch) must not be read or rewritten from the footprint."""
+    i = text.find('filter1:')
+    if i < 0:
+        raise ValueError('laser_filter.yaml: no filter1')
+    j = text.find('filter2:', i)
+    j = len(text) if j < 0 else text.rfind('\n', 0, j) + 1
+    return text[:i], text[i:j], text[j:]
+
+
 def read_laser_box(text):
+    _, body, _ = _robot_body_split(text)
     for k, rx in _BOX_RES.items():
-        if len(rx.findall(text)) != 1:
-            raise ValueError(f'laser_filter.yaml: expected 1 x {k}')
-    return {k: float(rx.search(text).group(2)) for k, rx in _BOX_RES.items()}
+        if len(rx.findall(body)) != 1:
+            raise ValueError(f'laser_filter.yaml: expected 1 x {k} in filter1')
+    return {k: float(rx.search(body).group(2)) for k, rx in _BOX_RES.items()}
 
 
 def write_laser_box(text, v):
     read_laser_box(text)
+    head, body, tail = _robot_body_split(text)
     for k, val in laser_box_for(v).items():
-        text = _BOX_RES[k].sub(lambda m, val=val: m.group(1) + f'{val:.2f}', text)
-    return text
+        body = _BOX_RES[k].sub(lambda m, val=val: m.group(1) + f'{val:.2f}', body)
+    return head + body + tail
 
 
 def find_key(tree, key):

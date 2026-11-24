@@ -23,3 +23,21 @@ scan_to_scan_filter_chain:
         min_z: -1.0
         max_z: 2.0
         invert: false        # false = drop points INSIDE the box
+    # Cart leg (rear right) of the cart that straddles the robot: measured at
+    # base_footprint (-0.70, -0.37) parked, but (-0.72, -0.42) on the U-turn
+    # near Station_a (2026-11-24 16:24) - the cart has lateral play, the leg
+    # left filter1's box and RPP refused to turn (obstacle 2 cm from the side).
+    # Only this patch: x -0.80..-0.62, y -0.47..-0.40 (blind 7 cm beyond the
+    # footprint side there, also without a cart). Operator choice (option B).
+    filter2:
+      name: cart_leg_rear_right
+      type: laser_filters/LaserScanBoxFilter
+      params:
+        box_frame: base_footprint
+        min_x: -0.80
+        max_x: -0.62
+        min_y: -0.47
+        max_y: -0.40
+        min_z: -1.0
+        max_z: 2.0
+        invert: false
