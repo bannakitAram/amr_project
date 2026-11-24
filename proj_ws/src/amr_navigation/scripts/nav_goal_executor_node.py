@@ -158,14 +158,14 @@ DETOUR_EARLY_M = 1.6     # m bumper -> object on the route: stop here while foll
 DETOUR_EARLY_HZ = 5.0    # early-stop check rate
 DETOUR_EARLY_MIN_LEFT = 1.5  # m - no early stop when the route ends closer than this
 DETOUR_REAR_MARGIN = 0.30  # m - behind a detour backup must be clear this much further
-DETOUR_SIDE_CLEAR = 0.20 # m - robot side to object gap while passing it
+DETOUR_SIDE_CLEAR = 0.10 # m - robot side to object gap while passing it (was 0.20, 2026-11-24)
 DETOUR_RAMP_M = 1.2      # m along the route to move over to the side lane (and back)
 DETOUR_RAMP_MIN = 0.8    # m - shortest ramp; less room in front -> back up first
 DETOUR_FRONT_GAP = 0.15  # m - lane must be reached this far before the bumper meets the object
 DETOUR_BACK_MAX = 0.8    # m - longest backup to make room for the ramp
 DETOUR_MAX_OFFSET = 1.2  # m - detour may leave the recorded route by at most this
                          # (was 1.0: Station_a->b test 2026-11-24 15:37 needed 1.03 m left)
-DETOUR_FOOT_MARGIN = 0.05  # m - footprint check against the global costmap / scan
+DETOUR_FOOT_MARGIN = 0.03  # m - footprint check against /map and scan (was 0.05)
 STATION_MATCH = 0.05     # m - a station goal belongs to the saved station this close
 
 APPROACH_DIST = 1.0      # m - pre-goal distance behind the station
@@ -980,7 +980,12 @@ def main():
                 continue
             ox, oy = here[0] + x * c - y * s_, here[1] + x * s_ + y * c
             dist, along = min((math.hypot(px - ox, py - oy), dd) for (px, py), dd in ahead)
-            if dist < DETOUR_BLOCK_R and not on_static_map(ox, oy):
+            # on a lane shift only points the footprint would really touch: the
+            # side of the object, unseen when the shift was planned, came into
+            # view within 0.55 m and stopped the robot mid-detour (test 16:00)
+            r = FOOT_HALF_W + DETOUR_FOOT_MARGIN if path is early.get('detour') \
+                else DETOUR_BLOCK_R
+            if dist < r and not on_static_map(ox, oy):
                 n += 1   # along = route point beside the object, not one before it
                 nearest = along if nearest is None else min(nearest, along)
         return (n, nearest - FOOT_FRONT) if n >= BACKUP_MIN_POINTS else None
@@ -1021,6 +1026,7 @@ def main():
         current['req'] = req
         station['value'] = req[1]
         route_plan['value'] = path
+        early['detour'] = path
         if not sent(navigator.followPath(path), 'detour'):
             return 'Nav2 rejected the detour'
         alert('warn', 'สิ่งกีดขวางไม่ขยับ - ใช้ทางอ้อมชั่วคราวแล้วกลับเข้าเส้นทางเดิม')
