@@ -158,7 +158,8 @@ DETOUR_EARLY_M = 1.6     # m bumper -> object on the route: stop here while foll
 DETOUR_EARLY_HZ = 5.0    # early-stop check rate
 DETOUR_EARLY_MIN_LEFT = 1.5  # m - no early stop when the route ends closer than this
 DETOUR_REAR_MARGIN = 0.30  # m - behind a detour backup must be clear this much further
-DETOUR_SIDE_CLEAR = 0.10 # m - robot side to object gap while passing it (was 0.20, 2026-11-24)
+DETOUR_SIDE_CLEAR = 0.20 # m - robot side to object gap while passing it (0.10 tried 2026-11-24
+                         # 16:02: shift came out 0 m and RPP's own footprint check refused it)
 DETOUR_RAMP_M = 1.2      # m along the route to move over to the side lane (and back)
 DETOUR_RAMP_MIN = 0.8    # m - shortest ramp; less room in front -> back up first
 DETOUR_FRONT_GAP = 0.15  # m - lane must be reached this far before the bumper meets the object
@@ -714,8 +715,10 @@ def main():
                 why = send_detour(req)
                 if why is None:
                     return
-                wait_for_clear(req, FAILED_RETRY_S,
-                               'สิ่งกีดขวางไม่ขยับ และอ้อมไม่ได้ (%s) - จอดรอ' % why)
+                if why.startswith('no object'):
+                    pending['value'] = req + (True,)
+                else:
+                    hold_for_detour(req, why)
                 return
             pending['value'] = req + (True,)
 
@@ -753,6 +756,13 @@ def main():
     cm_get_client = navigator.create_client(GetParameters, CM_PARAMS + '/get_parameters')
     cm_set_client = navigator.create_client(
         SetParametersAtomically, CM_PARAMS + '/set_parameters_atomically')
+
+    def hold_for_detour(req, why):
+        """Detour not possible now: stand where we are and try the detour
+        again in BLOCK_RETRY_S - re-sending the route drove the robot back
+        into the object (test 16:02, 0.02 m from the bumper)."""
+        wait_for_clear(req, BLOCK_RETRY_S, 'สิ่งกีดขวางไม่ขยับ และอ้อมไม่ได้ (%s) - จอดรอ' % why)
+        blocked['detour'] = True
 
     def wait_for_clear(req, delay, why):
         """Keep `req` and re-send it after `delay` s (no retry limit)."""
@@ -1304,8 +1314,7 @@ def main():
                     if why is None:
                         continue
                     if not why.startswith('no object'):
-                        wait_for_clear(req, BLOCK_RETRY_S,
-                                       'สิ่งกีดขวางไม่ขยับ และอ้อมไม่ได้ (%s) - จอดรอ' % why)
+                        hold_for_detour(req, why)
                         continue
                     # object gone in the wait: carry on along the route
                 pending['value'] = req + (True,)
@@ -1397,12 +1406,21 @@ def main():
                     # RPP 'collision ahead' aborts FollowPath before collision_monitor
                     # ever stops the robot: a route that keeps failing at the same
                     # spot for DETOUR_AFTER_S is a static object -> go around it
+                    on_detour = route_plan['value'] is not None and \
+                        route_plan['value'] is early.get('detour')
+                    if req[0] == 'station' and on_detour:
+                        # the lane shift itself failed (RPP): stand, re-plan in 3 s
+                        # instead of a tight re-plan loop or the route into the object
+                        hold_for_detour(req, 'lane shift blocked (RPP collision ahead)')
+                        continue
                     if req[0] == 'station' and stuck_s >= DETOUR_AFTER_S and \
                             (ghosts is None or ghosts < GHOST_MIN_CELLS):
                         detour_why = send_detour(req)
                         if detour_why is None:
                             continue
-                        alert('warn', 'สิ่งกีดขวางไม่ขยับ และอ้อมไม่ได้ (%s) - จอดรอ' % detour_why)
+                        if not detour_why.startswith('no object'):
+                            hold_for_detour(req, detour_why)
+                            continue
                     if want and ghosts is not None and ghosts < GHOST_MIN_CELLS and \
                             start_backup(req):
                         continue
