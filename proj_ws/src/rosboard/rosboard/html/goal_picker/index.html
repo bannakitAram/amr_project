@@ -1582,13 +1582,19 @@ const STOP_TOPICS = ['/cmd_vel', '/cmd_vel_smoothed', '/cmd_vel_nav', '/odometry
 // cause: scan vs depth vs FootprintApproach vs Nav2 failure)
 const CAUSE_TOPICS = ['/scan_filtered', '/depth_camera/points', '/collision_monitor_state',
                       '/cmd_vel_smoothed', '/cmd_vel', '/odometry/filtered', '/rosout',
-                      '/tf', '/tf_static'];
+                      '/tf', '/tf_static',
+                      // RPP "collision ahead": which costmap cells the
+                      // projected footprint hit (3x3 m @ 2 Hz, small)
+                      '/local_costmap/costmap', '/local_costmap/published_footprint',
+                      '/plan', '/lookahead_collision_arc'];
 // Humble's collision_monitor has no state topic (Iron+); recorded if present
-const CAUSE_OPTIONAL = ['/collision_monitor_state'];
+const CAUSE_OPTIONAL = ['/collision_monitor_state', '/plan', '/lookahead_collision_arc'];
 // motor current + battery V/A log (one-tap button); /cmd_vel and
 // /wheel/odom give the speed the current belongs to; /nav_event marks
 // station trip start/arrived (nav_goal_executor_node)
 // /amcl_pose = where on the map (floor, ramp), /hook/state = payload lifted
+// /imu/data ax + /cmd_vel_smoothed = accel phases (F = m*a: current during
+// a ramp carries the payload mass; cruise current is mostly friction)
 const POWER_TOPICS = ['/motor_current/left', '/motor_current/right', '/motor_current/stamped', '/battery/state', '/nav_event',
                       '/cmd_vel', '/cmd_vel_smoothed', '/wheel/odom', '/imu/data', '/amcl_pose', '/hook/state'];
 // only exist in Navigation mode / with the Mega: recorded if there, no warning
@@ -1799,8 +1805,6 @@ function renderBagPanel() {
     cb.onchange = () => {
       if (cb.checked) bagSelected.add(name); else bagSelected.delete(name);
       saveBagSelection();
-// /imu/data ax + /cmd_vel_smoothed = accel phases (F = m*a: current during
-// a ramp carries the payload mass; cruise current is mostly friction)
       renderBagStatus();
     };
     const type = document.createElement('span');
