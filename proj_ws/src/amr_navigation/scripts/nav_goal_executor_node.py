@@ -64,6 +64,10 @@ ghost (a mark raytrace never cleared - no LiDAR return behind it). If at least
 GHOST_MIN_CELLS ghosts are found both costmaps are cleared once before the retry. Obstacles
 the LiDAR still sees come back on the next costmap update (0.2 s), so real
 walls/people are not lost; with no fresh scan nothing is cleared.
+Lethal cells inside the keep-out mask (/keepout_filter_mask) are counted
+apart: clearing cannot remove them (the filter re-applies them) - a request
+that fails with KEEPOUT_MIN_CELLS of them near the robot gets an alert
+naming the keep-out zone instead of a plain "blocked".
 
 Backup recovery: when Nav2 fails a request (e.g. RPP "collision ahead"
 after a turn put the nose at a wall), there are no ghost cells, the LiDAR
@@ -123,7 +127,8 @@ SLIP_RESUME_S = 3.0      # s slip-free before the stopped request is resent
 
 BLOCK_S = 2.0            # s of commanded motion stopped by collision_monitor = blocked
 BLOCK_RETRY_S = 3.0      # s between cancelling a blocked request and re-sending it
-FAILED_RETRY_S = 10.0    # s before re-sending a request Nav2 failed (recoveries already ran)
+FAILED_RETRY_S = 3.0     # s before re-sending a request Nav2 failed (was 10: a door leaf or a
+                         # person passing made the operator re-press before the retry, 2026-11-23)
 CHAIN_FRESH_S = 0.5      # s - older cmd_vel_smoothed/cmd_vel counts as not publishing
 
 ROUTE_MAX_OFFSET = 0.5   # m - robot further than this from a route can't join it
@@ -156,6 +161,10 @@ YAW_TOL = 0.04           # rad (~2.3 deg) - final heading tolerance
 HALF_TRACK = 0.236       # m - wheel_sep / 2 (STM32 firmware)
 NO_REVERSE = 0.8         # while driving keep |w| <= this * v / HALF_TRACK
 CORRIDOR_LATERAL = 0.25  # m - within this of the line (and past the pre-goal) skip leg 1
+CORRIDOR_HEADING = 0.785 # rad - and facing the station's way within this (45 deg): a route
+                         # that drives THROUGH the station first (Station_b->a passes it
+                         # northbound, loops, comes back south) handed over at the first
+                         # pass with heading -168 deg -> approach aborted, 2026-11-23
 CORRIDOR_ENTRY = 0.25    # m - leg 1 hands over once within this before the pre-goal (MPPI
                          # stalled 0.18 m from it, then a recovery Spin; bag 20261020_161338)
 LATERAL_ABORT = 0.35     # m - too far off the line: stop, give up (0.25 tripped after AMCL jumped at the pre-goal)
@@ -163,6 +172,7 @@ APPROACH_TIMEOUT = 90.0  # s
 GHOST_RADIUS = 2.0       # m - lethal cells this close to the robot are checked before a retry
 GHOST_SUPPORT = 0.15     # m - a lethal cell with a scan point this close is real
 GHOST_MIN_CELLS = 3      # ghost cells needed before clearing
+KEEPOUT_MIN_CELLS = 1    # keep-out lethal cells near the robot -> "blocked by keep-out" alert
 GHOST_SETTLE_S = 1.0     # s - wait after clearing before the retry is sent
 SCAN_FRESH_S = 1.0       # s - older /scan_filtered: do not clear anything
 FOOT_FRONT = 0.49        # m - base_footprint bumper x (nav2_params.yaml footprint)
@@ -453,13 +463,31 @@ def main():
         chain['out_t'] = time.time()
         chain['out'] = is_moving(msg)
 
-    latest = {'costmap': None, 'scan': None, 'scan_t': 0.0}
+    latest = {'costmap': None, 'scan': None, 'scan_t': 0.0, 'keepout': None}
     clear_clients = [navigator.create_client(ClearEntireCostmap, srv) for srv in (
         '/local_costmap/clear_entirely_local_costmap',
         '/global_costmap/clear_entirely_global_costmap')]
 
     def on_costmap(msg):
         latest['costmap'] = msg
+
+    def on_keepout(msg):
+        latest['keepout'] = msg
+
+    def in_keepout(x, y):
+        """(x, y) in map frame inside the keep-out mask (+-1 cell)."""
+        km = latest['keepout']
+        if km is None:
+            return False
+        r = km.info.resolution
+        ci = int((x - km.info.origin.position.x) / r)
+        cj = int((y - km.info.origin.position.y) / r)
+        for j in range(cj - 1, cj + 2):
+            for i in range(ci - 1, ci + 2):
+                if 0 <= i < km.info.width and 0 <= j < km.info.height and \
+                        km.data[j * km.info.width + i] >= 100:
+                    return True
+        return False
 
     def on_scan(msg):
         latest['scan'] = msg
@@ -475,13 +503,15 @@ def main():
 
     def count_ghosts():
         """Lethal local-costmap cells near the robot that the live scan does not
-        support. None = cannot judge (no data / no TF) -> do not clear."""
+        support, split into (ghosts, keepout): keepout = cells inside the
+        keep-out mask. None = cannot judge (no data / no TF) -> do not clear."""
         cm, scan = latest['costmap'], latest['scan']
         if cm is None or scan is None or time.time() - latest['scan_t'] > SCAN_FRESH_S:
             return None
         frame = cm.header.frame_id
         robot = tf2d(frame, 'base_link')
         lidar = tf2d(frame, scan.header.frame_id)
+        to_map = tf2d('map', frame)
         if robot is None or lidar is None:
             return None
         lx, ly, lyaw = lidar
@@ -499,15 +529,23 @@ def main():
         rx, ry = int((robot[0] - ox) / res), int((robot[1] - oy) / res)
         rad = int(GHOST_RADIUS / res)
         w, h = cm.info.width, cm.info.height
-        ghosts = 0
+        ghosts = keepout = 0
         for j in range(max(0, ry - rad), min(h, ry + rad + 1)):
             for i in range(max(0, rx - rad), min(w, rx + rad + 1)):
                 if cm.data[j * w + i] < 100:  # 100 = lethal (254); inflation is lower
                     continue
-                if not any((i + di, j + dj) in cells
-                           for di in range(-n, n + 1) for dj in range(-n, n + 1)):
-                    ghosts += 1
-        return ghosts
+                if any((i + di, j + dj) in cells
+                       for di in range(-n, n + 1) for dj in range(-n, n + 1)):
+                    continue
+                if to_map is not None:
+                    cx, cy = ox + (i + 0.5) * res, oy + (j + 0.5) * res
+                    mx = to_map[0] + cx * math.cos(to_map[2]) - cy * math.sin(to_map[2])
+                    my = to_map[1] + cx * math.sin(to_map[2]) + cy * math.cos(to_map[2])
+                    if in_keepout(mx, my):
+                        keepout += 1
+                        continue
+                ghosts += 1
+        return ghosts, keepout
 
     def scan_in_base():
         """Fresh /scan_filtered points in base_footprint, or None."""
@@ -613,11 +651,12 @@ def main():
             pending['value'] = req + (True,)
 
     def clear_ghosts():
-        ghosts = count_ghosts()
-        if ghosts is None:
+        counted = count_ghosts()
+        if counted is None:
             navigator.get_logger().warn(
                 'nav_goal_executor_node: ghost check skipped (no fresh scan/costmap/TF)')
             return False
+        ghosts = counted[0]
         if ghosts < GHOST_MIN_CELLS:  # single cells are scan noise
             return False
         navigator.get_logger().warn(
@@ -772,6 +811,9 @@ def main():
         OccupancyGrid, '/local_costmap/costmap', on_costmap,
         QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
     navigator.create_subscription(LaserScan, '/scan_filtered', on_scan, qos_profile_sensor_data)
+    navigator.create_subscription(
+        OccupancyGrid, '/keepout_filter_mask', on_keepout,
+        QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
     try:
         while rclpy.ok():
@@ -819,7 +861,8 @@ def main():
                     e = station_errors(tf_buffer, msg.pose.position.x, msg.pose.position.y,
                                        yaw_of(msg.pose.orientation))
                     if e is not None and -APPROACH_DIST + 0.15 < e[0] < 0.05 and \
-                            abs(e[1]) < CORRIDOR_LATERAL:
+                            abs(e[1]) < CORRIDOR_LATERAL and \
+                            abs(e[2]) < CORRIDOR_HEADING:
                         navigator.get_logger().info(
                             'nav_goal_executor_node: station (%.2f, %.2f) - already in the '
                             'approach corridor, final approach directly'
@@ -873,7 +916,8 @@ def main():
                 e = station_errors(tf_buffer, g.pose.position.x, g.pose.position.y,
                                    yaw_of(g.pose.orientation))
                 if e is not None and -APPROACH_DIST - CORRIDOR_ENTRY < e[0] < 0.05 and \
-                        abs(e[1]) < CORRIDOR_LATERAL:
+                        abs(e[1]) < CORRIDOR_LATERAL and \
+                        abs(e[2]) < CORRIDOR_HEADING:
                     navigator.cancelTask()
                     task_active['value'] = False
                     station['value'] = None
@@ -977,16 +1021,25 @@ def main():
                     req = current['req']
                     station['value'] = None
                     current['req'] = None
-                    ghosts = count_ghosts()
+                    counted = count_ghosts()
+                    ghosts, kept = counted if counted is not None else (None, 0)
                     want, why = backup_wanted()
                     navigator.get_logger().info(
-                        'nav_goal_executor_node: request failed - ghosts %s, backup: %s'
-                        % (ghosts, why))
+                        'nav_goal_executor_node: request failed - ghosts %s, keep-out %s, '
+                        'backup: %s' % (ghosts, kept, why))
                     if want and ghosts is not None and ghosts < GHOST_MIN_CELLS and \
                             start_backup(req):
                         continue
-                    wait_for_clear(req, FAILED_RETRY_S,
-                                   'ไปต่อไม่ได้ (ทางถูกบังหรือหาเส้นทางไม่ได้) - จอดรอแล้วลองใหม่อัตโนมัติ')
+                    if kept >= KEEPOUT_MIN_CELLS:
+                        navigator.get_logger().warn(
+                            'nav_goal_executor_node: %d keep-out cells within %.1f m - the '
+                            'path/footprint runs into a keep-out zone' % (kept, GHOST_RADIUS))
+                        wait_for_clear(req, FAILED_RETRY_S,
+                                       'ไปต่อไม่ได้ - ติด Keepout zone ใกล้หุ่นยนต์ '
+                                       '(ตรวจ Map Edit / เส้นทาง) - จอดรอแล้วลองใหม่')
+                    else:
+                        wait_for_clear(req, FAILED_RETRY_S,
+                                       'ไปต่อไม่ได้ (ทางถูกบังหรือหาเส้นทางไม่ได้) - จอดรอแล้วลองใหม่อัตโนมัติ')
                     continue
                 if station['value'] is not None:
                     goal, station['value'] = station['value'], None
