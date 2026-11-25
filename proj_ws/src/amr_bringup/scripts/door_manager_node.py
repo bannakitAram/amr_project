@@ -119,9 +119,11 @@ class DoorManager(Node):
         # 0 = one pulse per pass (old behaviour); per door 'repulse_s' overrides
         self.default_repulse_s = float(self.declare_parameter('repulse_s', 0.0).value)
         self.robot_frame = self.declare_parameter('robot_frame', 'base_footprint').value
-        # 15 % of 0.30 m/s = 0.045 m/s
-        self.door_speed_percent = min(30.0, max(5.0, float(
-            self.declare_parameter('door_speed_percent', 15.0).value)))
+        # 50 % of 0.30 m/s = 0.15 m/s (was 15 %: operator wants only half speed
+        # at air doors). Cap 50 %: FrontStopShort is only 0.10 m deep, braking
+        # @0.15 m/s -0.5 m/s^2 ~2.3 cm + latency still fits; faster would not.
+        self.door_speed_percent = min(50.0, max(5.0, float(
+            self.declare_parameter('door_speed_percent', 50.0).value)))
 
         self.map_name = ''
         self.maps_dir = ''
