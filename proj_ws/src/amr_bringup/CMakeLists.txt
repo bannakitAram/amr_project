@@ -13,6 +13,7 @@ install(PROGRAMS
   scripts/wheel_joint_state_publisher.py
   scripts/amr_control_panel.py
   scripts/move_forward_node.py
+  scripts/energy_shuttle_node.py
   scripts/square_path_node.py
   scripts/circle_path_node.py
   scripts/calib_rotate_node.py
