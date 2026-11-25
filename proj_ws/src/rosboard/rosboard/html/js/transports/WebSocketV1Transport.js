@@ -120,10 +120,11 @@ class WebSocketV1Transport {
       this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_ROUTE, cmd]));
     }
 
-    bagCmd({action, topics, label}) {
+    bagCmd({action, topics, label, shuttle}) {
       if (!this.isConnected()) return;
       const msg = {action: action, topics: topics || []};
       if (label) msg.label = label;  // {payload_kg, note} - power log training label
+      if (shuttle) msg.shuttle = shuttle;  // {distance, speed, laps} - energy shuttle
       this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_BAG, msg]));
     }
 

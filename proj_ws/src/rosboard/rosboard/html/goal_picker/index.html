@@ -1898,6 +1898,14 @@ function renderBagStatus() {
   if (start) start.disabled = rec || bagSelected.size === 0;
   const power = document.getElementById('bag-power');
   if (power) power.disabled = rec;
+  // energy shuttle: only during a labelled power log
+  const shGo = document.getElementById('shuttle-start');
+  const shStop = document.getElementById('shuttle-stop');
+  const shRun = fresh && bagState.shuttle;
+  if (shGo) shGo.disabled = !rec || bagState.payload_kg == null || shRun;
+  if (shStop) shStop.disabled = !shRun;
+  const shMsg = document.getElementById('shuttle-msg');
+  if (shMsg) shMsg.textContent = fresh ? (shRun ? '▶ ' : '') + (bagState.shuttle_msg || '') : '';
   const causeRec = document.getElementById('bag-cause');
   if (causeRec) causeRec.disabled = rec;
   if (stop) stop.disabled = !rec;
@@ -2009,10 +2017,57 @@ function renderBagPanel() {
     bagSelected = new Set(topics); saveBagSelection(); renderBagPanel();
     transport.bagCmd({action: 'start', topics: topics, label: {payload_kg: kg, note: note}});
   });
-  mk2('bag-stopdist', 'primary', 'วิเคราะห์ระยะหยุด', () => transport.bagCmd({action: 'stop_dist'}));
+  bagPanel.appendChild(row2);
+
+  // ---- energy shuttle: straight back-and-forth at one speed (power log) ----
+  const shRow = document.createElement('div');
+  shRow.className = 'row';
+  let savedSh = {};
+  try { savedSh = JSON.parse(localStorage.getItem('goal_picker_shuttle')) || {}; } catch (e) {}
+  const shIn = (id, ph, min, max, step, val) => {
+    const i = document.createElement('input');
+    i.id = id; i.type = 'number'; i.min = min; i.max = max; i.step = step;
+    i.inputMode = 'decimal'; i.placeholder = ph; i.value = val; i.style.width = '6.5em';
+    shRow.appendChild(i); return i;
+  };
+  const shD = shIn('shuttle-d', 'ระยะ m', '0.5', '30', '0.5', savedSh.d || '3');
+  const shV = shIn('shuttle-v', 'm/s', '0.05', '0.40', '0.05', savedSh.v || '0.15');
+  const shN = shIn('shuttle-n', 'รอบ', '1', '100', '1', savedSh.n || '3');
+  const shGo = document.createElement('button');
+  shGo.id = 'shuttle-start'; shGo.className = 'btn primary'; shGo.textContent = 'วิ่ง Shuttle เก็บพลังงาน';
+  shGo.onclick = () => {
+    const d = Number(shD.value), v = Number(shV.value), n = Math.round(Number(shN.value));
+    if (!(d >= 0.5 && d <= 30) || !(v >= 0.05 && v <= 0.40) || !(n >= 1 && n <= 100)) {
+      alert('ระยะ 0.5-30 m, ความเร็ว 0.05-0.40 m/s, รอบ 1-100'); return;
+    }
+    try { localStorage.setItem('goal_picker_shuttle', JSON.stringify({d: shD.value, v: shV.value, n: shN.value})); } catch (e) {}
+    if (!confirm('Shuttle: เดินตรง ' + d + ' m ที่ ' + v + ' m/s ไป-กลับ ' + n + ' รอบ (หมุน 180° ที่ปลายทาง)\n' +
+        '⚠ ไม่ใช้แผนที่/planner - ทางตรงข้างหน้าต้องโล่งยาวกว่า ' + (d + 1) + ' m และมีที่หมุน\n' +
+        '⚠ กั้นพื้นที่ + มีคนถือ E-stop · collision_monitor ยังทำงาน\n' +
+        'Bag จะหยุดเองเมื่อวิ่งครบ · เริ่มเลย?')) return;
+    transport.bagCmd({action: 'shuttle_start', shuttle: {distance: d, speed: v, laps: n}});
+  };
+  shRow.appendChild(shGo);
+  const shStop = document.createElement('button');
+  shStop.id = 'shuttle-stop'; shStop.className = 'btn danger'; shStop.textContent = 'หยุด Shuttle';
+  shStop.onclick = () => transport.bagCmd({action: 'shuttle_stop'});
+  shRow.appendChild(shStop);
+  bagPanel.appendChild(shRow);
+  const shMsg = document.createElement('div');
+  shMsg.id = 'shuttle-msg'; shMsg.style.fontSize = '12px'; shMsg.style.color = '#aaa';
+  bagPanel.appendChild(shMsg);
+
+  const row3 = document.createElement('div');
+  row3.className = 'row';
+  const mk3 = (id, cls, text, fn) => {
+    const b = document.createElement('button');
+    b.id = id; b.className = 'btn ' + cls; b.textContent = text; b.onclick = fn;
+    row3.appendChild(b);
+  };
+  mk3('bag-stopdist', 'primary', 'วิเคราะห์ระยะหยุด', () => transport.bagCmd({action: 'stop_dist'}));
   // false stop ("มีสิ่งกีดขวาง" with nothing there): record in the spot,
   // start the goal, stop recording, then analyse
-  mk2('bag-cause', 'primary', 'บันทึกหาสาเหตุหยุดเอง', () => {
+  mk3('bag-cause', 'primary', 'บันทึกหาสาเหตุหยุดเอง', () => {
     // one tap like the power log: pick the topics and start recording
     const topics = CAUSE_TOPICS.filter(t => t in allTopics);
     const missing = CAUSE_TOPICS.filter(t => !(t in allTopics) && !CAUSE_OPTIONAL.includes(t));
@@ -2027,8 +2082,8 @@ function renderBagPanel() {
     bagSelected = new Set(topics); saveBagSelection(); renderBagPanel();
     transport.bagCmd({action: 'start', topics: topics});
   });
-  mk2('bag-stopcause', 'primary', 'วิเคราะห์สาเหตุที่หยุด', () => transport.bagCmd({action: 'stop_cause'}));
-  bagPanel.appendChild(row2);
+  mk3('bag-stopcause', 'primary', 'วิเคราะห์สาเหตุที่หยุด', () => transport.bagCmd({action: 'stop_cause'}));
+  bagPanel.appendChild(row3);
   const res = document.createElement('div');
   res.id = 'stop-result';
   res.hidden = true;

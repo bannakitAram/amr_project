@@ -282,7 +282,7 @@ class ROSBoardSocketHandler(tornado.websocket.WebSocketHandler):
                 print("error: bag: bad: %s" % message)
                 return
             self.node.on_bag_cmd(argv[1].get("action"), argv[1].get("topics", []),
-                                 argv[1].get("label"))
+                                 argv[1].get("label"), argv[1].get("shuttle"))
 
         # client sent a door edit (goal_picker: set door at robot pose or pinned x/y / delete)
         elif argv[0] == ROSBoardSocketHandler.MSG_DOOR:

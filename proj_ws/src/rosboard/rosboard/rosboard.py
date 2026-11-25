@@ -240,6 +240,12 @@ class ROSBoardNode(object):
         self.stop_proc_busy = False
         self.stop_result = ""
         self.stop_ok = None
+        # energy shuttle (amr_bringup energy_shuttle_node.py): constant-speed
+        # straight back-and-forth for the power log. Runs only while a
+        # labelled power log is recording; the bag stops when the shuttle ends,
+        # and stopping the bag stops the shuttle.
+        self.shuttle_proc = None
+        self.shuttle_msg = ""
         self.bag_lock = threading.Lock()
         self.bag_state_pub = rospy.Publisher("/rosboard_bag_state", String, queue_size=1)
         threading.Thread(target=self.bag_state_loop, daemon=True).start()
@@ -462,7 +468,7 @@ class ROSBoardNode(object):
             self.bag_error = "label not saved: %s" % e
         self.bag_label = None
 
-    def on_bag_cmd(self, action, topics, label=None):
+    def on_bag_cmd(self, action, topics, label=None, shuttle=None):
         """Start/stop `ros2 bag record` for the goal_picker page. Only
         currently-advertised topic names are accepted. `label` (optional,
         power log) = {"payload_kg", "note"} for payload-weight training."""
@@ -501,7 +507,13 @@ class ROSBoardNode(object):
                 self.bag_label = label
                 rospy.loginfo("bag record start: %s %s" % (self.bag_name, " ".join(topics)))
             elif action == "stop":
+                self._shuttle_stop()
                 self._bag_stop()
+            elif action == "shuttle_start":
+                self._shuttle_start(shuttle if type(shuttle) is dict else {})
+            elif action == "shuttle_stop":
+                self._shuttle_stop()
+                self.shuttle_msg = "shuttle cancelled"
             elif action in ("stop_dist", "stop_cause"):
                 # last finished bag only; path is ours, never from the browser.
                 # stop_cause: front_stop_source_from_bag.py - which sensor /
@@ -538,6 +550,60 @@ class ROSBoardNode(object):
             self.stop_result, self.stop_ok, self.stop_proc_busy = text, ok, False
         self.publish_bag_state()
 
+    def _shuttle_start(self, p):
+        # caller holds bag_lock. Ranges are checked again by the node itself.
+        if self.shuttle_proc is not None:
+            return
+        if self.bag_proc is None or not self.bag_label:
+            self.shuttle_msg = "start a power log (with payload kg) first"
+            return
+        try:
+            d, v, n = float(p.get("distance")), float(p.get("speed")), int(p.get("laps"))
+        except (TypeError, ValueError):
+            self.shuttle_msg = "bad shuttle parameters"
+            return
+        if not (0.5 <= d <= 30.0 and 0.05 <= v <= 0.40 and 1 <= n <= 100):
+            self.shuttle_msg = "shuttle out of range (0.5-30 m, 0.05-0.40 m/s, 1-100 laps)"
+            return
+        try:
+            self.shuttle_proc = subprocess.Popen(
+                ["ros2", "run", "amr_bringup", "energy_shuttle_node.py", "%g" % d, "%g" % v, str(n)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                start_new_session=True)
+        except OSError as e:
+            self.shuttle_proc = None
+            self.shuttle_msg = str(e)
+            return
+        self.shuttle_msg = "shuttle %g m @ %g m/s x %d laps" % (d, v, n)
+        rospy.loginfo("energy shuttle start: " + self.shuttle_msg)
+
+    def _shuttle_stop(self):
+        # caller holds bag_lock. SIGINT: the node publishes zero velocity first.
+        if self.shuttle_proc is None:
+            return
+        try:
+            os.killpg(self.shuttle_proc.pid, signal.SIGINT)
+            self.shuttle_proc.wait(timeout=5)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(self.shuttle_proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.shuttle_proc = None
+
+    def _shuttle_poll(self):
+        # caller holds bag_lock. Shuttle finished -> close the bag (one run per bag).
+        if self.shuttle_proc is None or self.shuttle_proc.poll() is None:
+            return
+        code = self.shuttle_proc.returncode
+        err = (self.shuttle_proc.stderr.read() or "").strip().splitlines()
+        self.shuttle_proc = None
+        self.shuttle_msg = {0: "shuttle done", 1: "shuttle aborted (held/stalled too long)",
+                            2: "shuttle refused: " + (err[-1] if err else "no data / navigation not running"),
+                            3: "shuttle: bad arguments"}.get(code, "shuttle exited %s" % code)
+        rospy.loginfo(self.shuttle_msg)
+        self._bag_stop()
+
     def _bag_stop(self):
         # caller holds bag_lock. SIGINT so the recorder closes the bag cleanly.
         if self.bag_proc is None:
@@ -568,6 +634,8 @@ class ROSBoardNode(object):
             "stop_busy": self.stop_proc_busy,
             "stop_result": self.stop_result,
             "stop_ok": self.stop_ok,
+            "shuttle": self.shuttle_proc is not None,
+            "shuttle_msg": self.shuttle_msg,
         })))
 
     def bag_state_loop(self):
@@ -575,6 +643,9 @@ class ROSBoardNode(object):
             time.sleep(1.0)
             try:
                 with self.bag_lock:
+                    self._shuttle_poll()
+                    if self.bag_proc is None:
+                        self._shuttle_stop()  # recorder died / auto-stopped: don't drive unlogged
                     if self.bag_proc is not None:
                         if self.bag_proc.poll() is not None:
                             self.bag_error = "recorder exited (code %s)" % self.bag_proc.returncode
