@@ -24,6 +24,7 @@ import collections
 import json
 import glob
 import math
+import copy
 import os
 import re
 import signal
@@ -318,11 +319,31 @@ def routes_path(map_name):
     return os.path.join(MAPS_DIR, f'{map_name}_routes.yaml')
 
 
+# The routes file is re-read every second for /amr_stations; a big one
+# (FR2: 155 kB) took ~1.3 s per pure-Python parse, x3 per publish, which
+# froze the Tk loop and left >5 s gaps -> phone station pins blinked.
+# Cache the parse by mtime/size and use the C loader when available.
+_YAML_LOADER = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
+_routes_cache = {}  # path -> ((mtime_ns, size), data)
+
+
+def _read_routes_file(map_name):
+    path = routes_path(map_name)
+    st = os.stat(path)
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _routes_cache.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    with open(path) as f:
+        data = yaml.load(f, Loader=_YAML_LOADER) or {}
+    _routes_cache[path] = (key, data)
+    return data
+
+
 def load_routes(map_name):
     """Routes saved for a map: list of {from, to, poses: [[x, y, yaw], ...]}."""
     try:
-        with open(routes_path(map_name)) as f:
-            return (yaml.safe_load(f) or {}).get('routes', [])
+        return copy.deepcopy(_read_routes_file(map_name).get('routes', []))
     except (OSError, yaml.YAMLError):
         return []
 
@@ -330,8 +351,7 @@ def load_routes(map_name):
 def routes_enabled(map_name):
     """False = operator chose the planner although the map has routes."""
     try:
-        with open(routes_path(map_name)) as f:
-            return (yaml.safe_load(f) or {}).get('use_routes', True) is not False
+        return _read_routes_file(map_name).get('use_routes', True) is not False
     except (OSError, yaml.YAMLError):
         return True
 
@@ -570,8 +590,8 @@ def load_map_image(yaml_path):
 # payload mounted off-centre gives an asymmetric rectangle.
 # The min/max bounds are hard limits - review ISO 3691-4 before widening:
 # FrontStop (0.35 m deep) and the decel limits were sized for 0.2 m/s.
-# v_max goes up to 0.50 (firmware MAX_SPEED_MS 1.5), but Save is refused
-# while the estimated stop distance exceeds STOP_DIST_MAX_FRAC of FrontStop
+# v_max goes up to 0.50 (firmware MAX_SPEED_MS 1.5); Save only warns (no
+# longer refuses) while the estimated stop distance exceeds STOP_DIST_MAX_FRAC of FrontStop
 # (0.50 m/s needs decel >= ~0.70 m/s^2).
 NAV_PARAM_SPECS = [
     # key, label, unit, min, max, step, fmt
@@ -592,7 +612,7 @@ NAV_PARAM_SPECS = [
     # STM32 ramp (MAX_ACCEL 0.5 / MAX_DECEL 1.2 m/s^2 per wheel; /0.236 m
     # half track for theta) - beyond that the firmware caps it anyway.
     ('acc_lin', 'เร่ง (accel)', 'm/s²', 0.10, 0.50, 0.05, '{:.2f}'),
-    ('dec_lin', 'เบรก (decel)', 'm/s²', 0.30, 1.20, 0.05, '{:.2f}'),
+    ('dec_lin', 'เบรก (decel)', 'm/s²', 0.10, 1.20, 0.05, '{:.2f}'),
     ('acc_rot', 'เร่งหมุน (α)', 'rad/s²', 0.30, 2.00, 0.10, '{:.2f}'),
     ('dec_rot', 'เบรกหมุน', 'rad/s²', 0.50, 2.00, 0.10, '{:.2f}'),
 ]
@@ -608,7 +628,7 @@ NAV_PARAM_DEFAULTS = {
 }
 STOP_LATENCY_S = 0.2      # cmd -> wheels, used for the stop-distance note
 FRONT_STOP_DEPTH = 0.35   # m ahead of the bumper (matches nav2_params.yaml)
-STOP_DIST_MAX_FRAC = 0.8  # Save refused when stop distance > this * FRONT_STOP_DEPTH
+STOP_DIST_MAX_FRAC = 0.8  # Save warns when stop distance > this * FRONT_STOP_DEPTH
 
 
 def stop_distance(v):
@@ -3276,7 +3296,7 @@ class AmrControlPanel(tk.Tk):
                          + T('(รวม latency') + f' {STOP_LATENCY_S:.1f} s)')
             if d_stop > FRONT_STOP_DEPTH * STOP_DIST_MAX_FRAC:
                 lines.append(T('⚠ ระยะหยุดเกิน 80% ของความลึก FrontStop - เพิ่ม decel หรือลด v_max'))
-                lines.append(T('บันทึกไม่ได้จนกว่าระยะหยุดจะอยู่ในเกณฑ์'))
+                lines.append(T('บันทึกได้ แต่ห้ามใช้บนไลน์จนกว่าระยะหยุดจะอยู่ในเกณฑ์'))
             if e['acc_lin'] > e['dec_lin']:
                 lines.append(T('⚠ accel มากกว่า decel - ควรให้ decel ≥ accel'))
             if not e.get('depth', True):
@@ -3293,17 +3313,17 @@ class AmrControlPanel(tk.Tk):
     def _on_param_save(self):
         if not self._param_changes:
             return
+        # Stop-distance check is a warning only (operator choice, test use):
+        # Save is no longer refused, but the confirm dialog says it loudly.
         d_stop = stop_distance(self._param_edit)
+        warn = ''
         if d_stop > FRONT_STOP_DEPTH * STOP_DIST_MAX_FRAC:
-            messagebox.showerror(
-                'บันทึก Parameter',
-                'ระยะหยุดโดยประมาณ %.2f m เกิน %.0f%% ของ FrontStop (%.2f m)\n'
-                'เพิ่ม decel หรือลด v_max ก่อนบันทึก (ISO 3691-4)'
-                % (d_stop, STOP_DIST_MAX_FRAC * 100, FRONT_STOP_DEPTH))
-            return
+            warn = ('⚠ ระยะหยุดโดยประมาณ %.2f m เกิน %.0f%% ของ FrontStop (%.2f m)\n'
+                    'หุ่นอาจหยุดไม่ทันก่อนชนสิ่งกีดขวาง - ห้ามใช้บนไลน์ (ISO 3691-4)\n\n'
+                    % (d_stop, STOP_DIST_MAX_FRAC * 100, FRONT_STOP_DEPTH))
         if not messagebox.askyesno(
                 'บันทึก Parameter',
-                'ค่าที่จะเปลี่ยน:\n' + '\n'.join(self._param_changes) + '\n\n'
+                warn + 'ค่าที่จะเปลี่ยน:\n' + '\n'.join(self._param_changes) + '\n\n'
                 'ค่าเหล่านี้เกี่ยวกับ Safety (ISO 3691-4) - หลังบันทึกต้องทดสอบระยะหยุด/'
                 'การหลบสิ่งกีดขวางบนหุ่นจริง แล้ว commit + tag ก่อนใช้บนไลน์\n\nบันทึก?'):
             return
