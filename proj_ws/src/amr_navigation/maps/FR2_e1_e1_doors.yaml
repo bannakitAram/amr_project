@@ -14,3 +14,11 @@ doors:
   relay: 0
   pulse_s: 0.5
   wait_s: 5.0
+- name: ST_B_short
+  x: -56.08
+  y: 51.416
+  radius: 1.0
+  relay: 0
+  pulse_s: 0.5
+  wait_s: 0.0
+  repulse_s: 0.0
