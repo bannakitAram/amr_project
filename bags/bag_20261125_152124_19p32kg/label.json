@@ -1,0 +1,20 @@
+{
+  "payload_kg": 19.32,
+  "note": "b03_(a15_15_v3)",
+  "bag": "bag_20261125_152124_19p32kg",
+  "start": "2026-11-25 15:21:24",
+  "duration_s": 70.3,
+  "topics": [
+    "/amcl_pose",
+    "/battery/state",
+    "/cmd_vel",
+    "/cmd_vel_smoothed",
+    "/hook/state",
+    "/imu/data",
+    "/motor_current/left",
+    "/motor_current/right",
+    "/motor_current/stamped",
+    "/nav_event",
+    "/wheel/odom"
+  ]
+}
