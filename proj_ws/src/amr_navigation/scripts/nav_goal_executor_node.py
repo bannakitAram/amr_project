@@ -161,6 +161,10 @@ DETOUR_EARLY_M = 1.6     # m bumper -> object on the route: stop here while foll
                          # (~0.15 m braking at 0.4 m/s leaves >= 1.4 m: ramp 0.8 + gap 0.15 fit)
                          # (RPP/FrontStop stopped 0.2-0.5 m short - no room left to shift)
 DETOUR_EARLY_HZ = 5.0    # early-stop check rate
+EARLY_MIN_POINTS = 6     # scan points for an early stop (was BACKUP_MIN_POINTS 3: 3-4 stray
+                         # points off the re-made map stopped the robot mid-aisle, detour then
+                         # found nothing -> stop/resend loop, test 2026-11-26 13:55/14:11)
+EARLY_CONFIRM = 3        # consecutive early checks (5 Hz -> 0.6 s, ~0.24 m @0.4 m/s) before stopping
 DETOUR_EARLY_MIN_LEFT = 1.5  # m - no early stop when the route ends closer than this
 DETOUR_EXIT_EXTRA = 0.70  # m - stay in the side lane this much longer: RPP's 0.6 m lookahead
                           # cut the way back and swung the rear into the object (test 16:05)
@@ -1126,7 +1130,7 @@ def main():
             if dist < r and not on_static_map(ox, oy):
                 n += 1   # along = route point beside the object, not one before it
                 nearest = along if nearest is None else min(nearest, along)
-        return (n, nearest - FOOT_FRONT) if n >= BACKUP_MIN_POINTS else None
+        return (n, nearest - FOOT_FRONT) if n >= EARLY_MIN_POINTS else None
 
     def detour_rear_points(dist):
         """Scan points behind the rear within `dist` + DETOUR_REAR_MARGIN
@@ -1454,7 +1458,9 @@ def main():
                     not backup['active'] and time.time() - early['t'] > 1.0 / DETOUR_EARLY_HZ:
                 early['t'] = time.time()
                 found = object_on_route_ahead()
-                if found is not None:
+                early['hits'] = early.get('hits', 0) + 1 if found is not None else 0
+                if found is not None and early['hits'] >= EARLY_CONFIRM:
+                    early['hits'] = 0
                     req = current['req']
                     cancel_and_wait()
                     task_active['value'] = False
