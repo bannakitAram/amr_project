@@ -1,15 +1,15 @@
 doors:
 - name: DOOR_C
-  x: 39.303
-  y: 0.597
+  x: 0.129
+  y: 34.259
   radius: 2.5
   relay: 3
   pulse_s: 0.5
   wait_s: 0.0
   repulse_s: 1.0
 - name: AIR1
-  x: 62.162
-  y: 12.913
+  x: -12.187
+  y: 57.118
   radius: 1.5
   relay: 0
   pulse_s: 0.5
