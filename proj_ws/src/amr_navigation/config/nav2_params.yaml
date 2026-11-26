@@ -464,8 +464,8 @@ velocity_smoother:
     # Lowered to reduce wheel slip on start/stop (was 1.0/2.0: 0 -> 0.2 m/s
     # in 0.2 s). Decel kept steeper than accel so stopping distance stays
     # short: 0.2 m/s -> 0 in 0.4 s (~4 cm).
-    max_accel: [0.50, 0.0, 0.30]
-    max_decel: [-0.50, 0.0, -1.00]
+    max_accel: [0.15, 0.0, 0.30]
+    max_decel: [-0.70, 0.0, -1.00]
     odom_topic: "/odometry/filtered"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
