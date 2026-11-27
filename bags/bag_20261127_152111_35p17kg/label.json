@@ -1,0 +1,20 @@
+{
+  "payload_kg": 35.17,
+  "note": "GA",
+  "bag": "bag_20261127_152111_35p17kg",
+  "start": "2026-11-27 15:21:11",
+  "duration_s": 94.6,
+  "topics": [
+    "/amcl_pose",
+    "/battery/state",
+    "/cmd_vel",
+    "/cmd_vel_smoothed",
+    "/hook/state",
+    "/imu/data",
+    "/motor_current/left",
+    "/motor_current/right",
+    "/motor_current/stamped",
+    "/nav_event",
+    "/wheel/odom"
+  ]
+}
