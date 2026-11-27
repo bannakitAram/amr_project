@@ -30,6 +30,10 @@ Output format:
 
 ***Caution: sim_ws for read only.
 
+Project knowledge (read before related work; verify against current code):
+- docs/robot_knowledge.md - hardware / Jetson quirks (encoder PPR, HP60C, snapd, CH340, gamepad)
+- docs/ml_smart_nav_handoff.md - payload estimation, GA speed profile, Smart (⚡) navigation, bag naming (a5 = accel 0.5)
+
 
 Versioning (git repo: this directory, remote origin = GitHub private repo, branch main):
 - After finishing one change (tuning, fix, feature), propose a commit + push. One topic per commit; message says what changed and why.
