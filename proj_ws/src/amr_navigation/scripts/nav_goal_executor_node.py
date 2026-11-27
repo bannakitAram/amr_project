@@ -51,6 +51,10 @@ once the way is clear. Each retry still goes through collision_monitor.
 Operator cancel or a new goal ends the wait. StationApproach is not covered;
 it keeps its own timeout.
 
+Door zones (/amr_doors from door_manager_node.py): inside a door's radius +
+DOOR_ZONE_MARGIN_M there is no early stop and no detour (send_detour refuses,
+the caller holds and retries the plain request) - doorways are pinch points.
+
 Door wait (/door_hold from amr_bringup door_manager_node.py, JSON at 10 Hz):
 while hold is true the running request is stopped (task cancelled, robot
 standing) and re-sent when hold goes false or its messages stop for
@@ -135,6 +139,9 @@ def restamp(pose_stamped, navigator):
 
 
 SLIP_FAULT_S = 6.0       # s of continuous slip before the robot is stopped (was 3.0: stopped too often)
+DOOR_ZONE_MARGIN_M = 0.5  # m added to each door radius (/amr_doors): no detour / early stop
+                          # inside - doorways are pinch points (0.25 m side margin at DOOR_C)
+DOORS_STALE_S = 3.0       # s without /amr_doors = door list unknown (treated as no doors)
 DOOR_HOLD_STALE_S = 1.0  # s without /door_hold = no door wait (door_manager gone)
 SLIP_RESUME_S = 3.0      # s slip-free before the stopped request is resent
 
@@ -164,6 +171,8 @@ DETOUR_EARLY_HZ = 5.0    # early-stop check rate
 EARLY_MIN_POINTS = 6     # scan points for an early stop (was BACKUP_MIN_POINTS 3: 3-4 stray
                          # points off the re-made map stopped the robot mid-aisle, detour then
                          # found nothing -> stop/resend loop, test 2026-11-26 13:55/14:11)
+DETOUR_OBJ_MEMORY_S = 10.0  # s - early-stop object points stay usable for the detour
+DETOUR_OBJ_MATCH_M = 0.15   # m - ...if a live scan point is this close to one of them
 EARLY_CONFIRM = 3        # consecutive early checks (5 Hz -> 0.6 s, ~0.24 m @0.4 m/s) before stopping
 DETOUR_EARLY_MIN_LEFT = 1.5  # m - no early stop when the route ends closer than this
 DETOUR_EXIT_EXTRA = 0.70  # m - stay in the side lane this much longer: RPP's 0.6 m lookahead
@@ -184,6 +193,10 @@ DETOUR_FRONT_GAP = 0.15  # m - lane must be reached this far before the bumper m
 DETOUR_BACK_MAX = 0.8    # m - longest backup to make room for the ramp
 DETOUR_MAX_OFFSET = 1.2  # m - detour may leave the recorded route by at most this
                          # (was 1.0: Station_a->b test 2026-11-24 15:37 needed 1.03 m left)
+DETOUR_WALL_MARGIN = 0.08  # m - lane to /map wall / keep-out / unknown: AMCL error eats a few cm,
+                           # then RPP's footprint check stops the robot ('collision ahead')
+DETOUR_FS_DEPTH = 0.35     # m - collision_monitor FrontStop ahead of the bumper (nav2_params.yaml)
+DETOUR_FS_HALF_W = 0.43    # m - FrontStop half width (nav2_params.yaml)
 DETOUR_FOOT_MARGIN = 0.03  # m - footprint check against /map and scan (was 0.05)
 STATION_MATCH = 0.05     # m - a station goal belongs to the saved station this close
 
@@ -834,9 +847,41 @@ def main():
         if points is None or here is None:
             return None, 'robot is more than %.1f m from the route' % DETOUR_MAX_OFFSET, 0
         c, s_ = math.cos(here[2]), math.sin(here[2])
-        obs = [o for o in ((here[0] + x * c - y * s_, here[1] + x * s_ + y * c)
-                           for x, y in (scan_in_base() or []) if math.hypot(x, y) < DETOUR_SCAN_M)
-               if not on_static_map(*o)]
+        live = [(here[0] + x * c - y * s_, here[1] + x * s_ + y * c)
+                for x, y in (scan_in_base() or []) if math.hypot(x, y) < DETOUR_SCAN_M]
+        obs = [o for o in live if not on_static_map(*o)]
+        # the object the early stop saw may flicker in the LiDAR (low/dark/
+        # glossy): early stop counted 13-16 pts 0.4 m ahead, the single scan
+        # here none -> 'no object', stop/resend loop (test 2026-11-26 14:18).
+        # Add those points while the live scan still shows any of them.
+        mem = early.get('obj')
+        n_mem = 0
+        if mem is not None and time.time() - mem[0] < DETOUR_OBJ_MEMORY_S and any(
+                math.hypot(lx - mx, ly - my) < DETOUR_OBJ_MATCH_M
+                for mx, my in mem[1] for lx, ly in live):
+            obs += mem[1]
+            n_mem = len(mem[1])
+        # lethal local-costmap cells: depth camera obstacles (below the LiDAR
+        # plane) and anything else RPP's collision check will stop for
+        n_cm = 0
+        cm = latest.get('costmap')
+        tcm = tf2d('map', cm.header.frame_id) if cm is not None else None
+        if tcm is not None:
+            cr, cc, cs = cm.info.resolution, math.cos(tcm[2]), math.sin(tcm[2])
+            cox, coy = cm.info.origin.position.x, cm.info.origin.position.y
+            w = cm.info.width
+            for idx, v in enumerate(cm.data):
+                if v < 100:
+                    continue
+                lx, ly = cox + (idx % w + 0.5) * cr, coy + (idx // w + 0.5) * cr
+                o = (tcm[0] + lx * cc - ly * cs, tcm[1] + lx * cs + ly * cc)
+                if math.hypot(o[0] - here[0], o[1] - here[1]) < DETOUR_SCAN_M and \
+                        not on_static_map(*o) and not in_keepout(*o):
+                    obs.append(o)
+                    n_cm += 1
+        navigator.get_logger().info(
+            'nav_goal_executor_node: detour search - %d live object pts, %d remembered, '
+            '%d costmap cells' % (len(obs) - n_mem - n_cm, n_mem, n_cm))
         n = len(points)
         cum = [0.0]
         for i in range(1, n):
@@ -886,10 +931,24 @@ def main():
             """Reason string if the footprint at (x, y, yaw) hits something."""
             cy, sy = math.cos(yaw), math.sin(yaw)
             m = DETOUR_FOOT_MARGIN
-            fx = FOOT_REAR - m
-            while fx <= FOOT_FRONT + m + 1e-6:
-                fy = -FOOT_HALF_W - m
-                while fy <= FOOT_HALF_W + m + 1e-6:
+            mw = DETOUR_WALL_MARGIN
+            # FrontStop sees /map walls too (LiDAR): a leaning bumper must not
+            # point the zone at a wall on the way
+            fx = FOOT_FRONT + mw
+            while fx <= FOOT_FRONT + DETOUR_FS_DEPTH + 1e-6:
+                fy = -DETOUR_FS_HALF_W
+                while fy <= DETOUR_FS_HALF_W + 1e-6:
+                    wx, wy = x + fx * cy - fy * sy, y + fx * sy + fy * cy
+                    ci, cj = int((wx - gox) / gr), int((wy - goy) / gr)
+                    if 0 <= ci < gw and 0 <= cj < gh and grid.data[cj * gw + ci] >= 65:
+                        hit_at[:] = [wx, wy]
+                        return 'wall in FrontStop at (%.2f, %.2f)' % (wx, wy)
+                    fy += gr
+                fx += gr
+            fx = FOOT_REAR - mw
+            while fx <= FOOT_FRONT + mw + 1e-6:
+                fy = -FOOT_HALF_W - mw
+                while fy <= FOOT_HALF_W + mw + 1e-6:
                     wx, wy = x + fx * cy - fy * sy, y + fx * sy + fy * cy
                     ci, cj = int((wx - gox) / gr), int((wy - goy) / gr)
                     if not (0 <= ci < gw and 0 <= cj < gh):
@@ -913,6 +972,9 @@ def main():
                 if FOOT_REAR - m < lx < FOOT_FRONT + m and abs(ly) < FOOT_HALF_W + m:
                     hit_at[:] = [ox, oy]
                     return 'scan point at (%.2f, %.2f)' % (ox, oy)
+                if FOOT_FRONT <= lx < FOOT_FRONT + DETOUR_FS_DEPTH and abs(ly) < DETOUR_FS_HALF_W:
+                    hit_at[:] = [ox, oy]
+                    return 'scan point in FrontStop at (%.2f, %.2f)' % (ox, oy)
             return None
 
 
@@ -960,7 +1022,7 @@ def main():
             return d
         wl = [wall_dist(i, 1.0) for i in range(E + 1)]
         wr = [wall_dist(i, -1.0) for i in range(E + 1)]
-        half = FOOT_HALF_W + DETOUR_FOOT_MARGIN
+        half = FOOT_HALF_W + DETOUR_WALL_MARGIN   # walls / keep-out / unknown
         body_obj = []   # scan points a leaning footprint touched: keep clear of the whole body
 
         def allowed(i):
@@ -1116,7 +1178,7 @@ def main():
         reach = FOOT_FRONT + DETOUR_EARLY_M
         ahead = [a for a in ahead if a[1] <= reach]
         c, s_ = math.cos(here[2]), math.sin(here[2])
-        n, nearest = 0, None
+        n, nearest, seen = 0, None, []
         for x, y in pts:
             if not (FOOT_FRONT - 0.05 < x < reach + DETOUR_BLOCK_R):
                 continue
@@ -1130,7 +1192,11 @@ def main():
             if dist < r and not on_static_map(ox, oy):
                 n += 1   # along = route point beside the object, not one before it
                 nearest = along if nearest is None else min(nearest, along)
-        return (n, nearest - FOOT_FRONT) if n >= EARLY_MIN_POINTS else None
+                seen.append((ox, oy))
+        if n >= EARLY_MIN_POINTS:
+            early['obj'] = (time.time(), seen)   # for plan_detour (flickering objects)
+            return n, nearest - FOOT_FRONT
+        return None
 
     def detour_rear_points(dist):
         """Scan points behind the rear within `dist` + DETOUR_REAR_MARGIN
@@ -1145,6 +1211,11 @@ def main():
     def send_detour(req):
         """Drive the station request `req` around the object; None on
         success, else why not."""
+        dz = door_zone()
+        if dz is not None:
+            # pinch point: never lane-shift or back up for a detour in a doorway;
+            # caller holds and retries the plain request
+            return 'door zone %s - detour off' % dz
         path, info, back = plan_detour(req[1])
         if path is None and back > 0:
             navigator.get_logger().warn('nav_goal_executor_node: detour - ' + info)
@@ -1184,6 +1255,29 @@ def main():
             slip['since'] = None
             if slip['clear_since'] is None:
                 slip['clear_since'] = t
+
+    doors = {'list': [], 't': 0.0}
+
+    def on_doors(msg):
+        try:
+            d = json.loads(msg.data)
+            doors['list'] = [(float(x['x']), float(x['y']), float(x['radius']), str(x['name']))
+                             for x in d.get('doors', [])]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return
+        doors['t'] = time.time()
+
+    def door_zone():
+        """Name of the door whose radius + DOOR_ZONE_MARGIN_M the robot is in, else None."""
+        if time.time() - doors['t'] > DOORS_STALE_S:
+            return None
+        here = tf2d('map', 'base_footprint')
+        if here is None:
+            return None
+        for x, y, rad, name in doors['list']:
+            if math.hypot(here[0] - x, here[1] - y) <= rad + DOOR_ZONE_MARGIN_M:
+                return name
+        return None
 
     def on_door_hold(msg):
         try:
@@ -1270,6 +1364,7 @@ def main():
     navigator.create_subscription(PoseStamped, '/rosboard_nav_station', on_station, 10)
     navigator.create_subscription(Bool, '/slip_localization/slipping', on_slipping, 10)
     navigator.create_subscription(String, '/door_hold', on_door_hold, 10)
+    navigator.create_subscription(String, '/amr_doors', on_doors, 10)
     navigator.create_subscription(String, '/amr_stations', on_stations, 10)
     navigator.create_subscription(Twist, '/cmd_vel_smoothed', on_smoothed, 10)
     navigator.create_subscription(Twist, '/cmd_vel', on_output, 10)
@@ -1457,7 +1552,7 @@ def main():
                     current['req'] is not None and current['req'][0] == 'station' and \
                     not backup['active'] and time.time() - early['t'] > 1.0 / DETOUR_EARLY_HZ:
                 early['t'] = time.time()
-                found = object_on_route_ahead()
+                found = object_on_route_ahead() if door_zone() is None else None
                 early['hits'] = early.get('hits', 0) + 1 if found is not None else 0
                 if found is not None and early['hits'] >= EARLY_CONFIRM:
                     early['hits'] = 0
