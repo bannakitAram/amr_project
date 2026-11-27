@@ -51,3 +51,10 @@ before relying on them - dates say when each was true.
 - Tried and failed: kernel xpad, paroj/xpad with ShanWan init, udev authorized toggle,
   USBDEVFS_RESET, uhubctl on hub 1-2.2 (does not cut VBUS). Builds in ~/xpad.
 - Workaround: replug after boot. Better: a Linux-native gamepad (then re-map, commit + tag).
+
+## AMR Control Panel autostart (2026-11-27)
+- GDM auto-login as nvidia (/etc/gdm3/custom.conf, X11) + `~/.config/autostart/amr_control_panel.desktop`
+  (not in git, delay 8 s) -> `proj_ws/src/amr_bringup/scripts/launch_control_panel.sh` opens the panel after boot.
+- The launcher exits if a panel is already running (single instance). Opening the panel starts no
+  robot motion; bringup / navigation still need a button. Log: ~/.ros/log/amr_control_panel.log
+- New machine: copy the Desktop launcher (`~/Desktop/amr_control_panel.desktop`) to `~/.config/autostart/`.
