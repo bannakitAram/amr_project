@@ -1,0 +1,9 @@
+stations:
+- name: Station_A
+  x: 0.0
+  y: 0.0
+  theta: -0.0
+- name: Station_B
+  x: 0.222
+  y: -0.004
+  theta: -0.022
