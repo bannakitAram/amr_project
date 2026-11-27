@@ -19,6 +19,7 @@ install(PROGRAMS
   scripts/local_plan_relay_node.py
   scripts/map_edit.py
   scripts/zone_manager_node.py
+  scripts/smart_speed_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

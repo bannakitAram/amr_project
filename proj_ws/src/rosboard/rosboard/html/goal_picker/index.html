@@ -46,6 +46,17 @@
     z-index: 20; pointer-events: none;
   }
   #speed-badge.stale { color: #ff6b6b; }
+  /* Smart navigation (payload estimate + GA speed profile) from
+     smart_speed_node's /smart_nav/state - see updateSmartBadge(). */
+  #smart-badge {
+    position: absolute; left: 10px; top: 100px;
+    padding: 4px 10px; border-radius: 6px; max-width: calc(100% - 40px);
+    background: rgba(40,0,70,0.75); color: #e1bee7; font-size: 12px;
+    z-index: 20; pointer-events: none;
+  }
+  #smart-badge.applied { color: #b9f6ca; }
+  #smart-badge.warn { color: #ffb300; }
+  #station-panel .btn.smart { background: #6a1b9a; color: #fff; }
   #speed-badge .slip { color: #ffb300; font-weight: bold; }
 
   /* IMU fault banner, driven by imu_watchdog_node's /imu_watchdog/ok -
@@ -214,6 +225,7 @@
   <div id="scale-badge" hidden></div>
   <div id="freshness-badge" hidden></div>
   <div id="speed-badge" hidden></div>
+  <div id="smart-badge" hidden></div>
   <div id="imu-banner" hidden></div>
   <div id="nav-alert" hidden></div>
 
@@ -373,6 +385,7 @@ function onAuthResult(result) {
     transport.subscribe({topicName: '/amr_zones', maxUpdateRate: 1.0});
     transport.subscribe({topicName: '/rosboard_bag_state', maxUpdateRate: 2.0});
     transport.subscribe({topicName: '/nav_alert', maxUpdateRate: 2.0});
+    transport.subscribe({topicName: '/smart_nav/state', maxUpdateRate: 2.0});
     transport.subscribe({topicName: '/rosout', maxUpdateRate: 30.0});
   } else {
     localStorage.removeItem('rosboard_pin');
@@ -409,6 +422,7 @@ function onRosMsg(msg) {
   else if (msg._topic_name === '/amr_zones') handleZones(msg);
   else if (msg._topic_name === '/rosboard_bag_state') handleBagState(msg);
   else if (msg._topic_name === '/nav_alert') handleNavAlert(msg);
+  else if (msg._topic_name === '/smart_nav/state') handleSmartState(msg);
   else if (msg._topic_name === '/rosout') handleLog(msg);
 }
 
@@ -635,6 +649,29 @@ function updateSpeedBadge() {
   }
 }
 setInterval(updateSpeedBadge, 200);
+
+// ---------- smart navigation badge ----------
+// smart_speed_node.py: weighing profile for t_eval s, payload estimate from
+// motor + battery current, then velocity_smoother -> GA profile. Shown only
+// while a smart trip runs (phase != idle) and the node is alive.
+const smartBadge = document.getElementById('smart-badge');
+let smartState = null;          // {d, at}
+const SMART_OBJ = {battery: 'ประหยัดแบต', motor: 'ประหยัดมอเตอร์'};
+function handleSmartState(msg) {
+  try { smartState = {d: JSON.parse(msg.data), at: Date.now()}; } catch (e) { /* ignore */ }
+}
+function updateSmartBadge() {
+  const st = smartState;
+  if (!st || Date.now() - st.at > 3000 || st.d.phase === 'idle') { smartBadge.hidden = true; return; }
+  const d = st.d;
+  smartBadge.hidden = false;
+  smartBadge.classList.toggle('applied', d.phase === 'applied');
+  smartBadge.classList.toggle('warn', ['no_estimate', 'out_of_range', 'error'].includes(d.phase));
+  let t = '⚡ Smart (GA ' + (SMART_OBJ[d.objective] || '') + '): ' + d.msg;
+  if (d.applied) t += '  | ใช้ v ' + d.applied.vmax.toFixed(2) + ' m/s, a ' + d.applied.accel.toFixed(2);
+  smartBadge.textContent = t;
+}
+setInterval(updateSmartBadge, 300);
 
 // ---------- IMU fault banner ----------
 // Hidden until the watchdog has been heard from at least once (navigation
@@ -1174,6 +1211,12 @@ function renderStationPanel() {
     if (/^#[0-9a-fA-F]{6}$/.test(s.color || '')) b.style.borderLeft = '8px solid ' + s.color;
     b.onclick = () => sendToStation(s);
     stationPanel.appendChild(b);
+    const sb = document.createElement('button');
+    sb.className = 'btn smart';
+    sb.textContent = '⚡ ' + s.name;
+    sb.title = 'Smart: หุ่นยนต์ชั่งน้ำหนักเองระหว่างวิ่ง แล้วเลือก speed profile จาก GA เอง';
+    sb.onclick = () => sendToStation(s, {objective: 'auto'});
+    stationPanel.appendChild(sb);
   }
 }
 
@@ -1374,11 +1417,14 @@ document.getElementById('route-clear').addEventListener('click', () => {
 document.getElementById('route-send').addEventListener('click', sendRoute);
 document.getElementById('route-exit').addEventListener('click', () => setMode('view'));
 
-function sendToStation(s) {
+function sendToStation(s, smart = null) {
   stationPanel.hidden = true;
+  const smartTxt = smart
+    ? ' ⚡ Smart: หุ่นยนต์ชั่งน้ำหนักเอง (วิ่ง 0.20 m/s ช่วงแรก) แล้วเลือก speed profile จาก GA เอง (ไม่เกินค่าเดิม)'
+    : '';
   showConfirm('ส่งหุ่นยนต์ไปที่ Station "' + s.name + '" (' + s.x.toFixed(2) + ', ' + s.y.toFixed(2) + ') ม.?' +
-    (hasRoutes ? (useRoutes ? ' ใช้เส้น Fix' : ' ใช้เส้นที่คิดเอง') : ''),
-    null,
+    (hasRoutes ? (useRoutes ? ' ใช้เส้น Fix' : ' ใช้เส้นที่คิดเอง') : '') + smartTxt,
+    smart ? 'ความเร็วจาก GA (0.33-0.37 m/s) ยังไม่ผ่านการทดสอบระยะหยุด - ใช้เพื่อทดสอบเท่านั้น' : null,
     () => {
       if (!confirm('ยืนยันส่งหุ่นยนต์ไปยัง Station "' + s.name + '"?\n\n' +
           'ตรวจสอบว่าตลอดเส้นทางและบริเวณจุดหมายไม่มีคน/สิ่งกีดขวางที่ไม่ปลอดภัย (ISO 3691-4) ' +
@@ -1386,9 +1432,9 @@ function sendToStation(s) {
         return;
       }
       const theta = s.theta || 0;
-      transport.navGoal({x: s.x, y: s.y, theta: theta, station: true});
+      transport.navGoal({x: s.x, y: s.y, theta: theta, station: true, smart: smart});
       setActiveGoal({x: s.x, y: s.y, theta: theta});
-      setStatus('ส่งไป Station "' + s.name + '" แล้ว - หุ่นยนต์กำลังนำทางอัตโนมัติ');
+      setStatus('ส่งไป Station "' + s.name + '" แล้ว' + (smart ? ' (⚡ Smart)' : '') + ' - หุ่นยนต์กำลังนำทางอัตโนมัติ');
       hideConfirm();
       redraw();
     });

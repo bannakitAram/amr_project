@@ -77,9 +77,11 @@ class WebSocketV1Transport {
       this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_AUTH, {code: code}]));
     }
 
-    navGoal({x, y, theta, station = false}) {
+    navGoal({x, y, theta, station = false, smart = null}) {
       if (!this.isConnected()) return;
-      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_NAV_GOAL, {x: x, y: y, theta: theta, station: station}]));
+      const g = {x: x, y: y, theta: theta, station: station};
+      if (smart) g.smart = smart;   // {objective, mode}: smart_speed_node (payload + GA profile)
+      this.ws.send(JSON.stringify([WebSocketV1Transport.MSG_NAV_GOAL, g]));
     }
 
     navPath({points}) {

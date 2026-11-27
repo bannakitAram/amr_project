@@ -278,6 +278,17 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}],
     )
 
+    # goal_picker "Smart" station button: payload estimate while driving, then
+    # velocity_smoother -> GA speed profile (only ever lowers limits) - see
+    # smart_speed_node.py's docstring. Idle until /rosboard_smart_nav.
+    smart_speed_node = Node(
+        package='amr_navigation',
+        executable='smart_speed_node.py',
+        name='smart_speed',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}],
+    )
+
     lifecycle_manager_localization = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
@@ -323,6 +334,7 @@ def generate_launch_description():
         slip_localization_node,
         imu_watchdog_node,
         local_plan_relay_node,
+        smart_speed_node,
         lifecycle_manager_localization,
         lifecycle_manager_navigation,
     ])

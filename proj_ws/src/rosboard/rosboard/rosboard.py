@@ -206,6 +206,10 @@ class ROSBoardNode(object):
         self.nav_station_pub = rospy.Publisher("/rosboard_nav_station", PoseStamped, queue_size=1)
         self.nav_path_pub = rospy.Publisher("/rosboard_nav_path", Path, queue_size=1)
         self.nav_cancel_pub = rospy.Publisher("/rosboard_nav_cancel", Empty, queue_size=1)
+        # "Smart" station goal: amr_navigation smart_speed_node.py weighs the
+        # payload while driving and switches velocity_smoother to the GA profile.
+        # Sent right before the goal; only these validated values are forwarded.
+        self.smart_nav_pub = rospy.Publisher("/rosboard_smart_nav", String, queue_size=1)
         # Mapping controls (start/pause scan, save, finish) from the phone.
         # Same narrow approach: only these four actions and a sanitized map
         # name are forwarded; the AMR Control panel is the only consumer and
@@ -284,7 +288,7 @@ class ROSBoardNode(object):
         pose.pose.orientation.w = math.cos(theta / 2.0)
         return pose
 
-    def on_nav_goal(self, x, y, theta, station=False):
+    def on_nav_goal(self, x, y, theta, station=False, smart=None):
         """Handle a single navigation goal tapped on the goal_picker page's
         map. Publishes a validated PoseStamped on /rosboard_nav_goal for
         nav_goal_executor_node to send to Nav2's navigate_to_pose action.
@@ -293,6 +297,17 @@ class ROSBoardNode(object):
         pose = self._nav_pose(x, y, theta)
         if pose is None:
             print("error: nav_goal: bad coordinates: x=%r y=%r theta=%r" % (x, y, theta))
+            return
+        if isinstance(smart, dict):
+            obj, mode = smart.get("objective", "auto"), smart.get("mode", "tested")
+            if obj not in ("auto", "battery", "motor") or mode not in ("tested", "ga"):
+                print("error: nav_goal: bad smart %r" % (smart,))
+                return
+            self.smart_nav_pub.publish(String(data=json.dumps({"objective": obj, "mode": mode})))
+            # goal 0.5 s later, so smart_speed_node has set the weighing profile
+            # before the robot moves (timer: don't block the websocket thread)
+            pub = self.nav_station_pub if station is True else self.nav_goal_pub
+            threading.Timer(0.5, pub.publish, args=(pose,)).start()
             return
         (self.nav_station_pub if station is True else self.nav_goal_pub).publish(pose)
 
