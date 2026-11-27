@@ -554,4 +554,4 @@ collision_monitor:
       topic: "/depth_camera/points"
       min_height: 0.05
       max_height: 1.8
-      enabled: True
+      enabled: False
