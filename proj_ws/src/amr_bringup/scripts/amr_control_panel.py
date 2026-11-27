@@ -53,6 +53,8 @@ MAPS_DIR = os.path.join(
     get_package_share_directory('amr_navigation'), '..', '..', '..', '..',
     'src', 'amr_navigation', 'maps')
 MAPS_DIR = os.path.normpath(MAPS_DIR)
+sys.path.insert(0, os.path.normpath(os.path.join(MAPS_DIR, '..', 'scripts')))
+import route_planner  # noqa: E402  (amr_navigation/scripts: best_route for the button)
 NAV2_PARAMS = os.path.normpath(os.path.join(MAPS_DIR, '..', 'config', 'nav2_params.yaml'))
 LASER_FILTER = os.path.normpath(os.path.join(
     MAPS_DIR, '..', '..', 'amr_bringup', 'config', 'laser_filter.yaml'))
@@ -2851,8 +2853,9 @@ class AmrControlPanel(tk.Tk):
 
     def _on_route_plan(self):
         """Compute a fixed route between two stations on the saved map
-        (route_tools.plan_route, no guide line): the real footprint is kept
-        clear of walls/keep-out the whole way. Runs in a thread (~1-10 s)."""
+        (route_planner.best_route: Hybrid-A* and route_tools lattice, both
+        centred, better one offered; real footprint kept clear of walls /
+        keep-out the whole way). Runs in a thread (~1-4 min)."""
         name = self._nav_map_name
         if not name or self._route_rec is not None:
             return
@@ -2871,11 +2874,17 @@ class AmrControlPanel(tk.Tk):
         start, end = stations[i], others[j]
         self.btn_route_plan.config(text=T('กำลังคำนวณเส้นทาง...'), state='disabled')
 
+        def say(msg):
+            self.after(0, lambda: self.btn_route_plan.config(text=T(msg)))
+
         def work():
+            # two planners (clearance-weighted Hybrid-A* and the lattice
+            # planner), each centred in narrow passages; the one with the
+            # wider narrowest gap / fewer tight poses is offered (~1-4 min)
             try:
-                res = route_tools.plan_route(os.path.join(MAPS_DIR, name + '.yaml'), start, end)
+                res = route_planner.best_route(MAPS_DIR, name, start, end, say)
             except Exception as e:  # noqa: BLE001
-                res = (None, f'คำนวณไม่สำเร็จ: {e}', [])
+                res = (None, [f'คำนวณไม่สำเร็จ: {e}'], [])
             self.after(0, lambda: self._route_plan_done(name, start, end, res))
         threading.Thread(target=work, daemon=True).start()
 
@@ -2884,7 +2893,8 @@ class AmrControlPanel(tk.Tk):
         poses, notes, warns = res
         key = (start['name'], end['name'])
         if poses is None:
-            messagebox.showwarning('คำนวณเส้นทางไม่ได้', f'{key[0]} → {key[1]}\n{notes}\n\n'
+            messagebox.showwarning('คำนวณเส้นทางไม่ได้', f'{key[0]} → {key[1]}\n' + '\n'.join(
+                notes if isinstance(notes, (list, tuple)) else [str(notes)]) + '\n\n'
                                    'ลองขยับ Station ออกจากผนัง หรือขับอัดเส้นทางเอง')
             return
         lines = list(notes) + ['⚠ ' + w for w in warns[:6]]
